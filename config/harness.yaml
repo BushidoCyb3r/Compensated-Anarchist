@@ -1,0 +1,185 @@
+# Compensated Anarchist - harness configuration
+# Secrets are referenced as ${ENV_VAR} and never written here. See config/env.example.
+
+harness:
+  default_model: local-vllm          # override per run: --model <profile>  or  CA_MODEL=<profile>
+  operator: ${CA_OPERATOR:-analyst}  # recorded in the audit log as the approving analyst
+  roe: roe.yaml
+  cases_dir: ../cases
+  evidence_roots: [../evidence]      # local forensic tools can only read under these (plus the case dir)
+  max_steps: 40                      # tool-use steps per agent turn
+  max_tool_result_chars: 12000       # larger outputs spill to the case dir; size this to your model's context
+
+# ---------------------------------------------------------------------------
+# Model profiles - run any model. Anything OpenAI-compatible works via provider: openai_compat
+# (vLLM, Ollama, llama.cpp, LM Studio, TGI, LiteLLM, enterprise/government AI gateways, ...).
+# tool_mode: native = function calling; text = <tool_call> JSON in content (models without tool support)
+# ---------------------------------------------------------------------------
+models:
+  local-vllm:            # e.g. vllm serve <model> --enable-auto-tool-choice --tool-call-parser hermes
+    provider: openai_compat
+    base_url: ${VLLM_URL:-http://127.0.0.1:8000/v1}
+    model: ${VLLM_MODEL:-Qwen/Qwen3-32B}
+    api_key: ${VLLM_API_KEY:-}
+    context_tokens: 32000
+    max_output_tokens: 4096
+    extra_body: {temperature: 0.2}
+
+  local-ollama:
+    provider: openai_compat
+    base_url: ${OLLAMA_URL:-http://127.0.0.1:11434/v1}
+    model: ${OLLAMA_MODEL:-qwen3:32b}
+    context_tokens: 32000
+    extra_body: {temperature: 0.2}
+
+  local-textmode:        # for local models that don't support native function calling
+    provider: openai_compat
+    base_url: ${LLAMACPP_URL:-http://127.0.0.1:8080/v1}
+    model: local
+    tool_mode: text
+    context_tokens: 16000
+
+  genai-gateway:         # government / enterprise AI gateway exposing an OpenAI-compatible API
+    provider: openai_compat
+    base_url: ${GENAI_BASE_URL:-https://CHANGE-ME/v1}
+    model: ${GENAI_MODEL:-CHANGE-ME}
+    api_key: ${GENAI_API_KEY:-}
+    api_key_header: ${GENAI_API_KEY_HEADER:-Authorization}   # or e.g. x-api-key
+    ca_bundle: ${DOD_CA_BUNDLE:-}                            # DoD PKI root/intermediate CAs (PEM)
+    client_cert: ${GENAI_CLIENT_CERT:-}                      # mTLS client cert if the gateway requires it
+    client_key: ${GENAI_CLIENT_KEY:-}
+    context_tokens: 128000
+    max_output_tokens: 8192
+
+  claude:
+    provider: anthropic           # pip install 'compensated-anarchist[anthropic]'
+    model: claude-opus-5-5
+    api_key: ${ANTHROPIC_API_KEY:-}
+    effort: high
+    context_tokens: 1000000
+    max_output_tokens: 32000
+
+# ---------------------------------------------------------------------------
+# Expert agents (definitions in compensated_anarchist/experts/*.md; add your own in extra_dir)
+# Route experts to different models: e.g. a big model for the lead/hunter, a small fast one for triage.
+# ---------------------------------------------------------------------------
+experts:
+  extra_dir: experts              # optional dir of additional/overriding expert .md files (relative to this file)
+  overrides:
+    # alert_triage: {model: local-ollama, max_steps: 20}
+    # forensicator: {model: genai-gateway}
+  disabled: []
+
+# ---------------------------------------------------------------------------
+# Learning memory
+# ---------------------------------------------------------------------------
+memory:
+  db_path: ../memory/canarchist_memory.db
+  retrieve_k: 8
+  # Agent-written memories land as 'candidate' until an analyst promotes them (canarchist memory review).
+  # Listing a kind here skips review for it. Keep this empty in contested environments (memory poisoning).
+  auto_promote_kinds: []
+
+# ---------------------------------------------------------------------------
+# MCP connectors - launched as stdio subprocesses by the harness (module:) or reached over HTTP (url:).
+# Third-party MCP servers work too (command:/args: or url:). Tools appear as <server>__<tool>.
+# ---------------------------------------------------------------------------
+mcp_servers:
+  security_onion:
+    enabled: ${SO_ENABLED:-false}
+    module: compensated_anarchist.servers.security_onion
+    env:
+      SO_URL: ${SO_URL:-}
+      SO_USER: ${SO_USER:-}
+      SO_PASS: ${SO_PASS:-}
+      SO_VERIFY: ${SO_VERIFY:-true}          # /etc/pki/ca.crt from the manager
+      SO_INDEX: ${SO_INDEX:-logs-*-so}
+      SO_ALERT_QUERY: ${SO_ALERT_QUERY:-event.dataset:alert}
+
+  # Security Onion Pro only: the official SO MCP server (Connect API, OQL queries, playbooks).
+  # Install/configure it per github.com/Security-Onion-Solutions/securityonion-mcp (API client from
+  # SOC Administration -> API Clients), then add it here with command:/args:/env: (stdio) or url: (HTTP).
+  # Its tools will appear as security_onion_pro__<tool>; add ROE rules for them (default tier is approve).
+
+  splunk:
+    enabled: ${SPLUNK_ENABLED:-false}
+    module: compensated_anarchist.servers.splunk
+    env:
+      SPLUNK_URL: ${SPLUNK_URL:-}
+      SPLUNK_TOKEN: ${SPLUNK_TOKEN:-}
+      SPLUNK_VERIFY: ${SPLUNK_VERIFY:-true}
+
+  elastic:
+    enabled: ${ES_ENABLED:-false}
+    module: compensated_anarchist.servers.elastic
+    env:
+      ES_URL: ${ES_URL:-}
+      ES_API_KEY: ${ES_API_KEY:-}
+      ES_VERIFY: ${ES_VERIFY:-true}
+      ES_DEFAULT_INDEX: ${ES_DEFAULT_INDEX:-logs-*}
+
+  # Velociraptor is split by privilege (least privilege): most experts get the investigator connector;
+  # only the four admin-only tools come from a separate administrator key. With a single admin key,
+  # point both VELO_API_CONFIG and VELO_ADMIN_API_CONFIG at it and enable both.
+  velociraptor:
+    enabled: ${VELO_ENABLED:-false}
+    module: compensated_anarchist.servers.velociraptor
+    timeout_s: 900
+    exclude_tools: [download_flow_uploads, quarantine_host, unquarantine_host, run_server_vql]
+    env:
+      VELO_API_CONFIG: ${VELO_API_CONFIG:-}  # role: investigator,api
+      VELO_ORG_ID: ${VELO_ORG_ID:-}
+      VELO_DOWNLOAD_DIR: ${VELO_DOWNLOAD_DIR:-}
+
+  velociraptor_admin:
+    enabled: ${VELO_ADMIN_ENABLED:-false}
+    module: compensated_anarchist.servers.velociraptor
+    timeout_s: 3600
+    include_tools: [download_flow_uploads, quarantine_host, unquarantine_host, run_server_vql]
+    env:
+      VELO_API_CONFIG: ${VELO_ADMIN_API_CONFIG:-}  # role: administrator,api
+      VELO_ORG_ID: ${VELO_ORG_ID:-}
+      VELO_DOWNLOAD_DIR: ${VELO_DOWNLOAD_DIR:-}  # empty = <first evidence root>/velociraptor
+
+  misp:
+    enabled: ${MISP_ENABLED:-false}
+    module: compensated_anarchist.servers.misp
+    env:
+      MISP_URL: ${MISP_URL:-}
+      MISP_KEY: ${MISP_KEY:-}
+      MISP_VERIFY: ${MISP_VERIFY:-true}
+
+  opencti:
+    enabled: ${OPENCTI_ENABLED:-false}
+    module: compensated_anarchist.servers.opencti
+    env:
+      OPENCTI_URL: ${OPENCTI_URL:-}
+      OPENCTI_TOKEN: ${OPENCTI_TOKEN:-}  # token of a read-only OpenCTI user
+      OPENCTI_VERIFY: ${OPENCTI_VERIFY:-true}
+
+  # example third-party server:
+  # misp:
+  #   command: /opt/mcp/misp-mcp
+  #   args: []
+  #   env: {MISP_URL: "${MISP_URL}", MISP_KEY: "${MISP_KEY}"}
+
+# ---------------------------------------------------------------------------
+# Local forensic tooling
+# ---------------------------------------------------------------------------
+forensics:
+  default_timeout_s: 900
+  yara_rules_dir: ${YARA_RULES:-}
+  sigma_rules_dir: ${SIGMA_RULES:-}
+  capa_rules_dir: ${CAPA_RULES:-}          # capa-rules checkout (not needed for the standalone capa binary)
+  ez_tools_dir: ${EZ_TOOLS_DIR:-}          # Eric Zimmerman tools (.NET 9 build); needs `dotnet` on Linux
+  memprocfs_python: ${MEMPROCFS_PYTHON:-}  # python with `pip install memprocfs` (default: this interpreter)
+  aleapp_path: ${ALEAPP_PATH:-}            # path to aleapp.py
+  ileapp_path: ${ILEAPP_PATH:-}            # path to ileapp.py
+  leapp_python: ${LEAPP_PYTHON:-}          # python with ALEAPP/iLEAPP requirements (default: this interpreter)
+  binaries:            # override executable names/paths if they differ on your workstation
+    volatility: vol
+    log2timeline: log2timeline.py
+    psort: psort.py
+  allowed_binaries:    # what local_run may execute (argv only, no shell)
+    [fls, icat, ils, mmls, fsstat, istat, tsk_recover, mactime, bulk_extractor, exiftool, ssdeep, sha256sum,
+     evtxexport, regripper, rip.pl, densityscout, pescan, olevba, oledump.py, pdfid.py, pdf-parser.py, floss, diec]

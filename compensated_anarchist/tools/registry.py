@@ -1,0 +1,126 @@
+"""Unified tool registry + executor (local tools, MCP tools, agent tools).
+
+Execution pipeline for every call, from every agent:
+   allowlist check (expert's tool globs) -> ROE gate -> run -> truncate/spill -> audit
+Tool output is wrapped as UNTRUSTED data: logs, alerts, files and packets are attacker-
+influenced and may contain prompt-injection text.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import hashlib
+import inspect
+import json
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from ..audit import AuditLog
+from ..llm.base import ToolCall, ToolSpec
+from ..roe import RoeGate
+
+Handler = Callable[..., Awaitable[str] | str]
+
+
+@dataclass
+class Tool:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    handler: Handler
+    server: str = ""  # MCP server name, "" for local
+    annotations: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(self.name, self.description, self.parameters)
+
+
+def schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
+    return {"type": "object", "properties": properties, "required": required or [], "additionalProperties": False}
+
+
+class ToolRegistry:
+    def __init__(self) -> None:
+        self.tools: dict[str, Tool] = {}
+
+    def add(self, tool: Tool) -> None:
+        if tool.name in self.tools:
+            raise ValueError(f"duplicate tool {tool.name}")
+        self.tools[tool.name] = tool
+
+    def specs(self, allow: list[str] | None = None, deny: list[str] | None = None) -> list[ToolSpec]:
+        return [t.spec for t in self.select(allow, deny)]
+
+    def select(self, allow: list[str] | None = None, deny: list[str] | None = None) -> list[Tool]:
+        out = []
+        for t in self.tools.values():
+            if allow is not None and not any(fnmatch.fnmatchcase(t.name, p) for p in allow):
+                continue
+            if deny and any(fnmatch.fnmatchcase(t.name, p) for p in deny):
+                continue
+            out.append(t)
+        return out
+
+
+class ToolExecutor:
+    def __init__(self, registry: ToolRegistry, roe: RoeGate, audit: AuditLog, spill_dir: Path, max_chars: int,
+                 on_event: Callable[[str, dict[str, Any]], None] | None = None):
+        self.registry = registry
+        self.roe = roe
+        self.audit = audit
+        self.spill_dir = spill_dir
+        self.max_chars = max_chars
+        self.on_event = on_event or (lambda kind, data: None)
+        self.denials: list[dict[str, Any]] = []  # analyst denials -> learning signal
+
+    async def execute(self, call: ToolCall, agent: str, rationale: str, allowed: list[ToolSpec]) -> tuple[str, bool]:
+        """Returns (content_for_model, is_error)."""
+        if call.parse_error:
+            return f"ERROR: {call.parse_error}. Re-issue the call with valid JSON arguments.", True
+        if call.name not in {s.name for s in allowed}:
+            return f"ERROR: tool '{call.name}' is not available to agent '{agent}'.", True
+        tool = self.registry.tools[call.name]
+
+        decision = await self.roe.authorize(call.name, call.arguments, rationale, agent, tool.annotations, tool.server)
+        self.on_event("decision", {"agent": agent, "tool": call.name, "args": call.arguments, "tier": decision.tier,
+                                   "allowed": decision.allowed, "reason": decision.reason})
+        if not decision.allowed:
+            if "analyst DENIED" in decision.reason:
+                self.denials.append({"agent": agent, "tool": call.name, "args": call.arguments, "reason": decision.reason})
+            return (f"NOT EXECUTED - {decision.reason}. Do not retry the same action; adjust your approach "
+                    f"or ask the analyst."), True
+
+        t0 = time.monotonic()
+        is_error = False
+        try:
+            res = tool.handler(**call.arguments)
+            if inspect.isawaitable(res):
+                res = await res
+            out = res if isinstance(res, str) else json.dumps(res, indent=1, default=str)
+        except TypeError as e:
+            out, is_error = f"ERROR: bad arguments for {call.name}: {e}", True
+        except Exception as e:  # tool failures are returned to the model, not raised
+            out, is_error = f"ERROR: {type(e).__name__}: {e}", True
+        elapsed = round(time.monotonic() - t0, 2)
+
+        digest = hashlib.sha256(out.encode("utf-8", "replace")).hexdigest()
+        self.audit.record("tool_result", agent=agent, tool=call.name, sha256=digest, chars=len(out),
+                          error=is_error, seconds=elapsed)
+        self.on_event("result", {"agent": agent, "tool": call.name, "chars": len(out), "error": is_error,
+                                 "seconds": elapsed, "preview": out[:800]})
+        return self._wrap(call.name, tool.server, out), is_error
+
+    def _wrap(self, name: str, server: str, out: str) -> str:
+        if len(out) > self.max_chars:
+            self.spill_dir.mkdir(parents=True, exist_ok=True)
+            spill = self.spill_dir / f"{name}_{uuid.uuid4().hex[:8]}.txt"
+            spill.write_text(out, encoding="utf-8")
+            head = out[: self.max_chars]
+            out = (f"{head}\n...[TRUNCATED {len(out) - self.max_chars} chars; full output saved to {spill} - "
+                   f"use local_read_file with offset to page through it, or narrow your query]")
+        src = server or "local"
+        return f'<tool_output tool="{name}" source="{src}" trust="untrusted-data">\n{out}\n</tool_output>'

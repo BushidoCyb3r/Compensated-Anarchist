@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compensated Anarchist</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo">⟁</span> COMPENSATED ANARCHIST</div>
+  <div class="meta">
+    <span class="chip" id="case-chip">case —</span>
+    <span class="chip posture" id="posture-chip">—</span>
+    <label class="model-pick">model <select id="model-select" aria-label="Model profile"></select></label>
+    <span class="chip" id="operator-chip">—</span>
+  </div>
+  <div class="runstate">
+    <span id="run-indicator" class="run idle">idle</span>
+    <button id="stop-btn" class="danger hidden" type="button">Stop</button>
+    <span id="conn-dot" class="dot off" title="live connection"></span>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="left" aria-label="Status">
+    <section>
+      <h3>Connectors</h3>
+      <ul id="connectors" class="plain"></ul>
+    </section>
+    <section>
+      <h3>Expert team</h3>
+      <ul id="experts" class="plain"></ul>
+    </section>
+    <section>
+      <h3>Playbooks</h3>
+      <div id="playbooks" class="pb-grid"></div>
+    </section>
+    <section>
+      <h3>Memory</h3>
+      <div id="memory-stats" class="small muted"></div>
+    </section>
+    <section>
+      <h3>Session</h3>
+      <div class="row">
+        <button id="retro-btn" type="button">After-action review</button>
+      </div>
+      <div class="row">
+        <select id="rate-select" aria-label="Rating">
+          <option value="">Rate…</option><option>5</option><option>4</option><option>3</option><option>2</option><option>1</option>
+        </select>
+        <input id="rate-note" placeholder="note (optional)">
+        <button id="rate-btn" type="button">Rate</button>
+      </div>
+    </section>
+  </aside>
+
+  <section class="center" aria-label="Operation">
+    <div id="mission" class="mission muted small"></div>
+    <div id="feed" class="feed" aria-live="polite"></div>
+    <form id="composer" class="composer">
+      <select id="playbook-select" aria-label="Playbook"><option value="">no playbook</option></select>
+      <textarea id="input" rows="3" placeholder="Task the DCO lead… (Ctrl+Enter to send)"></textarea>
+      <button id="send-btn" class="primary" type="submit">Send</button>
+    </form>
+  </section>
+
+  <aside class="right" aria-label="Case">
+    <nav class="tabs" id="tabs"></nav>
+    <div id="panel" class="panel"></div>
+  </aside>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
