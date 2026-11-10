@@ -405,3 +405,32 @@ def test_steer_and_stop_subagents(tmp_path, monkeypatch):
     assert "subagent_steer" in kinds
     lead_tel = [d for k, d in events if k == "telemetry" and d["agent_id"] == "lead"]
     assert lead_tel and 0 <= lead_tel[-1]["context_pct"] <= 100
+
+
+def test_lead_holds_overview_tools_only(tmp_path, monkeypatch):
+    """Tool schemas dominate the prompt: the default lead keeps orchestration, case, memory, skills and overview
+    tools, and must delegate searches, collection and response to experts (who keep their full toolsets)."""
+    cfg = load_config(write_config(tmp_path))
+    fake = ScriptedBackend({"lead": [("Quarantining directly.", [("velociraptor__quarantine_host", {"client_id": "C.1111111111111111"})]),
+                                     ("I cannot do that myself; an incident responder must.", [])]})
+    monkeypatch.setattr(agent_mod, "make_backend", lambda profile: fake)
+
+    async def go():
+        h = agent_mod.Harness(cfg, "LEAN-1", interactive=False)
+        await h.start(new=True)
+        names = {t.name for t in h.lead.tools}
+        out = await h.mission("contain ws01")
+        expert = h._build_subagent(agent_mod.SubAgent("SA-099", "incident_responder", "IR", "t"))
+        sub_names = {t.name for t in expert.tools}
+        msgs = h.lead.messages
+        await h.close()
+        return names, sub_names, out, msgs
+
+    names, sub_names, out, msgs = asyncio.run(go())
+    assert {"subagent_spawn", "subagent_message", "case_summary", "memory_search", "skill_view", "velociraptor__list_clients"} <= names
+    assert "local_case_evidence" in names  # an overview of what evidence exists, so the lead can brief well
+    assert not {n for n in names if (n.startswith("local_") and n != "local_case_evidence") or n == "velociraptor__quarantine_host"}
+    assert "velociraptor__quarantine_host" in sub_names  # the expert still has it
+    refused = [m["content"] for m in msgs if m["role"] == "tool"]
+    assert refused and "not available" in refused[0].lower()  # the lead cannot call it, even if it tries
+    assert "incident responder" in out

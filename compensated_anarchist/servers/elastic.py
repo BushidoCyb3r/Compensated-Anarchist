@@ -63,6 +63,14 @@ def field_values(field: str, index: str = "", query: str = "*", start: str = "no
 
 
 @tool(READ)
+def pair_counts(query: str = "*", index: str = "", start: str = "now-24h", end: str = "now", source_field: str = "source.ip",
+                destination_field: str = "destination.ip", size: int = 20) -> str:
+    """Who talked to whom over the WHOLE window: event counts per source -> destination pair for a query. Use it to
+    verify what you concluded from a sample of events (search returns samples)."""
+    return es.pair_counts(index or DEFAULT_INDEX, query, start, end, source_field, destination_field, size)
+
+
+@tool(READ)
 def ioc_sweep(values: list[str], index: str = "", start: str = "now-30d", end: str = "now") -> str:
     """Sweep IOCs (IPs, domains, hashes, filenames...) across all fields: per-IOC hits, first/last seen, top hosts."""
     return es.ioc_sweep(index or DEFAULT_INDEX, values, start, end, HOST_FIELD)
@@ -70,7 +78,8 @@ def ioc_sweep(values: list[str], index: str = "", start: str = "now-30d", end: s
 
 @tool(READ)
 def alerts(query: str = "*", start: str = "now-24h", end: str = "now", size: int = 50, open_only: bool = True) -> str:
-    """Elastic Security detection alerts (rule name, severity, risk, host, user, reason)."""
+    """Elastic Security detection-engine alerts (.alerts-security.alerts-*): rule name, severity, risk, host, user,
+    reason. Security Onion does NOT write its alerts here - on a Security Onion grid use security_onion__alerts."""
     q = query if not open_only else f"({query}) AND kibana.alert.workflow_status:open"
     return es.search(ALERTS, q, start, end, size, ["@timestamp", "kibana.alert.rule.name", "kibana.alert.severity",
                                                    "kibana.alert.risk_score", "kibana.alert.reason", "host.name",
@@ -80,7 +89,8 @@ def alerts(query: str = "*", start: str = "now-24h", end: str = "now", size: int
 
 @tool(READ)
 def alerts_summary(start: str = "now-24h", end: str = "now") -> str:
-    """Count open alerts by rule and severity - start triage here."""
+    """Count open Elastic Security detection-engine alerts by rule and severity. Empty on Security Onion grids,
+    whose Suricata and Detections alerts live in logs-*.alerts-so: use security_onion__alerts_summary there."""
     body = {"size": 0, "query": {"bool": {"filter": [es.time_filter(start, end), {"term": {"kibana.alert.workflow_status": "open"}}]}},
             "aggs": {"rule": {"terms": {"field": "kibana.alert.rule.name", "size": 50},
                               "aggs": {"sev": {"terms": {"field": "kibana.alert.severity"}},

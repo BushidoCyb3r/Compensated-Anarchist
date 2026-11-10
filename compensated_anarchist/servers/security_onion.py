@@ -48,32 +48,58 @@ def _alert_query(extra: str) -> str:
     return " AND ".join(f"({p})" for p in parts) or "*"
 
 
+def _rule_row(b: dict) -> dict:
+    pairs = sorted(((x["key"], y["key"], y["doc_count"]) for x in b.get("pairs", {}).get("buckets", [])
+                    for y in x.get("dst", {}).get("buckets", [])), key=lambda t: -t[2])
+    row = {"rule": b["key"], "count": b["doc_count"], "severity": [s["key"] for s in b["sev"]["buckets"]],
+           "source": [m["key"] for m in b["module"]["buckets"]],
+           "distinct_src": b["src"]["value"], "distinct_dst": b["dst"]["value"],
+           "top_pairs": [f"{x} -> {y}: {c}" for x, y, c in pairs[:5]], "last_seen": b["last"].get("value_as_string")}
+    covered = sum(c for _, _, c in pairs[:5])
+    if pairs and covered < b["doc_count"]:
+        row["pairs_cover"] = f"{covered} of {b['doc_count']} (use pair_counts for the rest)"
+    return row
+
+
 @tool(READ)
 def alerts_summary(start: str = "now-24h", end: str = "now") -> str:
-    """Alerts (Suricata + SO Detections/Sigma) grouped by rule with severity, source module, counts, distinct
-    source/destination IPs and last seen - start triage here."""
+    """Alerts (Suricata + SO Detections/Sigma) grouped by rule over the WHOLE window: severity, source module,
+    count, distinct source/destination IPs, the top source -> destination pairs with counts, and last seen.
+    Start triage here; it answers "which hosts" without sampling."""
     body: dict = {"size": 0, "query": {"bool": {"filter": [es.time_filter(start, end)]}},
                   "aggs": {"rule": {"terms": {"field": "rule.name", "size": 75},
                                     "aggs": {"sev": {"terms": {"field": SEV, "size": 3}},
                                              "module": {"terms": {"field": "event.module", "size": 3}},
                                              "src": {"cardinality": {"field": "source.ip"}},
                                              "dst": {"cardinality": {"field": "destination.ip"}},
+                                             "pairs": {"terms": {"field": "source.ip", "size": 5},
+                                                       "aggs": {"dst": {"terms": {"field": "destination.ip", "size": 5}}}},
                                              "last": {"max": {"field": "@timestamp"}}}}}}
     if (q := _alert_query("")) != "*":
         body["query"]["bool"]["must"] = [{"query_string": {"query": q}}]
     res = es.req("POST", f"/{ALERT_INDEX}/_search", body, params={"ignore_unavailable": "true"})
-    return dumps([{"rule": b["key"], "count": b["doc_count"], "severity": [s["key"] for s in b["sev"]["buckets"]],
-                   "source": [m["key"] for m in b["module"]["buckets"]],
-                   "distinct_src": b["src"]["value"], "distinct_dst": b["dst"]["value"], "last_seen": b["last"].get("value_as_string")}
-                  for b in res["aggregations"]["rule"]["buckets"]])
+    return dumps([_rule_row(b) for b in res["aggregations"]["rule"]["buckets"]])
 
 
 @tool(READ)
 def alerts(query: str = "*", start: str = "now-24h", end: str = "now", size: int = 50) -> str:
     """Individual alerts (Suricata, SO Detections Sigma/YARA) newest first, optionally narrowed by a query such as
     'rule.name:"ET HUNTING*"', 'event.severity_label:high', 'source.ip:10.1.2.3' or 'event.module:sigma'.
-    Sigma alerts hold the matched log under event_data.* (event_data.host.name, event_data.message...)."""
+    Sigma alerts hold the matched log under event_data.* (event_data.host.name, event_data.message...).
+    Returns a SAMPLE when more alerts match than `size` - good for reading; verify any conclusion about hosts or
+    counts with alerts_summary or pair_counts, which count the whole window."""
     return es.search(ALERT_INDEX, _alert_query(query), start, end, size, ALERT_FIELDS)
+
+
+@tool(READ)
+def pair_counts(query: str = "*", start: str = "now-24h", end: str = "now", source_field: str = "source.ip",
+                destination_field: str = "destination.ip", alerts_only: bool = False, size: int = 20) -> str:
+    """Who talked to whom over the WHOLE window: event counts per source -> destination pair for any query, e.g.
+    query='rule.name:"ET MALWARE BPFDoor*"' alerts_only=true, or query='event.dataset:zeek.conn AND destination.port:22'.
+    Use it to verify what you concluded from a sample of events. Also works for other field pairs
+    (e.g. source_field=source.ip destination_field=dns.query.name)."""
+    return es.pair_counts(ALERT_INDEX if alerts_only else INDEX, _alert_query(query) if alerts_only else query,
+                          start, end, source_field, destination_field, size)
 
 
 @tool(READ)

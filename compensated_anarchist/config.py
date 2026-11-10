@@ -72,6 +72,7 @@ class HarnessConfig:
     memory: dict[str, Any]
     experts: dict[str, Any]
     history_db: Path = Path("history.db")
+    forensics_dir: Path = Path("forensics")  # per-case drop folders: <forensics_dir>/<case-id>/ (an evidence root)
     skills: dict[str, Any] = field(default_factory=dict)
     orchestration: dict[str, Any] = field(default_factory=dict)
 
@@ -103,6 +104,10 @@ def load_config(path: str | Path) -> HarnessConfig:
 
     h = raw.get("harness") or {}
     default_model = os.environ.get("CA_MODEL") or h.get("default_model") or next(iter(models))
+    forensics_dir = rel(h.get("forensics_dir", "../forensics"))
+    evidence_roots = [rel(p) for p in h.get("evidence_roots", ["../evidence"])]
+    if forensics_dir not in evidence_roots:  # case drop folders are always readable by the forensic tools
+        evidence_roots.append(forensics_dir)
     return HarnessConfig(
         raw=raw,
         root=root,
@@ -110,7 +115,8 @@ def load_config(path: str | Path) -> HarnessConfig:
         default_model=default_model,
         cases_dir=rel(h.get("cases_dir", "../cases")),
         memory_db=rel((raw.get("memory") or {}).get("db_path", "../memory/dco_memory.db")),
-        evidence_roots=[rel(p) for p in h.get("evidence_roots", ["../evidence"])],
+        evidence_roots=evidence_roots,
+        forensics_dir=forensics_dir,
         roe_path=rel(h.get("roe", "roe.yaml")),
         operator=os.environ.get("CA_OPERATOR") or h.get("operator") or os.environ.get("USER", "unknown"),
         max_steps=int(h.get("max_steps", 40)),

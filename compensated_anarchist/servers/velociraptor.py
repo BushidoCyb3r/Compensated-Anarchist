@@ -11,7 +11,9 @@ Env:
   VELO_API_CONFIG     path to the api client config (required)
   VELO_ORG_ID         org to operate in (optional, multi-tenant servers)
   VELO_TIMEOUT        per-query timeout seconds (default 600)
-  VELO_DOWNLOAD_DIR   where download_flow_uploads writes evidence (point it inside an evidence root)
+  VELO_DOWNLOAD_DIR   the evidence vault folder download_flow_uploads writes to (the harness sets it to
+                      <evidence root>/vault/velociraptor). Files there are read-only and never executable;
+                      executables and scripts are stored with a .quarantined suffix (see compensated_anarchist/vault.py).
 
 Injection safety: every tool argument reaches VQL as a query *parameter* (VQLEnv), never by string
 formatting. Parameters use a `Ca` prefix because plain names collide with VQL builtins and keywords
@@ -23,6 +25,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import time
 from contextlib import contextmanager
@@ -33,6 +36,7 @@ import yaml
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
+from .. import vault
 from .common import ACTION, READ, dumps, env, tool_factory
 
 mcp = MCPServer("velociraptor", instructions=(
@@ -275,9 +279,11 @@ def flow_uploads(client_id: str, flow_id: str) -> str:
 
 @tool(READ)
 def download_flow_uploads(client_id: str, flow_id: str, path_regex: str = "", max_total_mb: int = 65536) -> str:
-    """Download files a collection uploaded (memory images, triage files, binaries) to the analyst workstation's
-    evidence folder, verifying size and computing SHA-256 for chain of custody. Then register them with
-    case_register_evidence and analyze with local tools. Needs an API client with the administrator role."""
+    """Download files a collection uploaded (memory images, triage files, binaries) into the evidence VAULT on the
+    analyst workstation, verifying size and computing SHA-256 for chain of custody. Every file is stored read-only
+    and non-executable; executables and scripts get a .quarantined suffix. Analyze them with local tools (they read,
+    never run, files), then register them with case_register_evidence. Needs the analyst's approval and an API
+    client with the administrator role."""
     cid, fid = _check(_CLIENT_RE, client_id, "client_id"), _check(_FLOW_RE, flow_id, "flow_id")
     if not DOWNLOAD_DIR:
         raise RuntimeError("VELO_DOWNLOAD_DIR is not configured for the velociraptor connector")
@@ -292,14 +298,19 @@ def download_flow_uploads(client_id: str, flow_id: str, path_regex: str = "", ma
     if total > max_total_mb * 1024 * 1024:
         return f"refusing: {total} bytes exceeds max_total_mb={max_total_mb}; narrow with path_regex"
     out = []
-    with _stub() as stub:
+    root = vault.ensure(Path(DOWNLOAD_DIR).resolve())
+    flow_dir = root / cid / fid
+    os.chmod(vault.ensure(root / cid), 0o700)
+    with _stub() as stub, vault.writable(flow_dir):
         for u in ups:
             parts = [re.sub(r"[^A-Za-z0-9._ -]", "_", c) for c in (u.get("cc") or [Path(u["client_path"]).name])
                      if c not in ("", ".", "..")]
-            dest = Path(DOWNLOAD_DIR).resolve() / cid / fid / Path(*parts)
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest = flow_dir / Path(*parts)
+            if (existing := vault.stored_copy(dest)) is not None:
+                out.append({"client_path": u["client_path"], "local_path": str(existing), "already_in_vault": True})
+                continue
             sha, md5, off = hashlib.sha256(), hashlib.md5(), 0
-            with open(dest, "wb") as fh:
+            with vault.open_new(dest) as fh:
                 while True:
                     rows, logs = _query(stub, "SELECT base64encode(string=read_file(accessor='fs', filename=CaPath, "
                                               "offset=int(int=CaOff), length=int(int=CaLen))) AS b FROM scope()",
@@ -317,10 +328,15 @@ def download_flow_uploads(client_id: str, flow_id: str, path_regex: str = "", ma
                     if len(data) < CHUNK:
                         break
             expected = int(u.get("file_size") or 0)
-            out.append({"client_path": u["client_path"], "local_path": str(dest), "bytes": off,
-                        "size_verified": off == expected, "expected_bytes": expected,
-                        "sha256": sha.hexdigest(), "md5": md5.hexdigest()})
-    return dumps({"client_id": cid, "flow_id": fid, "files": out})
+            stored = vault.seal_file(dest)
+            entry = {"client_path": u["client_path"], "local_path": str(stored), "bytes": off,
+                     "size_verified": off == expected, "expected_bytes": expected,
+                     "sha256": sha.hexdigest(), "md5": md5.hexdigest(),
+                     "executable_quarantined": stored.name.endswith(vault.QUARANTINE_SUFFIX)}
+            vault.record(root, {"client_id": cid, "flow_id": fid, **entry})
+            out.append(entry)
+    return dumps({"client_id": cid, "flow_id": fid, "vault": str(flow_dir), "files": out,
+                  "note": "stored read-only and non-executable; analyze with local tools, never run these files"})
 
 
 @tool(CHANGE)

@@ -67,6 +67,9 @@ def _event_line(kind: str, d: dict[str, Any]) -> str | None:
         return f"{C['m']}  [{who}] skill {d['skill']} v{d['version']} {d['status']}{' (review: canarchist skills review)' if d['status'] == 'candidate' else ''}{C['x']}"
     elif kind == "text" and d["agent"] != "lead" and not d["final"]:
         return f"{C['dim']}  [{who}] {d['text'][:300]}{C['x']}"
+    elif kind == "loop_guard":
+        what = "gave up: kept repeating" if d["gave_up"] else "cut off a repeating reply, asking again"
+        return f"{C['y']}  [{who}] loop guard: {what} ({d['unit'][:60]!r}{', in reasoning' if d['where'] == 'reasoning' else ''}){C['x']}"
     elif kind == "compact":
         return f"{C['dim']}  [{who}] compacted {d['dropped']} old messages{C['x']}"
     return None
@@ -94,6 +97,8 @@ def event_printer(kind: str, d: dict[str, Any]) -> None:
                 print(f"{C['dim']}  (response restarted){C['x']}")
             return
         if not _live["open"]:
+            if not d.get("text", "").strip():
+                return  # don't open a line for leading whitespace
             sys.stdout.write("\n")
             _live["open"] = True
         sys.stdout.write(d.get("text", ""))
@@ -107,14 +112,14 @@ def event_printer(kind: str, d: dict[str, Any]) -> None:
     line = _event_line(kind, d)
     if line is not None:
         _end_live()
-        print(line)
+        print(line, flush=True)  # progress shows up live even when output goes to a file
 
 
 def say(answer: str) -> None:
     """Print an agent's final answer unless it was just streamed to the terminal."""
     streamed, _live["final"] = _live["final"], None
     if answer != streamed:
-        print(f"\n{answer}")
+        print(f"\n{answer}", flush=True)
 
 
 def _cfg(args):
@@ -144,6 +149,14 @@ def _print_status(h) -> None:
     print(f"case {C['b']}{h.case.id}{C['x']}  model {C['b']}{h.model_name}{C['x']}  posture {C['b']}{h.roe.posture.upper()}{C['x']}")
     for k, v in h.mcp.status.items():
         print(f"  mcp {k:16s} {C['g'] if v.startswith('connected') else C['r']}{v}{C['x']}")
+    from . import vault
+    v = vault.status(h.vault_dir)
+    mount = (f"{C['g']}noexec mount{C['x']}" if v.get("noexec")
+             else f"{C['y']}not on a noexec mount (files are still read-only and non-executable; see SETUP.md){C['x']}")
+    print(f"  vault: {v['path']} ({v.get('files', 0)} files, mode {v.get('mode')}) - {mount}")
+    drop = h.case_evidence_dir
+    n = sum(1 for p in drop.rglob("*") if p.is_file() and p.name != "README.txt")
+    print(f"  case evidence folder: {drop} ({n} files) - drop artifacts for this case here")
     print(f"  experts: {', '.join(h.experts)}")
     print(f"  memory: {h.memory.stats() or 'empty'}")
     sk = h.skills.stats()
@@ -449,9 +462,14 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "run":
         async def go(h):
             text = (_playbook(args.playbook) + "\n\n# Details from analyst\n" + args.mission) if args.playbook else args.mission
-            say(await h.mission(text, args.mission, args.playbook or ""))
-            if args.retro:
-                say(await h.retro())
+            try:
+                say(await h.mission(text, args.mission, args.playbook or ""))
+                if args.retro:
+                    say(await h.retro())
+            except Exception as e:  # model server or connector failure: one clear line, not a traceback
+                _end_live()
+                print(f"{C['r']}error: {e}{C['x']}", file=sys.stderr, flush=True)
+                raise SystemExit(1)
         asyncio.run(_with_harness(args, not args.non_interactive, go))
     elif args.cmd == "doctor":
         async def doc(h):

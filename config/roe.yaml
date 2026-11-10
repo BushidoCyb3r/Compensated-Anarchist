@@ -1,8 +1,9 @@
 # Compensated Anarchist - Rules of Engagement policy (enforced in code on every tool call)
 #
 # tiers:  auto (run) | notify (run + announce) | approve (analyst must approve) | deny (never)
-# posture: observe -> anything at 'approve' tier is denied outright (pure monitoring / hunting)
-#          respond -> approval-tier actions are allowed with analyst approval
+# posture: observe -> approve-tier actions are denied outright, except rules marked `observe: ask`
+#                     (endpoint collection, evidence download): those can still be requested and approved
+#          respond -> every approve-tier action is allowed once the analyst approves it
 # Rules are evaluated top to bottom; first match wins. `args` narrows a rule to specific argument
 # values (glob patterns; all listed keys must match).
 
@@ -50,6 +51,10 @@ rules:
   - {match: "elastic__*",        tier: auto}
 
   # --- Velociraptor: visibility vs. response ------------------------------
+  # Human in the loop: everything that runs on, changes, or pulls files from an endpoint needs an analyst's
+  # approval. This is also enforced in code (roe.HUMAN_GATED): auto/notify here is raised to approve.
+  # `observe: ask` lets an investigation action be requested (and approved) in OBSERVE posture; response
+  # actions (quarantine, server VQL) stay denied in OBSERVE.
   # Remote command execution on endpoints by an agent is denied by default. If your ROE allows it,
   # change these to `approve` (never auto/notify).
   - match: "velociraptor*__collect_artifact"
@@ -66,20 +71,21 @@ rules:
   - {match: "velociraptor*__artifact_info", tier: auto}
   - {match: "velociraptor*__flow_*",      tier: auto}
   - {match: "velociraptor*__hunt_results", tier: auto}
-  - {match: "velociraptor*__download_flow_uploads", tier: notify, note: "pulls collected evidence to the workstation"}
-  - {match: "velociraptor*__label_client", tier: notify}
+  - {match: "velociraptor*__download_flow_uploads", tier: approve, observe: ask, note: "pulls files from the endpoint into the evidence vault (may include live executables)"}
+  - {match: "velociraptor*__label_client", tier: approve, observe: ask, note: "labels can target hunts"}
   - {match: "velociraptor*__cancel_flow",  tier: notify}
-  - {match: "velociraptor*__acquire_memory", tier: approve, note: "full RAM image - heavy transfer"}
+  - {match: "velociraptor*__acquire_memory", tier: approve, observe: ask, note: "full RAM image - heavy transfer"}
   - match: "velociraptor*__collect_artifact"
-    tier: notify
-    note: "low-impact triage artifacts on a single host"
+    tier: approve
+    observe: ask
+    note: "triage artifact - runs on the endpoint"
     args:
       artifact: [Generic.Client.Info, Windows.System.Pslist, Windows.Network.Netstat, Windows.Network.NetstatEnriched*,
                  Windows.Sys.StartupItems, Windows.System.Services, Windows.System.TaskScheduler, Windows.Sys.Users,
                  Windows.Forensics.Prefetch, Windows.Persistence.PermanentWMIEvents, Linux.Sys.Pslist,
                  Linux.Network.Netstat, Linux.Sys.Crontab, Linux.Sys.Users, MacOS.System.Pslist]
-  - {match: "velociraptor*__collect_artifact", tier: approve, note: "any other collection"}
-  - {match: "velociraptor*__create_hunt",      tier: approve, note: "fleet-wide"}
+  - {match: "velociraptor*__collect_artifact", tier: approve, observe: ask, note: "collection - runs on the endpoint, may upload files"}
+  - {match: "velociraptor*__create_hunt",      tier: approve, observe: ask, note: "fleet-wide collection"}
   - {match: "velociraptor*__quarantine_host",  tier: approve, note: "disruptive containment"}
   - {match: "velociraptor*__unquarantine_host", tier: approve}
   - {match: "velociraptor*__run_server_vql",   tier: approve, note: "arbitrary server VQL"}

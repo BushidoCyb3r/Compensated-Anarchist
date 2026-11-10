@@ -23,3 +23,5 @@ Security Onion 3 field layout (verified on a live grid; wrong field names silent
 - Severity: event.severity_label (low/medium/high/critical). Joins: network.community_id, log.id.uid.
 - Zero hits on a query you expected to match means check the field names with list_data_streams /
   field_values before concluding "no activity".
+- search/alerts return samples - fine for reading, but verify any conclusion about who talked to whom with
+  pair_counts (any query; alerts_only=true for alerts) over the full window, and report those counts.

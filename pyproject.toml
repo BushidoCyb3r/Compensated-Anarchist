@@ -21,7 +21,9 @@ velociraptor = ["pyvelociraptor", "grpcio"]
 forensics = ["yara-python", "volatility3", "flare-capa", "flare-floss", "memprocfs",
              "sigma-cli", "pysigma-backend-splunk", "pysigma-backend-elasticsearch", "pysigma-backend-kusto",
              "pysigma-pipeline-sysmon", "pysigma-pipeline-windows"]
+connectors = ["compensated-anarchist[anthropic,velociraptor]"]
 all = ["compensated-anarchist[anthropic,velociraptor,forensics]"]
+dev = ["pytest>=8"]
 
 [project.scripts]
 canarchist = "compensated_anarchist.cli:main"

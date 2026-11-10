@@ -35,7 +35,7 @@ def write_config(tmp: Path) -> Path:
     roe["scope"]["allowed_targets"] = ["C.1111111111111111", "10.0.0.0/8"]
     (tmp / "roe.yaml").write_text(yaml.safe_dump(roe))
     cfg = {
-        "harness": {"default_model": "fake", "roe": "roe.yaml", "cases_dir": "cases", "evidence_roots": ["evidence"],
+        "harness": {"default_model": "fake", "roe": "roe.yaml", "cases_dir": "cases", "evidence_roots": ["evidence"], "forensics_dir": "forensics",
                     "max_steps": 10, "operator": "tester"},
         "models": {"fake": {"provider": "openai_compat", "base_url": "http://fake/v1", "model": "x"}},
         "memory": {"db_path": "mem.db"},
@@ -196,12 +196,58 @@ def test_roe_observe_posture_and_args(tmp_path):
 
     gate = RoeGate(ROOT / "config" / "roe.yaml", log, yes, posture="observe")
     tier, _ = gate.classify("velociraptor__collect_artifact", {"artifact": "Windows.System.Pslist"})
-    assert tier == "notify"
+    assert tier == "approve"  # even triage runs on the endpoint: a human approves it
     tier, _ = gate.classify("velociraptor__collect_artifact", {"artifact": "Windows.KapeFiles.Targets"})
     assert tier == "approve"
+    assert gate.classify("velociraptor_admin__download_flow_uploads", {})[0] == "approve"
+    assert gate.classify("velociraptor__collect_artifact", {"artifact": "Windows.System.PowerShell"})[0] == "deny"
     d = asyncio.run(gate.authorize("velociraptor__quarantine_host", {"client_id": "C.1"}, "", "t"))
     assert not d.allowed and "OBSERVE" in d.reason
     assert gate.classify("brand_new_tool", {})[0] == "approve"
+
+
+def test_human_gate_for_endpoint_actions(tmp_path):
+    """Nothing touches an endpoint through Velociraptor without an analyst saying yes - and roe.yaml cannot
+    lower that. Investigation (collection, downloads) may be requested in OBSERVE; containment may not."""
+    asked = []
+
+    async def analyst(tool, args, rationale, why):
+        asked.append(tool)
+        return True, "ok"
+
+    async def no(tool, args, rationale, why):
+        asked.append(tool)
+        return False, "no"
+
+    gate = RoeGate(ROOT / "config" / "roe.yaml", AuditLog(tmp_path / "a.jsonl", "op"), analyst, posture="observe")
+    d = asyncio.run(gate.authorize("velociraptor__collect_artifact", {"client_id": "C.1", "artifact": "Linux.Sys.Pslist"}, "", "t"))
+    assert d.allowed and d.tier == "approve" and asked == ["velociraptor__collect_artifact"]  # asked, then allowed
+    d = asyncio.run(gate.authorize("velociraptor_admin__download_flow_uploads", {"client_id": "C.1", "flow_id": "F.1"}, "", "t"))
+    assert d.allowed and asked[-1] == "velociraptor_admin__download_flow_uploads"
+    gate.approver = no
+    d = asyncio.run(gate.authorize("velociraptor__collect_artifact", {"client_id": "C.1", "artifact": "Generic.Collectors.File"}, "", "t"))
+    assert not d.allowed and "DENIED" in d.reason  # the analyst said no: nothing runs
+    for t in ("velociraptor_admin__quarantine_host", "velociraptor_admin__run_server_vql"):
+        n = len(asked)
+        d = asyncio.run(gate.authorize(t, {"client_id": "C.1"}, "", "t"))
+        assert not d.allowed and "OBSERVE" in d.reason and len(asked) == n  # response actions: not even asked
+
+    # a permissive roe.yaml cannot switch the gate off
+    lax = tmp_path / "lax.yaml"
+    lax.write_text(yaml.safe_dump({"default_tier": "auto", "rules": [
+        {"match": "velociraptor*__quarantine_host", "tier": "auto"},
+        {"match": "velociraptor*__collect_artifact", "tier": "notify"},
+        {"match": "velociraptor*__download_flow_uploads", "tier": "auto", "observe": "ask"},
+        {"match": "velociraptor*__run_server_vql", "tier": "deny"}]}))
+    gate = RoeGate(lax, AuditLog(tmp_path / "b.jsonl", "op"), no, posture="respond")
+    for t in ("velociraptor_admin__quarantine_host", "velociraptor__collect_artifact", "velociraptor_admin__download_flow_uploads",
+              "velociraptor__create_hunt", "velociraptor__acquire_memory", "velociraptor__label_client"):
+        tier, why = gate.classify(t, {})
+        assert tier == "approve" and ("human gate" in why or "approve" in why), (t, tier, why)
+        n = len(asked)
+        assert not asyncio.run(gate.authorize(t, {"client_id": "C.1"}, "", "t")).allowed and len(asked) == n + 1
+    assert gate.classify("velociraptor_admin__run_server_vql", {})[0] == "deny"  # stricter rules still win
+    assert gate.classify("velociraptor__list_clients", {})[0] == "auto"      # read-only listing is untouched
 
 
 def test_text_mode_tool_calls():
@@ -248,3 +294,27 @@ def test_splunk_blocks_write_commands(monkeypatch):
         splunk._spl("index=main | outputlookup x.csv")
     assert splunk._spl("index=main error") == "search index=main error"
     assert splunk._spl("| tstats count where index=*").startswith("| tstats")
+
+
+def test_empty_reply_gets_a_nudge_not_a_silent_end(tmp_path, monkeypatch):
+    """Small reasoning models sometimes return nothing at all after a tool result. The agent must ask for the
+    answer instead of ending the turn with '(no final answer)'."""
+    cfg = load_config(write_config(tmp_path))
+    fake = ScriptedBackend({"lead": [("Checking memory.", [("memory_search", {"query": "BPFDoor false positive"})]),
+                                     ("", []), ("  \n", []),
+                                     ("**Verdict:** suspicious, unconfirmed (low confidence).", [])]})
+    monkeypatch.setattr(agent_mod, "make_backend", lambda profile: fake)
+
+    async def go():
+        h = agent_mod.Harness(cfg, "EMPTY-1", interactive=False)
+        await h.start(new=True)
+        out = await h.mission("Is BPFDoor real?")
+        msgs = h.lead.messages
+        await h.close()
+        return out, msgs
+
+    out, msgs = asyncio.run(go())
+    assert out.startswith("**Verdict:**")
+    nudges = [m for m in msgs if m["role"] == "user" and m["content"].startswith("[Harness] Your last reply was empty")]
+    assert len(nudges) == 2
+    assert not [m for m in msgs if m["role"] == "assistant" and not (m.get("content") or "").strip() and not m.get("tool_calls")]

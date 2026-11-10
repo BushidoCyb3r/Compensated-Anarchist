@@ -278,6 +278,8 @@ class Dashboard:
                            if f.name.endswith(".md"))
         return {
             "case": h.case.data,
+            "evidence_folder": str(h.case_evidence_dir),
+            "vault_folder": str(h.vault_dir / "velociraptor"),
             "session": h.session,
             "operator": self.cfg.operator,
             "posture": h.roe.posture,

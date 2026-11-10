@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .. import casefiles
 from ..case import Case, sha256_file
 from .registry import Tool, schema
 
@@ -49,8 +50,11 @@ class PathJail:
 
 
 class Forensics:
-    def __init__(self, cfg: dict[str, Any], evidence_roots: list[Path], case: Case):
+    def __init__(self, cfg: dict[str, Any], evidence_roots: list[Path], case: Case,
+                 case_folder: Path | None = None, vault_dir: Path | None = None):
         self.case = case
+        self.case_folder = case_folder
+        self.vault_dir = vault_dir
         self.jail = PathJail([*evidence_roots, case.dir])
         self.bin = {**DEFAULT_BINARIES, **(cfg.get("binaries") or {})}
         self.allowed_run = set(cfg.get("allowed_binaries") or [])
@@ -445,10 +449,21 @@ class Forensics:
         exe = shutil.which(binary)
         if not exe:
             return f"ERROR: {binary} not installed"
+        real = Path(exe).resolve()
+        for zone in [*self.jail.roots, self.case.dir.resolve()]:  # evidence (incl. the vault) and case outputs
+            if real == zone or zone in real.parents:
+                return (f"ERROR: refusing to execute {real}: it is inside {zone}, where files pulled from endpoints "
+                        f"and tool outputs live. Only installed tools run.")
         for a in args:  # any argument that looks like a path must be inside the jail
             if a.startswith("/") or a.startswith("~"):
                 self.jail.check(a)
         return await self._run([exe, *args], timeout=min(timeout_s, 6 * 3600), cwd=self.case.artifacts)
+
+    def case_evidence(self, include_vault: bool = True, max_entries: int = 500) -> str:
+        if not self.case_folder:
+            return "ERROR: no case evidence folder configured (harness.forensics_dir)"
+        registered = {str(Path(e.get("path", "")).resolve()) for e in self.case.data.get("evidence", [])}
+        return casefiles.inventory(self.case_folder, self.vault_dir, registered, include_vault, max_entries)
 
     # ---- definitions ------------------------------------------------------------
     def tools(self) -> list[Tool]:
@@ -456,6 +471,11 @@ class Forensics:
         L = {"type": "array", "items": {"type": "string"}}
         return [
             Tool("local_tools_inventory", "List which local forensic tools are installed and the evidence roots.", schema({}), self.tools_inventory),
+            Tool("local_case_evidence", "START HERE for forensics: list every artifact available to this case - the case evidence "
+                 "folder where the analyst drops artifacts (forensics/<case-id>/) and files pulled from endpoints into the "
+                 "evidence vault - with each item's type detected from its content (disk image, memory image, EVTX, registry "
+                 "hive, PCAP, triage package, executable...) and whether it is registered in the chain of custody.",
+                 schema({"include_vault": B, "max_entries": I}), self.case_evidence),
             Tool("local_list_dir", "List files in an evidence directory (size, mtime UTC).",
                  schema({"path": S, "pattern": S, "recursive": B, "max_entries": I}, ["path"]), self.list_dir),
             Tool("local_file_info", "File metadata, magic type, MAC times and MD5/SHA1/SHA256.", schema({"path": S}, ["path"]), self.file_info),

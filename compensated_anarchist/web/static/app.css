@@ -384,6 +384,9 @@ table.list tbody tr:hover td { background: var(--hover); }
 .grid-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
 .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .form-grid { display: grid; grid-template-columns: 160px minmax(0, 1fr); gap: 10px 14px; align-items: center; }
+.drop-card { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.drop-card .path-row { display: flex; align-items: center; gap: 6px; }
+.drop-card .path-row .mono { font-size: 12px; word-break: break-all; }
 .settings-sec { display: flex; flex-direction: column; gap: 16px; padding: 18px; }
 .sec-head h2 { font-size: 15px; font-weight: 600; margin: 0; }
 .sec-head p { margin: 4px 0 0; color: var(--text-2); font-size: 13px; max-width: 640px; }

@@ -4,9 +4,11 @@
 harness:
   default_model: local-vllm          # override per run: --model <profile>  or  CA_MODEL=<profile>
   operator: ${CA_OPERATOR:-analyst}  # recorded in the audit log as the approving analyst
-  roe: roe.yaml
+  roe: ${CA_ROE:-roe.yaml}           # site copy (e.g. roe.local.yaml, git-ignored) via CA_ROE
   cases_dir: ../cases
   evidence_roots: [../evidence]      # local forensic tools can only read under these (plus the case dir)
+  forensics_dir: ../forensics        # per-case drop folders <forensics_dir>/<case-id>/ - drop artifacts there;
+                                     # always an evidence root, and where the forensics playbook looks first
   max_steps: 40                      # tool-use steps per agent turn
   max_tool_result_chars: 12000       # larger outputs spill to the case dir; size this to your model's context
 
@@ -33,6 +35,36 @@ models:
     context_tokens: 32000
     extra_body: {temperature: 0.2}
 
+  lab-mlx:               # OpenAI-compatible MLX server (omlx) on the lab network; set LAB_LLM_* in config/.env
+    provider: openai_compat
+    base_url: ${LAB_LLM_URL:-http://127.0.0.1:8080/v1}
+    model: ${LAB_LLM_MODEL:-mlx-community--NVIDIA-Nemotron-3-Nano-4B-8bit}
+    api_key: ${LAB_LLM_API_KEY:-}
+    context_tokens: 65536  # the server allows 262144; compacting earlier keeps prompts fast on Apple silicon
+    max_output_tokens: 8192  # the model reasons before answering, and reasoning counts against this
+    timeout_s: 600
+    extra_body: {temperature: 0.2}
+
+  lab-qwen3-14b:         # same lab server, larger model
+    provider: openai_compat
+    base_url: ${LAB_LLM_URL:-http://127.0.0.1:8080/v1}
+    model: ${LAB_QWEN_MODEL:-mlx-community--Qwen3-14B-4bit}
+    api_key: ${LAB_LLM_API_KEY:-}
+    context_tokens: 16000  # memory-bound, not the model's 40960: 8.1 GB of weights leave ~2.5 GB for context on a 12 GB oMLX ceiling
+    max_output_tokens: 8192
+    timeout_s: 900
+    extra_body: {temperature: 0.3}
+
+  lab-gemma4-12b:        # same lab server; 6.6 GB of weights leaves more room for context than Qwen3 14B
+    provider: openai_compat
+    base_url: ${LAB_LLM_URL:-http://127.0.0.1:8080/v1}
+    model: ${LAB_GEMMA_MODEL:-mlx-community--gemma-4-12b-it-4bit}
+    api_key: ${LAB_LLM_API_KEY:-}
+    context_tokens: 24000
+    max_output_tokens: 8192
+    timeout_s: 900
+    extra_body: {temperature: 0.3}
+
   local-textmode:        # for local models that don't support native function calling
     provider: openai_compat
     base_url: ${LLAMACPP_URL:-http://127.0.0.1:8080/v1}
@@ -52,13 +84,40 @@ models:
     context_tokens: 128000
     max_output_tokens: 8192
 
-  claude:
+  # Claude via the Anthropic API (ANTHROPIC_API_KEY). Everything the agents read - alerts, hosts, endpoint
+  # results - is sent to Anthropic: check your data-handling rules first (CUI / classified -> genai-gateway).
+  # Prompt caching is on; context_tokens is kept below the models' 1M so each step stays affordable.
+  claude-opus:            # Claude Opus 5.5 - strongest general choice for the lead ($4/$20 per MTok)
     provider: anthropic           # pip install 'compensated-anarchist[anthropic]'
     model: claude-opus-5-5
     api_key: ${ANTHROPIC_API_KEY:-}
     effort: high
-    context_tokens: 1000000
+    context_tokens: 400000
     max_output_tokens: 32000
+
+  claude-sonnet:          # Claude Sonnet 5.5 - fast, about half Opus's price ($2/$10); good for lead and subagents
+    provider: anthropic
+    model: claude-sonnet-5-5
+    api_key: ${ANTHROPIC_API_KEY:-}
+    effort: high
+    context_tokens: 400000
+    max_output_tokens: 32000
+
+  claude-haiku:           # Claude Haiku 5.5 - fastest and cheapest ($0.10/$0.50 up to 100K-token prompts); suits
+    provider: anthropic   # narrow subagent work (triage lookups, enrichment). No automatic fallback on refusals.
+    model: claude-haiku-5-5
+    api_key: ${ANTHROPIC_API_KEY:-}
+    effort: medium
+    context_tokens: 400000
+    max_output_tokens: 32000
+
+  # claude-mythos:        # Claude Mythos 5.2: for organizations verified through Anthropic's Cyber Verification
+  #   provider: anthropic # Program (meant for security work). Uncomment only if your org has access.
+  #   model: claude-mythos-5-2
+  #   api_key: ${ANTHROPIC_API_KEY:-}
+  #   effort: high
+  #   context_tokens: 400000
+  #   max_output_tokens: 32000
 
 # ---------------------------------------------------------------------------
 # Expert agents (definitions in compensated_anarchist/experts/*.md; add your own in extra_dir)
@@ -77,6 +136,11 @@ experts:
 orchestration:
   max_parallel: 4            # subagents working at once (lower it for a single local GPU)
   reflect_on_retro: true     # after-action review: every subagent reflects on its work and revises its skills
+  # The lead's own tools. It orchestrates, so it keeps overview tools only and experts do the detailed work.
+  # Tool schemas are most of a prompt: the full set is ~80 tools / ~10K tokens, this list ~25 tools.
+  # ["*"] gives the lead every tool (slow and memory-hungry on local models).
+  lead_tools: ["subagent_*", "case_*", "memory_*", "*__alerts_summary", "*__notable_events", "*__list_clients",
+               "local_case_evidence"]
 
 # ---------------------------------------------------------------------------
 # Expert skills: versioned procedures the team writes, uses, scores and revises (stored in the memory DB)

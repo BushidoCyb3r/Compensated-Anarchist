@@ -62,6 +62,52 @@ class LLMBackend(Protocol):
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
 
 
+class RepetitionLoop(Exception):
+    """The model got stuck repeating the same text (a degenerate loop); its reply was cut off."""
+
+    def __init__(self, unit: str, where: str = "text"):
+        super().__init__(f"model output keeps repeating {unit[:60]!r} ({where})")
+        self.unit = unit
+        self.where = where
+
+
+class LoopDetector:
+    """Spots degenerate repetition in model output: the tail of the text is one short span repeated over and
+    over ("2 low, 2 low, 2 low, ..."). Small local models fall into these loops and run to max_tokens.
+
+    A loop = the last `min_span`+ characters are `min_repeats`+ consecutive copies of one unit of at most
+    `max_period` characters. Ordinary prose, tables and lists of distinct values never qualify.
+    """
+
+    def __init__(self, min_span: int = 400, min_repeats: int = 5, max_period: int = 200, window: int = 4000,
+                 every: int = 48):
+        self.min_span, self.min_repeats, self.max_period = min_span, min_repeats, max_period
+        self.window, self.every = window, every
+        self.buf = ""
+        self.pending = 0
+
+    def feed(self, chunk: str) -> str | None:
+        """Add streamed text; returns the repeating unit once a loop is established, else None."""
+        self.buf = (self.buf + chunk)[-self.window:]
+        self.pending += len(chunk)
+        if self.pending < self.every:
+            return None
+        self.pending = 0
+        return self.check(self.buf)
+
+    def check(self, text: str) -> str | None:
+        t = text[-self.window:]
+        n = len(t)
+        for p in range(1, min(self.max_period, n // self.min_repeats) + 1):
+            reps = max(self.min_repeats, -(-self.min_span // p))
+            span = p * reps
+            if span > n or t[-1] != t[-1 - p]:  # cheap filter before comparing strings
+                continue
+            if t[-span + p:] == t[-span:-p]:  # the tail is p-periodic over the whole span
+                return t[-p:]
+        return None
+
+
 class ToolCallTextFilter:
     """Forwards streamed text to a sink but holds back <tool_call> blocks, which are parsed out after the call.
 

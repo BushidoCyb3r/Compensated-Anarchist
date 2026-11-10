@@ -35,11 +35,12 @@ from .case import Case
 from .config import HarnessConfig
 from .history import ChatStore
 from .llm import LLMBackend, ToolSpec, make_backend
-from .llm.base import estimate_tokens
+from .llm.base import LoopDetector, RepetitionLoop, estimate_tokens
 from .mcp_manager import McpManager
 from .memory import Memory
 from .roe import RoeGate, cli_approver, deny_all_approver
 from .skills import LEAD, SkillStore, skill_tools
+from . import casefiles, vault
 from .tools.forensics import Forensics
 from .tools.registry import Tool, ToolExecutor, ToolRegistry, schema
 
@@ -48,8 +49,13 @@ EventFn = Callable[[str, dict[str, Any]], None]
 # events that make up the conversation feed (persisted and replayed); everything else is UI-only
 PERSIST_KINDS = {"analyst_message", "text", "subagent_spawn", "subagent_message", "subagent_report", "subagent_steer",
                  "decision", "result", "approval_request", "approval_resolved", "run_end", "compact", "skill_used",
-                 "skill_proposed", "retro_start"}
+                 "skill_proposed", "retro_start", "loop_guard"}
 REPORT_STATUSES = ["completed", "blocked", "needs_input", "failed"]
+# The lead orchestrates, so it only holds overview tools; detailed connector, forensic and intel tools belong to
+# the experts. This keeps the lead's prompt small (tool schemas are most of it), which matters on local models.
+# Override with orchestration.lead_tools in harness.yaml (["*"] = every tool, the old behavior).
+DEFAULT_LEAD_TOOLS = ["subagent_*", "case_*", "memory_*", "*__alerts_summary", "*__notable_events", "*__list_clients",
+                      "local_case_evidence"]
 
 
 def _prompt(name: str) -> str:
@@ -108,6 +114,14 @@ def load_experts(cfg: HarnessConfig) -> dict[str, ExpertDef]:
 # Agent loop
 # ---------------------------------------------------------------------------
 DELTA_INTERVAL_S = 0.05  # streamed text is batched into one "delta" event per ~50 ms per agent
+MAX_EMPTY_REPLIES = 2    # small local models sometimes stop with an empty reply; ask them to answer instead
+MAX_LOOP_RETRIES = 2     # a reply stuck repeating itself is cut off and re-asked at most this many times per turn
+LOOP_NUDGE = ("[Harness] Your last reply was cut off because it kept repeating the same text: {snippet}. "
+              "Do not repeat yourself or list items over and over. Continue the task: answer briefly from the tool "
+              "results above, or call the next tool. Subagents finish with submit_report.")
+EMPTY_REPLY_NUDGE = ("[Harness] Your last reply was empty. Continue the task: if you have what you need, write your "
+                     "answer now in plain text from the tool results above; if not, call the next tool. "
+                     "Subagents finish with submit_report.")
 
 
 def _accepts_on_delta(backend: Any) -> bool:
@@ -132,6 +146,8 @@ class _DeltaSink:
         self.first: float | None = None
         self.handle: asyncio.TimerHandle | None = None
         self.loop = asyncio.get_running_loop()
+        self.guard = LoopDetector()     # visible text
+        self.r_guard = LoopDetector()   # hidden reasoning (servers that stream it separately)
 
     def _emit(self, **data: Any) -> None:
         self.agent.on_event("delta", {"agent": self.agent.name, "agent_id": self.agent.agent_id, **data})
@@ -142,9 +158,20 @@ class _DeltaSink:
             return
         if self.first is None:
             self.first = time.monotonic()
+        unit = self.guard.feed(chunk)
+        if unit is not None:
+            raise RepetitionLoop(unit, "text")
         self.buf.append(chunk)
         if self.handle is None:
             self.handle = self.loop.call_later(DELTA_INTERVAL_S, self.flush)
+
+    def reasoning(self, chunk: str) -> None:
+        """Hidden reasoning tokens: never displayed, only watched for loops."""
+        if self.first is None:
+            self.first = time.monotonic()
+        unit = self.r_guard.feed(chunk)
+        if unit is not None:
+            raise RepetitionLoop(unit, "reasoning")
 
     def flush(self) -> None:
         if self.handle:
@@ -160,7 +187,7 @@ class _DeltaSink:
         if self.handle:
             self.handle.cancel()
             self.handle = None
-        had = self.offset or self.buf
+        had = bool(self.offset or self.buf)  # evaluate before clearing: buf is the same list object
         self.buf.clear()
         self.offset = 0
         if had:
@@ -195,14 +222,27 @@ class Agent:
         self.messages.append({"role": "user", "content": user_text})
         self.terminal = None
         final = ""
+        empty = loops = 0
         for _ in range(self.max_steps):
             if self.inbox:
                 notes, self.inbox = self.inbox, []
                 self.messages.append({"role": "user", "content": "[Guidance from the analyst - adjust your work accordingly]\n"
                                       + "\n".join(f"- {n}" for n in notes)})
             await self._maybe_compact()
-            resp = await self._step(self.tools)
+            try:
+                resp = await self._step(self.tools)
+            except RepetitionLoop as e:
+                loops += 1
+                if self._loop_guard(e, loops):
+                    final = self.LOOP_GIVE_UP
+                    break
+                continue
             if not resp.tool_calls:
+                if not resp.text.strip() and empty < MAX_EMPTY_REPLIES:
+                    empty += 1
+                    self.messages.pop()  # an empty assistant turn is noise (and some servers reject it on replay)
+                    self.messages.append({"role": "user", "content": EMPTY_REPLY_NUDGE})
+                    continue
                 final = resp.text
                 break
             results = await asyncio.gather(*[
@@ -217,10 +257,26 @@ class Agent:
             self.messages.append({"role": "user", "content": (
                 "Step budget exhausted. Do not call tools. Give your final report now: what you did, what you "
                 "found (with evidence), what remains open, and recommended next steps.")})
-            resp = await self._step([])
-            final = resp.text
+            try:
+                final = (await self._step([])).text
+            except RepetitionLoop as e:
+                self._loop_guard(e, MAX_LOOP_RETRIES + 1)
+                final = self.LOOP_GIVE_UP
         self.save()
         return final or "(no final answer)"
+
+    LOOP_GIVE_UP = ("(stopped: the model kept repeating itself and was cut off each time. Try a larger model "
+                    "for this agent, or narrow the task.)")
+
+    def _loop_guard(self, e: RepetitionLoop, attempt: int) -> bool:
+        """Record a cut-off loop and queue a nudge. Returns True when it is time to give up."""
+        give_up = attempt > MAX_LOOP_RETRIES
+        snippet = " ".join(e.unit.split())[:80] or repr(e.unit[:20])
+        self.on_event("loop_guard", {"agent": self.name, "agent_id": self.agent_id, "unit": snippet, "where": e.where,
+                                     "attempt": attempt, "gave_up": give_up})
+        if not give_up:
+            self.messages.append({"role": "user", "content": LOOP_NUDGE.format(snippet=f'"{snippet}"')})
+        return give_up
 
     async def _step(self, tools: list[ToolSpec]) -> Any:
         """One model call: stream its text, record usage, append the reply, then emit text and telemetry.
@@ -242,9 +298,14 @@ class Agent:
         t1 = time.monotonic()
         for k in self.usage:
             self.usage[k] += resp.usage.get(k, 0)
+        unit = LoopDetector().check(resp.text or "")  # non-streamed replies (or a loop that began near the end)
+        if unit is not None:
+            if sink:
+                sink.discard()
+            raise RepetitionLoop(unit, "text")
         self.messages.append(resp.assistant_message)
-        if resp.text:
-            self.on_event("text", {"agent": self.name, "agent_id": self.agent_id, "text": resp.text,
+        if resp.text.strip():
+            self.on_event("text", {"agent": self.name, "agent_id": self.agent_id, "text": resp.text.strip(),
                                    "final": not resp.tool_calls})
         out_tokens = resp.usage.get("output", 0)
         first = sink.first if sink else None
@@ -369,11 +430,16 @@ class Harness:
         self.registry = ToolRegistry()
         self.executor = ToolExecutor(self.registry, self.roe, self.audit, self.case.artifacts / "spill",
                                      cfg.max_tool_result_chars, self.emit)
-        for spec in cfg.mcp_servers.values():  # Velociraptor evidence lands inside the forensic jail
+        self.vault_dir = vault.ensure(Path(cfg.forensics.get("vault_dir") or cfg.evidence_roots[0] / "vault"))
+        self.case_evidence_dir = casefiles.ensure_case_folder(cfg.forensics_dir, case_id)  # analyst drop folder
+        for spec in cfg.mcp_servers.values():  # Velociraptor evidence lands in the vault, inside the forensic jail
             if str(spec.get("module", "")).endswith(".velociraptor"):
                 env = spec.setdefault("env", {})
-                if not env.get("VELO_DOWNLOAD_DIR"):
-                    env["VELO_DOWNLOAD_DIR"] = str(cfg.evidence_roots[0] / "velociraptor")
+                # files pulled from endpoints always land in the vault (read-only, never executable)
+                want = Path(env.get("VELO_DOWNLOAD_DIR") or self.vault_dir / "velociraptor").resolve()
+                if not want.is_relative_to(self.vault_dir.resolve()):
+                    want = (self.vault_dir / "velociraptor").resolve()
+                env["VELO_DOWNLOAD_DIR"] = str(want)
         self.mcp = McpManager(cfg.mcp_servers, self.case.dir / "logs")
         self.experts = load_experts(cfg)
         self.backends: dict[str, LLMBackend] = {}
@@ -454,7 +520,8 @@ class Harness:
             self.registry.add(t)
         for t in self.memory.tools():
             self.registry.add(t)
-        for t in Forensics(self.cfg.forensics, self.cfg.evidence_roots, self.case).tools():
+        for t in Forensics(self.cfg.forensics, self.cfg.evidence_roots, self.case,
+                           case_folder=self.case_evidence_dir, vault_dir=self.vault_dir).tools():
             self.registry.add(t)
         await self.mcp.start(self.registry)
         self._register_orchestration()
@@ -520,6 +587,8 @@ class Harness:
         env = (f"\n\n# Session\nCase: {self.case.id} | Posture: {self.roe.posture.upper()} | Operator: {self.cfg.operator} | "
                f"UTC now: {datetime.now(timezone.utc).isoformat()[:19]}\nConnectors: "
                + ", ".join(f"{k}={v}" for k, v in self.mcp.status.items())
+               + f"\nCase evidence folder (the analyst drops artifacts here): {self.case_evidence_dir}"
+               + f"\nFiles pulled from endpoints (evidence vault): {self.vault_dir / 'velociraptor'}"
                + f"\nEvidence roots: {[str(p) for p in self.cfg.evidence_roots]}")
         return _prompt("core") + "\n\n" + role_prompt + env
 
@@ -531,7 +600,8 @@ class Harness:
                      transcript_name=f"{self.session}__{agent_id}__{self._agent_seq:03d}.json")
 
     def _new_lead(self) -> Agent:
-        lead = self._make_agent("lead", "lead", _prompt("lead"), None, ["*"], [], self.cfg.max_steps)
+        allow = list(self.cfg.orchestration.get("lead_tools") or DEFAULT_LEAD_TOOLS)
+        lead = self._make_agent("lead", "lead", _prompt("lead"), None, allow, [], self.cfg.max_steps)
         lead.add_local(skill_tools(self.skills, LEAD, "lead", self._skill_ctx, list(self.experts), self.emit))
         return lead
 

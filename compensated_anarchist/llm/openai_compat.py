@@ -129,6 +129,9 @@ class OpenAICompatBackend:
                                 text.append(piece)
                                 filt.feed(piece)
                                 emitted = True
+                            thought = delta.get("reasoning_content") or delta.get("reasoning")
+                            if thought and hasattr(on_delta, "reasoning"):  # not shown, but watched for loops
+                                on_delta.reasoning(thought)
                             for tc in delta.get("tool_calls") or []:
                                 _merge_tool_delta(calls, tc)
                             if ch.get("finish_reason"):

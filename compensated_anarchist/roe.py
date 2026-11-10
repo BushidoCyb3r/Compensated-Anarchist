@@ -35,6 +35,19 @@ from .config import load_yaml
 
 TIERS = ["auto", "notify", "approve", "deny"]
 
+# Built-in human-in-the-loop floor. Anything that changes an endpoint, runs on one, or pulls files from it through
+# Velociraptor needs an analyst's approval no matter what roe.yaml says: a rule can make these `deny`, but never
+# `auto` or `notify`. Quarantine, collection, hunts, memory images and evidence downloads all land here.
+HUMAN_GATED = (
+    "velociraptor*__collect_artifact", "velociraptor*__create_hunt", "velociraptor*__acquire_memory",
+    "velociraptor*__download_flow_uploads", "velociraptor*__label_client",
+    "velociraptor*__quarantine_host", "velociraptor*__unquarantine_host", "velociraptor*__run_server_vql",
+)
+
+
+def human_gated(tool: str) -> bool:
+    return any(fnmatch.fnmatchcase(tool, p) for p in HUMAN_GATED)
+
 
 @dataclass
 class Decision:
@@ -51,6 +64,7 @@ class Rule:
     tier: str
     args: dict[str, list[str]] = field(default_factory=dict)
     note: str = ""
+    observe: str = ""  # "ask": an approve-tier action that may still be requested in OBSERVE posture (collection)
 
     def matches(self, tool: str, arguments: dict[str, Any]) -> bool:
         if not fnmatch.fnmatchcase(tool, self.match):
@@ -104,7 +118,8 @@ class RoeGate:
         self.allowed_targets = [str(x) for x in scope.get("allowed_targets", [])]
         self.protected_assets = [str(x) for x in scope.get("protected_assets", [])]
         self.rules = [
-            Rule(match=r["match"], tier=r["tier"], args=r.get("args") or {}, note=r.get("note", ""))
+            Rule(match=r["match"], tier=r["tier"], args=r.get("args") or {}, note=r.get("note", ""),
+                 observe=str(r.get("observe", "")))
             for r in cfg.get("rules", [])
         ]
         for r in self.rules:
@@ -115,6 +130,17 @@ class RoeGate:
 
     # ---- classification -------------------------------------------------
     def classify(
+        self, tool: str, arguments: dict[str, Any], annotations: dict[str, Any] | None = None, server: str = ""
+    ) -> tuple[str, str]:
+        tier, why = self._classify(tool, arguments, annotations, server)
+        if tier in ("auto", "notify") and human_gated(tool):
+            return "approve", f"{why}; raised to approve by the built-in human gate (touches an endpoint)"
+        return tier, why
+
+    def _rule(self, tool: str, arguments: dict[str, Any]) -> Rule | None:
+        return next((r for r in self.rules if r.matches(tool, arguments)), None)
+
+    def _classify(
         self, tool: str, arguments: dict[str, Any], annotations: dict[str, Any] | None = None, server: str = ""
     ) -> tuple[str, str]:
         for r in self.rules:
@@ -166,7 +192,10 @@ class RoeGate:
         if tier == "deny":
             return Decision("deny", False, f"denied by ROE: {why}", why)
         if self.posture == "observe" and tier == "approve":
-            return Decision("deny", False, "denied: harness is in OBSERVE posture (no response actions)", why)
+            rule = self._rule(tool, arguments)
+            if not (rule and rule.observe == "ask" and rule.tier == "approve"):
+                return Decision("deny", False, "denied: harness is in OBSERVE posture (no response actions)", why)
+            why = f"{why}; OBSERVE posture allows asking for this collection"
 
         if tier in ("notify", "approve"):
             targets = self._targets(arguments)

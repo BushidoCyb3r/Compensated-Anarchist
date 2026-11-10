@@ -124,6 +124,7 @@ def test_mission_with_browser_approval(tmp_path, monkeypatch):
 def test_stop_repairs_history(tmp_path, monkeypatch):
     scripts = {"lead": [("Quarantining.", [("velociraptor__quarantine_host", {"client_id": "C.1111111111111111"})])]}
     dash, app = make(tmp_path, monkeypatch, scripts)
+    dash.cfg.orchestration["lead_tools"] = ["*"]  # this test has the lead act directly (the default lead delegates)
     with TestClient(app) as c:
         login(c)
         c.post("/api/message", json={"text": "contain"}, headers=H)

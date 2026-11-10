@@ -3,9 +3,14 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 config/.env
+# API client configs and other credentials (contain private keys)
+config/secrets/
+config/*.local.yaml
+*.api.yaml
 cases/
 memory/
 evidence/
+forensics/
 training.jsonl
 
 # private working list

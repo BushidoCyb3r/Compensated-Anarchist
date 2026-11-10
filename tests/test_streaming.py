@@ -226,6 +226,9 @@ def test_anthropic_stream_forwards_text(model):
     assert r.usage == {"input": 40, "output": 30} and r.stop_reason == "tool_use"
     body = json.loads(reqs[0].content)
     assert body["stream"] is True
+    # prompt caching: system prompt (with the tools before it) and the newest message are breakpoints
+    assert body["system"][-1]["cache_control"] == {"type": "ephemeral"} and body["system"][-1]["text"] == "sys"
+    assert body["messages"][-1]["content"][-1] == {"type": "text", "text": "go", "cache_control": {"type": "ephemeral"}}
     if model == "claude-opus-5-5":
         assert "server-side-fallback" in reqs[0].headers.get("anthropic-beta", "")
 

@@ -129,7 +129,38 @@ class ESClient:
         hits = res.get("hits", {})
         total = hits.get("total", {}).get("value", 0)
         docs = [{"_index": h["_index"], "_id": h["_id"], **h.get("_source", {})} for h in hits.get("hits", [])]
-        return dumps({"total": total, "returned": len(docs), "hits": docs})
+        out: dict[str, Any] = {"total": total, "returned": len(docs)}
+        if len(docs) < total:  # say so in the data itself: small models generalize from whatever rows they see
+            out["sample"] = (f"SAMPLE: {len(docs)} of {total} matching events, newest first. Fine to read; before you "
+                             f"decide anything from it (hosts, src->dst pairs, counts, a pattern, a verdict), go back and "
+                             f"verify over the full window with pair_counts or field_values.")
+        out["hits"] = docs
+        return dumps(out)
+
+    def pair_counts(self, index: str, query: str, start: str, end: str, a: str, b: str, size: int) -> str:
+        """Count events per (a, b) value pair over the WHOLE window - e.g. who talked to whom."""
+        n = max(1, min(size or 20, 100))
+        body: dict[str, Any] = {
+            "size": 0, "track_total_hits": True,
+            "query": {"bool": {"filter": [self.time_filter(start, end)]}},
+            "aggs": {"a": {"terms": {"field": a, "size": n}, "aggs": {"b": {"terms": {"field": b, "size": n}}}},
+                     "a_n": {"cardinality": {"field": a}}, "b_n": {"cardinality": {"field": b}}},
+        }
+        if query and query.strip() not in ("*", ""):
+            body["query"]["bool"]["must"] = [{"query_string": {"query": query, "analyze_wildcard": True}}]
+        res = self.req("POST", f"/{index}/_search", body, params={"ignore_unavailable": "true"})
+        total = res.get("hits", {}).get("total", {}).get("value", 0)
+        aggs = res.get("aggregations") or {}
+        pairs = sorted(((x["key"], y["key"], y["doc_count"]) for x in aggs.get("a", {}).get("buckets", [])
+                        for y in x.get("b", {}).get("buckets", [])), key=lambda t: -t[2])[:n]
+        covered = sum(c for _, _, c in pairs)
+        out: dict[str, Any] = {"query": query or "*", "total_events": total, f"distinct_{a}": aggs.get("a_n", {}).get("value"),
+                               f"distinct_{b}": aggs.get("b_n", {}).get("value"),
+                               "pairs": [f"{x} -> {y}: {c}" for x, y, c in pairs]}
+        if covered < total:
+            out["not_in_pairs"] = (f"{total - covered} of {total} events are not in these pairs (more pairs than size={n}, "
+                                   f"or events without {a}/{b}). Raise size or narrow the query before saying 'all'.")
+        return dumps(out)
 
     def search_dsl(self, index: str, body: dict[str, Any]) -> str:
         body = dict(body)

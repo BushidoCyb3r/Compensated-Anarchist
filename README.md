@@ -33,11 +33,14 @@ and the expert team **writes, scores and revises its own skills** as it works.
 
 ## Quick start
 
+**Setting up the model and connectors:** follow [SETUP.md](SETUP.md). It covers a step-by-step for each system
+(Security Onion, Elastic, Splunk, Velociraptor, MISP, OpenCTI, local tools) and the scope file.
+
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e '.[all]'     # or just -e . for the core
-cp config/env.example config/.env && $EDITOR config/.env         # models + connector credentials
+./scripts/install.sh                                             # venv, install, config/.env, folders, doctor
+$EDITOR config/.env                                              # models + connector credentials (SETUP.md)
+# evidence for a case goes in forensics/<case-id>/ (created per case; the forensics playbook starts there)
 set -a; source config/.env; set +a
-mkdir -p evidence                                                # put evidence here (read-only jail)
 
 .venv/bin/canarchist doctor    --case TEST                       # models, connectors, ROE tier per tool
 .venv/bin/canarchist dashboard --case IR-2026-0042               # web GUI -> open the printed login URL
@@ -186,8 +189,8 @@ and a Velociraptor `investigator,api` client.
   both entries at it.
 - **New API users.** A running server only sees API users created with `config api_client` after a
   restart. Without one, the connector reports `User not found`.
-- **Downloads.** Collected files land in `<first evidence root>/velociraptor/<client>/<flow>/`, inside the
-  forensic jail, so Volatility, YARA and the other local tools can open them directly.
+- **Downloads.** Collected files land in the vault, `<first evidence root>/vault/velociraptor/<client>/<flow>/`,
+  inside the forensic jail, so Volatility, YARA and the other local tools can read (never run) them.
 - **No injection.** Tool arguments reach VQL only as parameters. They are prefixed `Ca…` because plain
   names collide with VQL builtins (`Artifact`) and keywords (`DESC`).
 - **Artifact names.** `Windows.KapeFiles.Targets` is no longer built in as of 0.77; import it with
@@ -195,6 +198,10 @@ and a Velociraptor `investigator,api` client.
   `Linux.Triage.ProcessMemory`.
 - **Remote shells.** Shell artifacts (`*.System.PowerShell`, `*.System.CmdShell`, `*.Sys.BashShell`) are
   set to `deny` in roe.yaml. Change them to `approve` only if your ROE permits remote command execution.
+- **Human in the loop.** Every collection, hunt, memory image, evidence download, label, quarantine and server-VQL
+  call needs an analyst's approval, enforced in code so `roe.yaml` cannot lower it. Files pulled from endpoints
+  land in the evidence vault (`evidence/vault/`): read-only, never executable, executables renamed
+  `.quarantined`, every file in `MANIFEST.jsonl`. See SETUP.md section 5.
 - **Re-verify.** To re-check the connector against your own server version, run:
   `CA_VELO_API_CONFIG=api.yaml CA_VELO_ADMIN_API_CONFIG=admin.yaml pytest tests/test_velociraptor_live.py`
 

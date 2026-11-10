@@ -864,6 +864,13 @@ const H = {
     }
     if (!S.replaying) { refreshConvs(); scheduleRefresh(); }
   },
+  loop_guard(d, ev) {
+    const what = d.gave_up ? "Gave up: the model kept repeating itself" : "Cut off a reply that was repeating itself and asked again";
+    const detail = `"${d.unit}"${d.where === "reasoning" ? " (in its reasoning)" : ""}`;
+    if (!isLead(d)) { subLog(d.agent_id || d.agent, "text", { text: `${what}: ${detail}` }, ev.ts); return; }
+    const st = addStep(ensureTurn(ev.ts), { icon: "alert", what, detail });
+    if (d.gave_up) setEnd(st, el("span", { class: "chip red", text: "Stopped" }));
+  },
   compact(d, ev) {
     if (!isLead(d)) { subLog(d.agent_id || d.agent, "text", { text: `Compacted ${d.dropped} old messages` }, ev.ts); return; }
     addStep(ensureTurn(ev.ts), { icon: "refresh", what: "Compacted the lead's context", detail: `${plural(d.dropped, "older message")} summarized` });
@@ -926,14 +933,14 @@ function liveChanged(id) {
   if (id === "lead") { renderLeadLiveSoon(); return; }
   const s = S.subs.get(id); if (!s) return;
   const v = S.live.get(id);
-  if (v && v.text) s.activity = tailLine(v.text);
+  if (v && v.text.trim()) s.activity = tailLine(v.text);
   if (s.actEl && s.actEl.isConnected && s.status === "running" && !isWaiting(s)) s.actEl.textContent = s.activity || "Working";
   if (S.insp.thread === id) renderThreadLiveSoon();
 }
 function rafOnce(fn) { let q = 0; return () => { if (!q) q = requestAnimationFrame(() => { q = 0; fn(); }); }; }
 const renderLeadLiveSoon = rafOnce(() => {
   const v = S.live.get("lead");
-  if (!v || !v.text) { if (S.turn) dropLeadLive(S.turn); return; }
+  if (!v || !v.text.trim()) { if (S.turn) dropLeadLive(S.turn); return; }
   const t = ensureTurn(Date.now() / 1000);
   mutate(() => {
     t.lead.hidden = false;
@@ -946,8 +953,9 @@ const renderThreadLiveSoon = rafOnce(() => {
   const box = S.ui.threadLive; const id = S.insp.thread;
   if (!box || !box.isConnected || !id) return;
   const v = S.live.get(id);
-  clear(box); box.hidden = !(v && v.text);
-  if (v && v.text) box.append(withCaret(md(v.text)));
+  const has = !!(v && v.text.trim());
+  clear(box); box.hidden = !has;
+  if (has) box.append(withCaret(md(v.text)));
 });
 
 function subStepBody(id) {
@@ -1190,7 +1198,16 @@ function caseTimeline(body, c) {
   }
 }
 function caseEvidence(body, c) {
-  if (!c.evidence.length) { body.append(el("div", { class: "empty", text: "No evidence registered yet." })); return; }
+  const st = S.st || {};
+  if (st.evidence_folder) {
+    body.append(el("div", { class: "card drop-card" },
+      el("div", { class: "label", text: "Drop artifacts for this case into" }),
+      el("div", { class: "path-row" }, el("span", { class: "mono", text: st.evidence_folder }),
+        el("button", { type: "button", class: "btn btn-ghost icon-btn btn-sm", "aria-label": "Copy folder path", title: "Copy path", onclick: () => copyText(st.evidence_folder) }, icon("copy", 14))),
+      el("div", { class: "muted small", text: "Subfolders disk/, memory/, logs/, network/, mobile/, triage/, other/ - types are detected by content. Files pulled from endpoints land in the evidence vault. The forensics playbook starts from both." }),
+      el("div", { class: "toolbar" }, el("button", { type: "button", class: "btn btn-sm", onclick: () => setPlaybook("forensics") }, icon("list", 14), "Examine this case's evidence"))));
+  }
+  if (!c.evidence.length) { body.append(el("div", { class: "empty", text: "No evidence registered yet. The team registers and hashes each item before analysis." })); return; }
   for (const e of c.evidence) {
     const sha = (e.hashes && e.hashes.sha256) || "";
     body.append(el("div", { class: "card", css: { padding: "10px 12px" } },

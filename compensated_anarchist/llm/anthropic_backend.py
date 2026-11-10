@@ -83,6 +83,23 @@ class AnthropicBackend:
         return "\n\n".join(system_parts), clean
 
     @staticmethod
+    def _cache(system: str, wire: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Prompt caching for agent loops: one breakpoint on the system prompt (tools render before it, so they
+        are cached with it) and one on the newest message, so each step re-reads the earlier conversation from
+        cache instead of paying for it again. Caching is a prefix match; the system prompt and tool list are
+        fixed for the life of an agent."""
+        sys_blocks = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}] if system else []
+        if wire:
+            last = dict(wire[-1])
+            content = last["content"]
+            blocks = [{"type": "text", "text": content}] if isinstance(content, str) else [dict(b) for b in content]
+            if blocks and blocks[-1].get("type") not in ("thinking", "redacted_thinking"):
+                blocks[-1]["cache_control"] = {"type": "ephemeral"}
+                last["content"] = blocks
+                wire = [*wire[:-1], last]
+        return sys_blocks, wire
+
+    @staticmethod
     async def _consume(stream: Any, on_delta: DeltaFn | None) -> Any:
         if on_delta:
             async for event in stream:
@@ -92,11 +109,12 @@ class AnthropicBackend:
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec], on_delta: DeltaFn | None = None) -> LLMResponse:
         system, wire = self._convert(messages)
+        system_blocks, wire = self._cache(system, wire)
         p = self.profile
         params: dict[str, Any] = {
             "model": p.model,
             "max_tokens": max(p.max_output_tokens, 16000),
-            "system": system,
+            "system": system_blocks,
             "messages": wire,
             "thinking": {"type": "adaptive"},
             "output_config": {"effort": p.effort},

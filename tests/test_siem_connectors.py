@@ -170,3 +170,52 @@ def test_elastic(monkeypatch):
     summary = json.loads(el.alerts_summary())
     assert summary == [{"rule": "Suspicious PowerShell", "count": 3, "hosts": 2, "severity": ["high"]}]
     assert {"term": {"kibana.alert.workflow_status": "open"}} in seen[-1][3]["query"]["bool"]["filter"]
+
+
+def test_samples_are_flagged_and_pairs_count_the_whole_window(monkeypatch):
+    """A 4B model once reported 'all alerts come from X' after reading 10 of 40. Sampling is fine, but a sample must
+    say it is one, and the summary / pair_counts must give whole-window host pairs to verify conclusions against."""
+    so = load(monkeypatch, "security_onion", {"SO_URL": "https://so.invalid:9200", "SO_API_KEY": "k3y"})
+    seen: list = []
+    pairs = {"buckets": [
+        {"key": "10.99.1.1", "doc_count": 30, "dst": {"buckets": [{"key": "10.99.1.47", "doc_count": 24}, {"key": "10.99.1.6", "doc_count": 6}]}},
+        {"key": "172.31.5.1", "doc_count": 10, "dst": {"buckets": [{"key": "172.31.5.17", "doc_count": 10}]}}]}
+
+    def handler(method, path, body):
+        aggs = body.get("aggs") or {}
+        if "rule" in aggs:
+            return httpx.Response(200, json={"hits": {"total": {"value": 40}, "hits": []}, "aggregations": {"rule": {"buckets": [
+                {"key": "ET MALWARE BPFDoor ICMP Echo Reply", "doc_count": 40, "sev": {"buckets": [{"key": "high"}]},
+                 "module": {"buckets": [{"key": "suricata"}]}, "src": {"value": 2}, "dst": {"value": 3}, "pairs": pairs,
+                 "last": {"value_as_string": "2026-11-10T09:12:15Z"}}]}}})
+        if "a" in aggs:  # pair_counts
+            return httpx.Response(200, json={"hits": {"total": {"value": 45}, "hits": []}, "aggregations": {
+                "a_n": {"value": 2}, "b_n": {"value": 3},
+                "a": {"buckets": [{**x, "b": x["dst"]} for x in pairs["buckets"]]}}})
+        hit = {"_index": "i", "_id": "1", "_source": {"source": {"ip": "172.31.5.1"}, "destination": {"ip": "172.31.5.17"}}}
+        return httpx.Response(200, json={"hits": {"total": {"value": 40}, "hits": [hit] * 10}})
+
+    mock(so, "https://so.invalid:9200", handler, seen)
+    sample = json.loads(so.alerts('rule.name:"ET MALWARE BPFDoor*"', size=10))
+    assert sample["returned"] == 10 and sample["total"] == 40 and sample["sample"].startswith("SAMPLE: 10 of 40")
+    assert "verify over the full window" in sample["sample"]
+    assert list(sample)[:3] == ["total", "returned", "sample"]  # the warning comes before the rows
+
+    row = json.loads(so.alerts_summary())[0]
+    assert row["top_pairs"] == ["10.99.1.1 -> 10.99.1.47: 24", "172.31.5.1 -> 172.31.5.17: 10", "10.99.1.1 -> 10.99.1.6: 6"]
+    assert "pairs_cover" not in row  # the pairs account for all 40
+
+    out = json.loads(so.pair_counts('rule.name:"ET MALWARE BPFDoor*"', alerts_only=True))
+    assert out["pairs"][0] == "10.99.1.1 -> 10.99.1.47: 24" and out["distinct_source.ip"] == 2
+    assert "5 of 45 events are not in these pairs" in out["not_in_pairs"]
+    _, path, params, body = seen[-1]
+    assert path == "/logs-*.alerts-so/_search" and body["track_total_hits"] is True
+    assert body["query"]["bool"]["must"][0]["query_string"]["query"] == '(rule.name:"ET MALWARE BPFDoor*")'
+    so.pair_counts("event.dataset:zeek.conn")
+    assert seen[-1][1] == "/logs-*-so/_search"  # not alerts_only: all SO data
+
+    # full results are not flagged
+    def full(method, path, body):
+        return httpx.Response(200, json={"hits": {"total": {"value": 1}, "hits": [{"_index": "i", "_id": "1", "_source": {}}]}})
+    mock(so, "https://so.invalid:9200", full, seen)
+    assert "sample" not in json.loads(so.search("x"))
