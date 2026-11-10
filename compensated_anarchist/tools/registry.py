@@ -77,17 +77,20 @@ class ToolExecutor:
         self.on_event = on_event or (lambda kind, data: None)
         self.denials: list[dict[str, Any]] = []  # analyst denials -> learning signal
 
-    async def execute(self, call: ToolCall, agent: str, rationale: str, allowed: list[ToolSpec]) -> tuple[str, bool]:
-        """Returns (content_for_model, is_error)."""
+    async def execute(self, call: ToolCall, agent: str, rationale: str, allowed: list[ToolSpec],
+                      local: dict[str, Tool] | None = None, agent_id: str = "") -> tuple[str, bool]:
+        """Returns (content_for_model, is_error). `local` holds tools bound to this agent (skills, report
+        submission); they go through the same ROE gate and audit as registry tools."""
         if call.parse_error:
             return f"ERROR: {call.parse_error}. Re-issue the call with valid JSON arguments.", True
         if call.name not in {s.name for s in allowed}:
             return f"ERROR: tool '{call.name}' is not available to agent '{agent}'.", True
-        tool = self.registry.tools[call.name]
+        tool = (local or {}).get(call.name) or self.registry.tools[call.name]
+        aid = agent_id or agent
 
         decision = await self.roe.authorize(call.name, call.arguments, rationale, agent, tool.annotations, tool.server)
-        self.on_event("decision", {"agent": agent, "tool": call.name, "args": call.arguments, "tier": decision.tier,
-                                   "allowed": decision.allowed, "reason": decision.reason})
+        self.on_event("decision", {"agent": agent, "agent_id": aid, "tool": call.name, "args": call.arguments,
+                                   "tier": decision.tier, "allowed": decision.allowed, "reason": decision.reason})
         if not decision.allowed:
             if "analyst DENIED" in decision.reason:
                 self.denials.append({"agent": agent, "tool": call.name, "args": call.arguments, "reason": decision.reason})
@@ -108,9 +111,9 @@ class ToolExecutor:
         elapsed = round(time.monotonic() - t0, 2)
 
         digest = hashlib.sha256(out.encode("utf-8", "replace")).hexdigest()
-        self.audit.record("tool_result", agent=agent, tool=call.name, sha256=digest, chars=len(out),
+        self.audit.record("tool_result", agent=agent, agent_id=aid, tool=call.name, sha256=digest, chars=len(out),
                           error=is_error, seconds=elapsed)
-        self.on_event("result", {"agent": agent, "tool": call.name, "chars": len(out), "error": is_error,
+        self.on_event("result", {"agent": agent, "agent_id": aid, "tool": call.name, "chars": len(out), "error": is_error,
                                  "seconds": elapsed, "preview": out[:800]})
         return self._wrap(call.name, tool.server, out), is_error
 

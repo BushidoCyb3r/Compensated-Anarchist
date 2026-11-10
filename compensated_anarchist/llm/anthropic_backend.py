@@ -4,6 +4,9 @@
 - server-side refusal fallbacks enabled by default on models that support it
 - assistant content blocks (incl. thinking blocks) are replayed verbatim via the
   private "_anthropic" key so multi-turn tool use stays valid.
+- every request streams (timeout protection); with an on_delta sink, text deltas are forwarded as they arrive.
+  After a mid-stream server-side fallback the partial text is kept and the fallback model continues it, so the
+  streamed text never has to be retracted.
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ import json
 from typing import Any
 
 from ..config import ModelProfile
-from .base import LLMResponse, ToolCall, ToolSpec
+from .base import DeltaFn, LLMResponse, ToolCall, ToolSpec
 
 _FALLBACK_MODELS = {"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 _FALLBACK_BETA = "server-side-fallback-2026-07-01"
@@ -79,7 +82,15 @@ class AnthropicBackend:
         clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in out]
         return "\n\n".join(system_parts), clean
 
-    async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec]) -> LLMResponse:
+    @staticmethod
+    async def _consume(stream: Any, on_delta: DeltaFn | None) -> Any:
+        if on_delta:
+            async for event in stream:
+                if event.type == "text" and event.text:
+                    on_delta(event.text)
+        return await stream.get_final_message()
+
+    async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec], on_delta: DeltaFn | None = None) -> LLMResponse:
         system, wire = self._convert(messages)
         p = self.profile
         params: dict[str, Any] = {
@@ -96,14 +107,24 @@ class AnthropicBackend:
                 {"name": t.name, "description": t.description, "input_schema": t.parameters, "eager_input_streaming": True}
                 for t in tools
             ]
+        sink = on_delta if p.stream else None
+        api = self.client.messages
         if p.model in _FALLBACK_MODELS:
             params["betas"] = [_FALLBACK_BETA]
             params["fallbacks"] = "default"
-            async with self.client.beta.messages.stream(**params) as stream:
-                msg = await stream.get_final_message()
-        else:
-            async with self.client.messages.stream(**params) as stream:
-                msg = await stream.get_final_message()
+            api = self.client.beta.messages
+        for attempt in range(3):
+            try:
+                async with api.stream(**params) as stream:
+                    msg = await self._consume(stream, sink)
+                break
+            except ValueError:
+                # eager input streaming: tool-input JSON the SDK could not parse at all. No tool_use id exists to
+                # answer, so re-issue the turn (bounded) and discard the text streamed so far.
+                if attempt == 2:
+                    raise
+                if sink:
+                    sink(None)
 
         raw_blocks = [b.model_dump(exclude_none=True) for b in msg.content]
         text = "".join(b.text for b in msg.content if b.type == "text")

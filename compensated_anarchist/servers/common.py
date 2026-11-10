@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 import sys
 from typing import Any, Callable
 
@@ -60,6 +61,17 @@ def dumps(obj: Any, limit: int = 60000) -> str:
     return s if len(s) <= limit else s[:limit] + f"\n...[truncated {len(s) - limit} chars - narrow the query]"
 
 
+class ESHTTPError(RuntimeError):
+    def __init__(self, status: int, text: str):
+        super().__init__(f"HTTP {status}: {text[:2000]}")
+        self.status = status
+
+
+def _stream_name(index: str) -> str:
+    """'.ds-logs-zeek-so-2026.10.25-000016' -> 'logs-zeek-so' (backing index -> data stream)."""
+    return re.sub(r"-\d{4}\.\d{2}\.\d{2}-\d+$", "", index.removeprefix(".ds-"))
+
+
 class ESClient:
     """Minimal Elasticsearch / OpenSearch client (used by the Elastic and Security Onion servers)."""
 
@@ -79,8 +91,24 @@ class ESClient:
     def req(self, method: str, path: str, body: Any = None, params: dict[str, Any] | None = None) -> Any:
         r = self.http.request(method, path, json=body, params=params)
         if r.status_code >= 400:
-            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:2000]}")
+            raise ESHTTPError(r.status_code, r.text)
         return r.json()
+
+    def inventory(self, pattern: str) -> list[dict[str, Any]]:
+        """Data streams/indices with doc counts and newest event, using only the `read` privilege (a terms
+        aggregation on _index) - works with a least-privilege read-only API key, unlike _cat/_data_stream."""
+        body = {"size": 0, "aggs": {"i": {"terms": {"field": "_index", "size": 2000},
+                                          "aggs": {"last": {"max": {"field": self.time_field}}}}}}
+        res = self.req("POST", f"/{pattern or '*'}/_search", body, params={"ignore_unavailable": "true"})
+        out: dict[str, dict[str, Any]] = {}
+        for b in res["aggregations"]["i"]["buckets"]:
+            s = out.setdefault(_stream_name(b["key"]), {"name": _stream_name(b["key"]), "docs": 0, "backing_indices": 0, "last_event": None})
+            s["docs"] += b["doc_count"]
+            s["backing_indices"] += 1
+            last = b["last"].get("value_as_string")
+            if last and (s["last_event"] is None or last > s["last_event"]):
+                s["last_event"] = last
+        return sorted(out.values(), key=lambda s: -s["docs"])
 
     def time_filter(self, start: str, end: str) -> dict[str, Any]:
         return {"range": {self.time_field: {"gte": start or "now-24h", "lte": end or "now"}}}
@@ -111,9 +139,14 @@ class ESClient:
                       "aggregations": res.get("aggregations")})
 
     def esql(self, query: str) -> str:
-        res = self.req("POST", "/_query", {"query": query}, params={"format": "json"})
+        # without KEEP, ES|QL returns every mapped field (thousands on a SIEM) - drop all-null columns server-side
+        # (drop_null_columns, ES 8.13+) and again client-side for older clusters
+        res = self.req("POST", "/_query", {"query": query}, params={"format": "json", "drop_null_columns": "true"})
         cols = [c["name"] for c in res.get("columns", [])]
         rows = res.get("values", [])[: self.max_hits]
+        keep = [i for i in range(len(cols)) if any(i < len(r) and r[i] is not None for r in rows)] if rows else list(range(len(cols)))
+        if len(keep) < len(cols):
+            cols, rows = [cols[i] for i in keep], [[r[i] for i in keep] for r in rows]
         return dumps({"columns": cols, "rows": rows, "returned": len(rows)})
 
     def eql(self, index: str, query: str, start: str, end: str, size: int) -> str:
@@ -125,9 +158,15 @@ class ESClient:
         return dumps(out)
 
     def indices(self, pattern: str) -> str:
-        res = self.req("GET", f"/_cat/indices/{pattern or '*'}", params={"format": "json", "h": "index,docs.count,store.size,health",
-                                                                        "s": "index", "expand_wildcards": "open"})
-        return dumps(res[:500])
+        try:
+            res = self.req("GET", f"/_cat/indices/{pattern or '*'}", params={"format": "json", "h": "index,docs.count,store.size,health",
+                                                                            "s": "index", "expand_wildcards": "open"})
+            return dumps(res[:500])
+        except ESHTTPError as e:
+            if e.status != 403:
+                raise
+        return dumps({"source": "aggregation on _index (API key lacks monitor/view_index_metadata - expected for read-only keys)",
+                      "streams": self.inventory(pattern)[:500]})
 
     def field_values(self, index: str, field: str, query: str, start: str, end: str, size: int, rare: bool) -> str:
         body: dict[str, Any] = {

@@ -1,10 +1,26 @@
-"""Agent loop, expert delegation and the Harness that wires everything together."""
+"""Agent loop, the orchestrator / subagent model, and the Harness that wires everything together.
+
+Orchestrator - subagent relationship
+  - The lead is the one orchestrator. It answers to the analyst, plans, and spawns expert subagents
+    (subagent_spawn). Each subagent gets an id (SA-001...), a scoped brief and its own context window.
+  - A subagent persists for the whole conversation: the orchestrator follows up with the same subagent
+    (subagent_message) and it still has everything it learned. Subagent state survives restarts.
+  - Subagents never spawn agents. They finish every task with a structured report (submit_report: status,
+    bottom line, evidence, confidence, open questions, recommended tasks, skills used). Recommended tasks go UP
+    to the orchestrator, which decides what runs next.
+  - Independent subagents run in parallel, bounded by orchestration.max_parallel.
+
+Chat history: every conversation (feed + orchestrator/subagent context) is persisted in the ChatStore and kept
+until the analyst deletes it. Skills: see skills.py.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -17,19 +33,31 @@ import yaml
 from .audit import AuditLog
 from .case import Case
 from .config import HarnessConfig
+from .history import ChatStore
 from .llm import LLMBackend, ToolSpec, make_backend
 from .llm.base import estimate_tokens
 from .mcp_manager import McpManager
 from .memory import Memory
 from .roe import RoeGate, cli_approver, deny_all_approver
+from .skills import LEAD, SkillStore, skill_tools
 from .tools.forensics import Forensics
 from .tools.registry import Tool, ToolExecutor, ToolRegistry, schema
 
 EventFn = Callable[[str, dict[str, Any]], None]
 
+# events that make up the conversation feed (persisted and replayed); everything else is UI-only
+PERSIST_KINDS = {"analyst_message", "text", "subagent_spawn", "subagent_message", "subagent_report", "subagent_steer",
+                 "decision", "result", "approval_request", "approval_resolved", "run_end", "compact", "skill_used",
+                 "skill_proposed", "retro_start"}
+REPORT_STATUSES = ["completed", "blocked", "needs_input", "failed"]
+
 
 def _prompt(name: str) -> str:
     return resources.files("compensated_anarchist").joinpath(f"prompts/{name}.md").read_text(encoding="utf-8")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -79,47 +107,155 @@ def load_experts(cfg: HarnessConfig) -> dict[str, ExpertDef]:
 # ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
+DELTA_INTERVAL_S = 0.05  # streamed text is batched into one "delta" event per ~50 ms per agent
+
+
+def _accepts_on_delta(backend: Any) -> bool:
+    try:
+        return "on_delta" in inspect.signature(backend.chat).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+class _DeltaSink:
+    """Collects streamed text and emits it as ephemeral "delta" events.
+
+    Each event carries the text added since the last one and its offset in the reply being generated, so a client
+    that reconnects can stitch the live text without gaps or duplicates. {"reset": True} discards the reply so far
+    (the provider restarted the response, or the call failed).
+    """
+
+    def __init__(self, agent: "Agent"):
+        self.agent = agent
+        self.buf: list[str] = []
+        self.offset = 0
+        self.first: float | None = None
+        self.handle: asyncio.TimerHandle | None = None
+        self.loop = asyncio.get_running_loop()
+
+    def _emit(self, **data: Any) -> None:
+        self.agent.on_event("delta", {"agent": self.agent.name, "agent_id": self.agent.agent_id, **data})
+
+    def __call__(self, chunk: str | None) -> None:
+        if chunk is None:
+            self.discard()
+            return
+        if self.first is None:
+            self.first = time.monotonic()
+        self.buf.append(chunk)
+        if self.handle is None:
+            self.handle = self.loop.call_later(DELTA_INTERVAL_S, self.flush)
+
+    def flush(self) -> None:
+        if self.handle:
+            self.handle.cancel()
+            self.handle = None
+        if self.buf:
+            text = "".join(self.buf)
+            self.buf.clear()
+            self._emit(text=text, offset=self.offset)
+            self.offset += len(text)
+
+    def discard(self) -> None:
+        if self.handle:
+            self.handle.cancel()
+            self.handle = None
+        had = self.offset or self.buf
+        self.buf.clear()
+        self.offset = 0
+        if had:
+            self._emit(reset=True)
+
+
 class Agent:
     def __init__(self, name: str, system: str, backend: LLMBackend, executor: ToolExecutor, tools: list[ToolSpec],
-                 max_steps: int, transcript_path: Path, on_event: EventFn):
-        self.name = name
+                 max_steps: int, on_event: EventFn, agent_id: str = "", on_save: Callable[["Agent"], None] | None = None,
+                 transcript_name: str = ""):
+        self.name = name                      # expert name (ROE / allowlists / audit)
+        self.agent_id = agent_id or name      # instance id: "lead" or SA-###
         self.backend = backend
         self.executor = executor
-        self.tools = tools
+        self.tools = list(tools)
+        self.local: dict[str, Tool] = {}      # tools bound to this agent (skills, submit_report)
         self.max_steps = max_steps
-        self.transcript_path = transcript_path
         self.on_event = on_event
+        self.on_save = on_save
+        self.transcript_name = transcript_name or f"{self.agent_id}.json"
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         self.usage = {"input": 0, "output": 0}
+        self.terminal: dict[str, Any] | None = None  # set by a terminal tool (submit_report) to end the turn
+        self.inbox: list[str] = []  # analyst guidance ("steer"), delivered before the next model call
+
+    def add_local(self, tools: list[Tool]) -> None:
+        for t in tools:
+            self.local[t.name] = t
+            self.tools.append(t.spec)
 
     async def turn(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
+        self.terminal = None
         final = ""
-        for step in range(self.max_steps):
+        for _ in range(self.max_steps):
+            if self.inbox:
+                notes, self.inbox = self.inbox, []
+                self.messages.append({"role": "user", "content": "[Guidance from the analyst - adjust your work accordingly]\n"
+                                      + "\n".join(f"- {n}" for n in notes)})
             await self._maybe_compact()
-            resp = await self.backend.chat(self.messages, self.tools)
-            for k in self.usage:
-                self.usage[k] += resp.usage.get(k, 0)
-            self.messages.append(resp.assistant_message)
-            if resp.text:
-                self.on_event("text", {"agent": self.name, "text": resp.text, "final": not resp.tool_calls})
+            resp = await self._step(self.tools)
             if not resp.tool_calls:
                 final = resp.text
                 break
             results = await asyncio.gather(*[
-                self.executor.execute(c, self.name, resp.text, self.tools) for c in resp.tool_calls])
+                self.executor.execute(c, self.name, resp.text, self.tools, self.local, self.agent_id) for c in resp.tool_calls])
             for call, (content, is_err) in zip(resp.tool_calls, results):
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,
                                       "content": content, "_is_error": is_err})
+            if self.terminal is not None:
+                final = self.terminal.get("summary", "")
+                break
         else:
             self.messages.append({"role": "user", "content": (
                 "Step budget exhausted. Do not call tools. Give your final report now: what you did, what you "
                 "found (with evidence), what remains open, and recommended next steps.")})
-            resp = await self.backend.chat(self.messages, [])
-            self.messages.append(resp.assistant_message)
+            resp = await self._step([])
             final = resp.text
         self.save()
         return final or "(no final answer)"
+
+    async def _step(self, tools: list[ToolSpec]) -> Any:
+        """One model call: stream its text, record usage, append the reply, then emit text and telemetry.
+
+        The text event comes before telemetry so a client can swap the streamed draft for the final text in one go.
+        """
+        sink = _DeltaSink(self) if _accepts_on_delta(self.backend) else None  # the backend can be switched mid-session
+        t0 = time.monotonic()
+        try:
+            if sink:
+                resp = await self.backend.chat(self.messages, tools, on_delta=sink)
+                sink.flush()
+            else:
+                resp = await self.backend.chat(self.messages, tools)
+        except BaseException:
+            if sink:
+                sink.discard()  # the partial reply will never complete
+            raise
+        t1 = time.monotonic()
+        for k in self.usage:
+            self.usage[k] += resp.usage.get(k, 0)
+        self.messages.append(resp.assistant_message)
+        if resp.text:
+            self.on_event("text", {"agent": self.name, "agent_id": self.agent_id, "text": resp.text,
+                                   "final": not resp.tool_calls})
+        out_tokens = resp.usage.get("output", 0)
+        first = sink.first if sink else None
+        gen = t1 - first if first and t1 - first > 0.2 else t1 - t0  # generation speed, excluding time to first token
+        self.on_event("telemetry", {
+            "agent_id": self.agent_id, "seconds": round(t1 - t0, 2),
+            "ttft": round(first - t0, 2) if first else None,
+            "tok_s": round(out_tokens / gen, 1) if out_tokens and gen > 0.05 else None,
+            "context_pct": round(100 * estimate_tokens(self.messages) / max(1, self.backend.context_tokens)),
+            "input": self.usage["input"], "output": self.usage["output"]})
+        return resp
 
     def repair(self, reason: str = "cancelled by analyst") -> None:
         """After an interrupted turn, close any tool calls left without results so the history stays valid."""
@@ -163,18 +299,57 @@ class Agent:
         for m in tail:  # replayed provider-private blocks (e.g. thinking) are bound to the old prefix
             m.pop("_anthropic", None)
         self.messages = [self.messages[0], {"role": "user", "content": f"[Compacted history of this operation]\n{summary}"}] + tail
-        self.on_event("compact", {"agent": self.name, "dropped": len(old)})
+        self.on_event("compact", {"agent": self.name, "agent_id": self.agent_id, "dropped": len(old)})
+
+    def export_state(self) -> dict[str, Any]:
+        return {"name": self.name, "agent_id": self.agent_id, "model": self.backend.profile_name, "usage": self.usage,
+                "messages": self.messages[1:]}
+
+    def restore(self, state: dict[str, Any]) -> None:
+        """Resume from a saved state under a fresh system prompt (session details change between runs)."""
+        msgs = state.get("messages") or []
+        for m in msgs:  # provider-private blocks are bound to the old prompt prefix
+            m.pop("_anthropic", None)
+        self.messages = [self.messages[0], *msgs]
+        self.usage = dict(state.get("usage") or self.usage)
 
     def save(self) -> None:
-        self.transcript_path.parent.mkdir(parents=True, exist_ok=True)
-        self.transcript_path.write_text(json.dumps({
-            "agent": self.name, "model": self.backend.profile_name, "usage": self.usage,
-            "tools": [{"name": t.name, "description": t.description, "parameters": t.parameters} for t in self.tools],
-            "messages": self.messages}, indent=1, default=str))
+        if self.on_save:
+            self.on_save(self)
 
 
 # ---------------------------------------------------------------------------
-# Harness: case + memory + ROE + tools + MCP + lead agent + experts
+# Subagents
+# ---------------------------------------------------------------------------
+SUB_META = ("id", "expert", "title", "task", "context", "expected", "status", "turns", "created", "updated", "last_report",
+            "started")
+
+
+@dataclass
+class SubAgent:
+    id: str
+    expert: str
+    title: str
+    task: str
+    context: str = ""
+    expected: str = ""
+    status: str = "idle"  # running | completed | blocked | needs_input | failed | interrupted
+    turns: int = 0
+    created: str = ""
+    updated: str = ""
+    last_report: dict[str, Any] | None = None
+    started: float = 0.0  # epoch seconds of the current / last run
+    agent: Agent | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    job: asyncio.Task | None = None  # the running agent turn, so the analyst can stop this subagent alone
+    stop_requested: bool = False
+
+    def meta(self) -> dict[str, Any]:
+        return {k: getattr(self, k) for k in SUB_META}
+
+
+# ---------------------------------------------------------------------------
+# Harness: case + memory + skills + history + ROE + tools + MCP + orchestrator + subagents
 # ---------------------------------------------------------------------------
 class Harness:
     def __init__(self, cfg: HarnessConfig, case_id: str, model: str | None = None, posture: str | None = None,
@@ -187,10 +362,13 @@ class Harness:
         self.audit = AuditLog(self.case.dir / "audit.jsonl", cfg.operator)
         self.memory = Memory(cfg.memory_db, cfg.memory, self.audit)
         self.memory.case_id = case_id
+        self.skills = SkillStore(cfg.memory_db, cfg.skills, self.audit)
+        self.history = ChatStore(cfg.history_db)
+        self.conversation: dict[str, Any] | None = None
         self.roe = RoeGate(cfg.roe_path, self.audit, cli_approver if interactive else deny_all_approver, posture)
         self.registry = ToolRegistry()
         self.executor = ToolExecutor(self.registry, self.roe, self.audit, self.case.artifacts / "spill",
-                                     cfg.max_tool_result_chars, self.on_event)
+                                     cfg.max_tool_result_chars, self.emit)
         for spec in cfg.mcp_servers.values():  # Velociraptor evidence lands inside the forensic jail
             if str(spec.get("module", "")).endswith(".velociraptor"):
                 env = spec.setdefault("env", {})
@@ -200,17 +378,78 @@ class Harness:
         self.experts = load_experts(cfg)
         self.backends: dict[str, LLMBackend] = {}
         self.lead: Agent | None = None
+        self.subagents: dict[str, SubAgent] = {}
+        self._sub_states: dict[str, dict[str, Any]] = {}
+        self.max_parallel = max(1, int(cfg.orchestration.get("max_parallel", 4)))
+        self._sem: asyncio.Semaphore | None = None
         self._alias_cache: dict[str, tuple[float, list[str]]] = {}
         self.roe.target_resolver = self._resolve_target
-        self._expert_runs = 0
+        self._agent_seq = 0
 
+    # ---- events / conversation -------------------------------------------------------
+    def emit(self, kind: str, data: dict[str, Any]) -> None:
+        """Every harness event goes through here: feed events are persisted to the conversation first."""
+        if kind in PERSIST_KINDS:
+            self.history.append(self._conv()["id"], self.session, kind, data, time.time())
+        self.on_event(kind, data)
+
+    def _conv(self) -> dict[str, Any]:
+        if self.conversation is None:  # created on first use, so `doctor` etc. leave no empty conversations
+            self.conversation = self.history.create(self.case.id)
+            self.audit.record("conversation_start", conversation=self.conversation["id"])
+        return self.conversation
+
+    def _skill_ctx(self) -> dict[str, str]:
+        return {"conversation_id": self._conv()["id"], "case_id": self.case.id}
+
+    def open_conversation(self, conv_id: str) -> dict[str, Any]:
+        c = self.history.get(conv_id)
+        if not c or c["case_id"] != self.case.id:
+            raise ValueError(f"no conversation {conv_id} in case {self.case.id}")
+        self.conversation = c
+        self.lead = self._new_lead()
+        self.subagents, self._sub_states = {}, {}
+        states = self.history.load_agents(conv_id)
+        if "lead" in states:
+            self.lead.restore(states["lead"])
+        for key, st in sorted(states.items()):
+            meta = st.get("meta") or {}
+            if key == "lead" or not meta.get("id"):
+                continue
+            sa = SubAgent(**{k: meta[k] for k in SUB_META if k in meta})
+            if sa.status == "running":
+                sa.status = "interrupted"
+            self.subagents[sa.id] = sa
+            self._sub_states[sa.id] = st  # the agent itself is rebuilt on first follow-up
+        self.audit.record("conversation_open", conversation=conv_id, subagents=len(self.subagents))
+        return c
+
+    def new_conversation(self) -> None:
+        if self.lead:
+            self.lead.save()
+        self.conversation = None
+        self.lead = self._new_lead()
+        self.subagents, self._sub_states = {}, {}
+
+    def delete_conversation(self, conv_id: str) -> bool:
+        c = self.history.get(conv_id)
+        if not c or c["case_id"] != self.case.id:
+            return False
+        if self.conversation and self.conversation["id"] == conv_id:
+            self.conversation = None
+            self.lead = self._new_lead()
+            self.subagents, self._sub_states = {}, {}
+        _purge(self.history, self.case.dir, c, self.audit)
+        return True
+
+    # ---- setup ----------------------------------------------------------------------------
     def backend(self, name: str | None) -> LLMBackend:
         key = name or self.model_name
         if key not in self.backends:
             self.backends[key] = make_backend(self.cfg.model(key))
         return self.backends[key]
 
-    async def start(self) -> None:
+    async def start(self, conversation_id: str | None = None, new: bool = False) -> None:
         for t in self.case.tools():
             self.registry.add(t)
         for t in self.memory.tools():
@@ -218,19 +457,37 @@ class Harness:
         for t in Forensics(self.cfg.forensics, self.cfg.evidence_roots, self.case).tools():
             self.registry.add(t)
         await self.mcp.start(self.registry)
-        roster = {n: e.description for n, e in self.experts.items()}
-        self.registry.add(Tool(
-            "delegate",
-            "Hand a scoped task to an expert agent and get its report back. Call several in one turn to run experts "
-            "in parallel. Experts: " + "; ".join(f"{n}: {d}" for n, d in roster.items()),
-            schema({"expert": {"type": "string", "enum": list(roster)},
-                    "task": {"type": "string", "description": "Specific objective, scope, time window, what to return."},
-                    "context": {"type": "string", "description": "Relevant facts/IOCs/hosts already known."}},
-                   ["expert", "task"]),
-            self._delegate))
+        self._register_orchestration()
         self.audit.record("session_start", session=self.session, model=self.model_name, posture=self.roe.posture,
                           mcp=self.mcp.status, experts=list(self.experts))
-        self.lead = self._make_agent("lead", _prompt("lead"), None, ["*"], [], self.cfg.max_steps)
+        self.lead = self._new_lead()
+        if conversation_id:
+            self.open_conversation(conversation_id)
+        elif not new and (latest := self.history.latest(self.case.id)):
+            self.open_conversation(latest["id"])
+
+    def _register_orchestration(self) -> None:
+        S = {"type": "string"}
+        roster = "; ".join(f"{n}: {e.description}" for n, e in self.experts.items())
+        self.registry.add(Tool(
+            "subagent_spawn",
+            "Spawn an expert subagent for a scoped task; returns its structured report. The subagent keeps its "
+            "context for this whole conversation - follow up with subagent_message instead of spawning a duplicate. "
+            "Call several in one turn to run independent tasks in parallel. Experts: " + roster,
+            schema({"expert": {"type": "string", "enum": list(self.experts)},
+                    "task": {"type": "string", "description": "Specific objective, scope (hosts, subnets, indices), time window."},
+                    "context": {"type": "string", "description": "Facts, IOCs, hosts, users and findings already known."},
+                    "expected_output": {"type": "string", "description": "What the report must contain for you to decide the next step."}},
+                   ["expert", "task"]),
+            self._spawn))
+        self.registry.add(Tool(
+            "subagent_message",
+            "Send a follow-up question, a correction or a related new task to a subagent you spawned earlier in this "
+            "conversation. It remembers its earlier work and answers with a new report.",
+            schema({"subagent_id": {"type": "string", "description": "e.g. SA-003"}, "message": S}, ["subagent_id", "message"]),
+            self._message))
+        self.registry.add(Tool("subagent_list", "List your subagents in this conversation: id, expert, task, status, last bottom line.",
+                               schema({}), self._list_subagents))
 
     async def _resolve_target(self, tool: str, value: str) -> list[str]:
         """Resolve a Velociraptor client id to hostname / fqdn / last IP for ROE scope checks (cached 10 min).
@@ -266,54 +523,269 @@ class Harness:
                + f"\nEvidence roots: {[str(p) for p in self.cfg.evidence_roots]}")
         return _prompt("core") + "\n\n" + role_prompt + env
 
-    def _make_agent(self, name: str, role_prompt: str, model: str | None, allow: list[str], deny: list[str],
-                    max_steps: int) -> Agent:
-        specs = self.registry.specs(allow, deny)
-        n = self._expert_runs = self._expert_runs + 1
-        path = self.case.dir / "transcripts" / f"{self.session}__{name}__{n:03d}.json"
-        return Agent(name, self._system(role_prompt), self.backend(model), self.executor, specs, max_steps, path,
-                     self.on_event)
+    def _make_agent(self, name: str, agent_id: str, role_prompt: str, model: str | None, allow: list[str],
+                    deny: list[str], max_steps: int) -> Agent:
+        self._agent_seq += 1
+        return Agent(name, self._system(role_prompt), self.backend(model), self.executor, self.registry.specs(allow, deny),
+                     max_steps, self.emit, agent_id=agent_id, on_save=self._on_save,
+                     transcript_name=f"{self.session}__{agent_id}__{self._agent_seq:03d}.json")
 
-    async def _delegate(self, expert: str, task: str, context: str = "") -> str:
+    def _new_lead(self) -> Agent:
+        lead = self._make_agent("lead", "lead", _prompt("lead"), None, ["*"], [], self.cfg.max_steps)
+        lead.add_local(skill_tools(self.skills, LEAD, "lead", self._skill_ctx, list(self.experts), self.emit))
+        return lead
+
+    def _on_save(self, agent: Agent) -> None:
+        """Persist an agent's context to the conversation (and its transcript for training export)."""
+        if self.conversation is None and len(agent.messages) <= 1:
+            return
+        conv = self._conv()
+        d = self.case.dir / "transcripts" / conv["id"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / agent.transcript_name).write_text(json.dumps({
+            "agent": agent.name, "agent_id": agent.agent_id, "model": agent.backend.profile_name, "usage": agent.usage,
+            "tools": [{"name": t.name, "description": t.description, "parameters": t.parameters} for t in agent.tools],
+            "messages": agent.messages}, indent=1, default=str))
+        state = agent.export_state()
+        if agent.agent_id in self.subagents:
+            state["meta"] = self.subagents[agent.agent_id].meta()
+        self.history.save_agent(conv["id"], agent.agent_id, state)
+
+    # ---- orchestrator tools -------------------------------------------------------------------
+    def _semaphore(self) -> asyncio.Semaphore:
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self.max_parallel)
+        return self._sem
+
+    def _next_sid(self) -> str:
+        nums = [int(k[3:]) for k in self.subagents if k[3:].isdigit()]
+        return f"SA-{max(nums, default=0) + 1:03d}"
+
+    def _build_subagent(self, sa: SubAgent) -> Agent:
+        e = self.experts.get(sa.expert)
+        if not e:
+            raise ValueError(f"expert {sa.expert} is no longer configured")
+        agent = self._make_agent(e.name, sa.id, f"# Role: {e.title}\n{e.prompt}\n\n{_prompt('subagent')}", e.model, e.tools,
+                                 ["subagent_*", *e.deny_tools], e.max_steps)
+        agent.add_local(skill_tools(self.skills, e.name, sa.id, self._skill_ctx, list(self.experts), self.emit))
+        agent.add_local([self._report_tool(agent, sa)])
+        if sa.id in self._sub_states:
+            agent.restore(self._sub_states.pop(sa.id))
+        return agent
+
+    def _report_tool(self, agent: Agent, sa: SubAgent) -> Tool:
+        def submit_report(status: str, summary: str, details: str = "", confidence: str = "medium",
+                          open_questions: list[str] | None = None, recommended_tasks: list[dict[str, Any]] | None = None,
+                          skills_used: list[dict[str, Any]] | None = None) -> str:
+            if status not in REPORT_STATUSES:
+                raise ValueError(f"status must be one of {REPORT_STATUSES}")
+            rec = [{"expert": str(r.get("expert", "")), "task": str(r["task"])[:1500]}
+                   for r in recommended_tasks or [] if isinstance(r, dict) and r.get("task")]
+            used = []
+            for u in skills_used or []:
+                if not (isinstance(u, dict) and u.get("name")):
+                    continue
+                worked, note = bool(u.get("worked", True)), str(u.get("note", ""))[:500]
+                try:
+                    self.skills.feedback(str(u["name"]), worked, note, sa.id, self._conv()["id"])
+                    used.append({"name": str(u["name"]), "worked": worked, "note": note})
+                except KeyError:
+                    pass
+            agent.terminal = {"status": status, "summary": summary.strip(), "details": details.strip(),
+                              "confidence": confidence, "open_questions": [str(q) for q in open_questions or []],
+                              "recommended_tasks": rec, "skills_used": used}
+            return "report submitted to the orchestrator"
+
+        S = {"type": "string"}
+        return Tool(
+            "submit_report",
+            "Finish your task: deliver your report to the orchestrator. Call it once, last. Put follow-on work you "
+            "recommend in recommended_tasks (the orchestrator decides); list every skill you loaded in skills_used.",
+            schema({"status": {"type": "string", "enum": REPORT_STATUSES},
+                    "summary": {"type": "string", "description": "Bottom line in 1-5 sentences: the answer to the tasking."},
+                    "details": {"type": "string", "description": "Evidence (queries, artifacts, hashes, times), assessment, actions taken."},
+                    "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "open_questions": {"type": "array", "items": S},
+                    "recommended_tasks": {"type": "array", "items": {"type": "object", "properties": {
+                        "expert": S, "task": S}, "required": ["task"]}},
+                    "skills_used": {"type": "array", "items": {"type": "object", "properties": {
+                        "name": S, "worked": {"type": "boolean"}, "note": S}, "required": ["name", "worked"]}}},
+                   ["status", "summary"]),
+            submit_report)
+
+    async def _spawn(self, expert: str, task: str, context: str = "", expected_output: str = "") -> str:
         e = self.experts.get(expert)
         if not e:
-            return f"ERROR: unknown expert {expert}"
-        agent = self._make_agent(e.name, f"# Role: {e.title}\n{e.prompt}", e.model, e.tools,
-                                 ["delegate", *e.deny_tools], e.max_steps)
+            return f"ERROR: unknown expert {expert}. Experts: {', '.join(self.experts)}"
+        self._conv()
+        sa = SubAgent(self._next_sid(), e.name, e.title, task, context, expected_output, created=_now(), updated=_now())
+        self.subagents[sa.id] = sa
+        sa.agent = self._build_subagent(sa)
         mem = self.memory.context_block(f"{e.name} {task} {context}")
-        brief = f"# Tasking from DCO lead\n{task}\n\n# Known context\n{context or '(none)'}\n\n{mem}"
-        self.on_event("delegate", {"expert": expert, "title": e.title, "task": task})
-        try:
-            report = await agent.turn(brief)
-        except Exception as ex:
-            self.on_event("expert_done", {"expert": expert, "ok": False, "error": f"{type(ex).__name__}: {ex}"})
-            raise
-        self.audit.record("expert_report", expert=expert, task=task[:500], chars=len(report))
-        self.on_event("expert_done", {"expert": expert, "ok": True, "report": report[:4000],
-                                      "usage": agent.usage})
-        return f"# Report from {e.title}\n{report}"
+        skills = self.skills.index_block(e.name, f"{task} {context}")
+        brief = (f"# Tasking from the orchestrator (you are subagent {sa.id})\n{task}\n\n"
+                 f"# Known context\n{context or '(none)'}\n\n"
+                 f"# Expected output\n{expected_output or 'Answer the tasking with evidence for every claim.'}\n\n"
+                 f"{skills}\n\n{mem}").rstrip()
+        self.emit("subagent_spawn", {"id": sa.id, "expert": e.name, "title": e.title, "task": task, "context": context[:2000]})
+        return await self._run_sub(sa, brief)
 
-    # ---- entry points -----------------------------------------------------------
-    async def mission(self, text: str) -> str:
+    async def _message(self, subagent_id: str, message: str) -> str:
+        sa = self.subagents.get(subagent_id.strip().upper())
+        if not sa:
+            return f"ERROR: no subagent {subagent_id} in this conversation (subagent_list shows them)"
+        if sa.agent is None:
+            sa.agent = self._build_subagent(sa)
+        self.emit("subagent_message", {"id": sa.id, "expert": sa.expert, "title": sa.title, "message": message})
+        return await self._run_sub(sa, f"# Follow-up from the orchestrator\n{message}\n\nFinish with submit_report.")
+
+    async def _run_sub(self, sa: SubAgent, text: str) -> str:
+        if sa.lock.locked():
+            return f"ERROR: {sa.id} is still working on an earlier task; wait for that report"
+        assert sa.agent
+        stopped = False
+        async with sa.lock, self._semaphore():
+            sa.status, sa.updated, sa.started, sa.stop_requested = "running", _now(), time.time(), False
+            sa.job = asyncio.ensure_future(sa.agent.turn(text))
+            try:
+                final = await sa.job
+            except asyncio.CancelledError:
+                me = asyncio.current_task()
+                if not sa.stop_requested or (me is not None and me.cancelling()):
+                    raise  # the whole operation was cancelled, not just this subagent
+                sa.agent.repair("stopped by the analyst")
+                stopped, final = True, ""
+            except Exception as ex:
+                sa.status, sa.updated = "failed", _now()
+                sa.agent.repair(f"subagent failed: {type(ex).__name__}")
+                self.emit("subagent_report", {"id": sa.id, "expert": sa.expert, "title": sa.title, "status": "failed",
+                                              "summary": f"{type(ex).__name__}: {ex}", "details": "", "confidence": "",
+                                              "open_questions": [], "recommended_tasks": [], "skills_used": []})
+                raise
+            finally:
+                sa.job = None
+        if stopped:
+            report = {"status": "stopped", "summary": "Stopped by the analyst before finishing.", "details": "",
+                      "confidence": "", "open_questions": [], "recommended_tasks": [], "skills_used": []}
+        else:
+            report = sa.agent.terminal or {"status": "completed", "summary": final, "details": "", "confidence": "unstated",
+                                           "open_questions": [], "recommended_tasks": [], "skills_used": [], "unstructured": True}
+        sa.turns += 1
+        sa.status, sa.last_report, sa.updated = report["status"], report, _now()
+        sa.agent.save()
+        self.audit.record("subagent_report", id=sa.id, expert=sa.expert, status=sa.status, task=sa.task[:500],
+                          chars=len(report["summary"]) + len(report["details"]))
+        self.emit("subagent_report", {"id": sa.id, "expert": sa.expert, "title": sa.title, **report, "usage": sa.agent.usage,
+                                      "seconds": round(time.time() - sa.started, 1)})
+        return self._format_report(sa, report)
+
+    def steer_subagent(self, subagent_id: str, message: str, by: str) -> None:
+        """Queue analyst guidance for a running subagent; it is delivered before its next model call."""
+        sa = self.subagents.get(subagent_id)
+        if not sa:
+            raise KeyError(f"no subagent {subagent_id}")
+        if sa.status != "running" or not sa.agent:
+            raise ValueError(f"{subagent_id} is not running; ask the lead to follow up with it instead")
+        msg = message.strip()[:2000]
+        if not msg:
+            raise ValueError("empty guidance")
+        sa.agent.inbox.append(msg)
+        self.audit.record("subagent_steer", id=sa.id, expert=sa.expert, message=msg[:500], by=by)
+        self.emit("subagent_steer", {"id": sa.id, "expert": sa.expert, "title": sa.title, "message": msg})
+
+    def stop_subagent(self, subagent_id: str, by: str) -> None:
+        """Cancel one running subagent. The orchestrator gets a 'stopped' report and carries on."""
+        sa = self.subagents.get(subagent_id)
+        if not sa:
+            raise KeyError(f"no subagent {subagent_id}")
+        if not sa.job or sa.job.done():
+            raise ValueError(f"{subagent_id} is not running")
+        sa.stop_requested = True
+        sa.job.cancel()
+        self.audit.record("subagent_stopped", id=sa.id, expert=sa.expert, by=by)
+
+    @staticmethod
+    def _format_report(sa: SubAgent, r: dict[str, Any]) -> str:
+        out = [f"# Report from {sa.id} - {sa.title} ({sa.expert})", f"status: {r['status']} | confidence: {r['confidence']}"]
+        if r.get("unstructured"):
+            out.append("(the subagent answered in free text instead of submit_report)")
+        out += ["## Bottom line", r["summary"] or "(empty)"]
+        if r["details"]:
+            out += ["## Details", r["details"]]
+        if r["open_questions"]:
+            out += ["## Open questions", *[f"- {q}" for q in r["open_questions"]]]
+        if r["recommended_tasks"]:
+            out += ["## Recommended tasks (your decision)", *[f"- {t['expert'] or 'any'}: {t['task']}" for t in r["recommended_tasks"]]]
+        if r["skills_used"]:
+            out += ["## Skills used", *[f"- {u['name']}: {'worked' if u['worked'] else 'DID NOT WORK'} {u['note']}" for u in r["skills_used"]]]
+        out.append(f'(Follow up with subagent_message(subagent_id="{sa.id}", ...) - it keeps its context.)')
+        return "\n".join(out)
+
+    def _list_subagents(self) -> str:
+        if not self.subagents:
+            return "no subagents yet in this conversation"
+        return "\n".join(f"{s.id} {s.expert} [{s.status}, {s.turns} report(s)] task: {s.task[:200]}"
+                         + (f"\n   last: {s.last_report['summary'][:300]}" if s.last_report else "")
+                         for s in self.subagents.values())
+
+    # ---- entry points -----------------------------------------------------------------
+    async def mission(self, text: str, display: str | None = None, playbook: str = "") -> str:
         assert self.lead
+        conv = self._conv()
+        shown = text if display is None else display
+        if not conv.get("title"):
+            src = (shown or playbook or text).strip()
+            title = src.splitlines()[0][:120] if src else "operation"
+            self.history.rename(conv["id"], title)
+            conv["title"] = title
+        self.emit("analyst_message", {"text": shown, "playbook": playbook})
         if not self.case.data.get("mission"):
             self.case.data["mission"] = text
             self.case._save()
-        mem = self.memory.context_block(text)
-        intro = f"{text}\n\n{mem}\n\n# Current case state\n{self.case.summary(10)}" if mem or self.case.data["findings"] else text
-        return await self.lead.turn(intro)
+        parts = [text]
+        if mem := self.memory.context_block(text):
+            parts.append(mem)
+        if self.skills.relevant(LEAD, text, 1):
+            parts.append(self.skills.index_block(LEAD, text))
+        if mem or self.case.data["findings"]:
+            parts.append(f"# Current case state\n{self.case.summary(10)}")
+        return await self.lead.turn("\n\n".join(parts))
 
     async def retro(self) -> str:
-        """After-action review: the lead turns this operation into durable lessons."""
+        """After-action review. Each subagent reflects on its own work and revises its skills, then the
+        orchestrator turns the whole operation into memories and skills."""
         assert self.lead
+        self.emit("retro_start", {})
         for d in self.executor.denials:  # analyst-authored corrections are trusted immediately
             self.memory.add("feedback", f"Analyst denied {d['tool']}",
                             f"Agent {d['agent']} requested {d['tool']} with {json.dumps(d['args'])[:400]}. {d['reason']}",
                             tags=[d["tool"]], source="analyst")
         self.executor.denials.clear()
-        verdicts = [f"{f['id']} {f['title']}: {f['verdict']} {f.get('verdict_note', '')}"
-                    for f in self.case.data["findings"] if f["verdict"] != "unreviewed"]
-        prompt = _prompt("retro") + "\n\n# Analyst verdicts on findings\n" + ("\n".join(verdicts) or "(none yet)")
+        verdicts = "\n".join(f"{f['id']} {f['title']}: {f['verdict']} {f.get('verdict_note', '')}"
+                             for f in self.case.data["findings"] if f["verdict"] != "unreviewed") or "(none yet)"
+        conv_id = self._conv()["id"]
+        usage = self.skills.conversation_usage(conv_id)
+
+        reflections: list[str] = []
+        subs = [s for s in self.subagents.values() if s.status not in ("failed",)]
+        if subs and self.cfg.orchestration.get("reflect_on_retro", True):
+            async def reflect(sa: SubAgent) -> str:
+                mine = [u for u in usage if u["agent_id"] == sa.id]
+                block = "\n".join(f"- {u['name']} v{u['version']}: {u['outcome'] or 'not reported'} {u['note'] or ''}" for u in mine)
+                return await self._message(sa.id, _prompt("reflect") + f"\n\n# Analyst verdicts on findings\n{verdicts}\n\n"
+                                           f"# Skills you used in this operation\n{block or '(none)'}")
+            for sa, res in zip(subs, await asyncio.gather(*[reflect(s) for s in subs], return_exceptions=True)):
+                summary = (sa.last_report or {}).get("summary", "") if not isinstance(res, BaseException) else f"failed: {res}"
+                reflections.append(f"- {sa.id} {sa.expert}: {summary[:600]}")
+
+        usage = self.skills.conversation_usage(conv_id)
+        used = "\n".join(f"- {u['agent_id']} used {u['name']} v{u['version']}: {u['outcome'] or 'not reported'} {u['note'] or ''}"
+                         for u in usage) or "(no skills were used)"
+        weak = "\n".join(f"- {s['name']} ({s['expert']}): {s['successes']} worked / {s['failures']} failed"
+                         for s in self.skills.struggling()) or "(none)"
+        prompt = (_prompt("retro") + f"\n\n# Analyst verdicts on findings\n{verdicts}\n\n# Skill use in this operation\n{used}"
+                  f"\n\n# Skills with a poor track record (revise or replace)\n{weak}"
+                  f"\n\n# Subagent reflections\n" + ("\n".join(reflections) or "(no subagents reflected)"))
         return await self.lead.turn(prompt)
 
     def set_verdict(self, finding_id: str, verdict: str, note: str = "") -> bool:
@@ -334,9 +806,11 @@ class Harness:
 
     def rate(self, rating: int, note: str = "") -> None:
         self.case.data.setdefault("ratings", []).append({"run": self.session, "rating": rating, "note": note,
-                                                         "by": self.cfg.operator})
+                                                         "by": self.cfg.operator,
+                                                         "conversation": self.conversation["id"] if self.conversation else ""})
         self.case._save()
-        self.audit.record("session_rating", session=self.session, rating=rating, note=note)
+        settled = self.skills.settle_conversation(self.conversation["id"], rating) if self.conversation else 0
+        self.audit.record("session_rating", session=self.session, rating=rating, note=note, skill_uses_settled=settled)
 
     def switch_model(self, name: str) -> None:
         self.cfg.model(name)  # validate
@@ -354,3 +828,20 @@ class Harness:
         await self.mcp.aclose()
         for b in self.backends.values():
             await b.aclose()
+
+
+def _purge(store: ChatStore, case_dir: Path, conv: dict[str, Any], audit: AuditLog) -> None:
+    store.delete(conv["id"])
+    shutil.rmtree(case_dir / "transcripts" / conv["id"], ignore_errors=True)
+    audit.record("conversation_deleted", conversation=conv["id"], title=conv["title"], events=conv["events"])
+
+
+def delete_conversation(cfg: HarnessConfig, conv_id: str, operator: str) -> dict[str, Any] | None:
+    """Delete a conversation from outside a running harness (CLI). Returns the deleted conversation's row."""
+    store = ChatStore(cfg.history_db)
+    c = store.get(conv_id)
+    if not c:
+        return None
+    case_dir = cfg.cases_dir / c["case_id"]
+    _purge(store, case_dir, c, AuditLog(case_dir / "audit.jsonl", operator))
+    return c

@@ -12,7 +12,11 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Optional, Protocol
+
+# Streaming sink: called with each new piece of visible assistant text as it is generated, or with None when the
+# provider restarted the response (a retry after a dropped stream) and the text so far must be discarded.
+DeltaFn = Callable[[Optional[str]], None]
 
 
 @dataclass
@@ -43,7 +47,9 @@ class LLMBackend(Protocol):
     profile_name: str
     context_tokens: int
 
-    async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec]) -> LLMResponse: ...
+    async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec], on_delta: DeltaFn | None = None) -> LLMResponse:
+        """One model call. With on_delta, stream visible text through it while the response is generated."""
+        ...
 
     async def aclose(self) -> None: ...
 
@@ -54,6 +60,44 @@ class LLMBackend(Protocol):
 # models are trained on.
 # ---------------------------------------------------------------------------
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
+
+
+class ToolCallTextFilter:
+    """Forwards streamed text to a sink but holds back <tool_call> blocks, which are parsed out after the call.
+
+    Text after the first <tool_call> is not streamed; the final, cleaned text still arrives with the response.
+    """
+
+    TAG = "<tool_call>"
+
+    def __init__(self, sink: DeltaFn):
+        self.sink = sink
+        self.held = ""
+        self.blocked = False
+
+    def feed(self, chunk: str) -> None:
+        if self.blocked or not chunk:
+            return
+        self.held += chunk
+        i = self.held.find(self.TAG)
+        if i >= 0:
+            out, self.held, self.blocked = self.held[:i], "", True
+        else:  # keep a possible partial tag at the end until the next chunk decides it
+            keep = next((k for k in range(min(len(self.TAG) - 1, len(self.held)), 0, -1)
+                         if self.TAG.startswith(self.held[-k:])), 0)
+            out, self.held = self.held[:len(self.held) - keep], self.held[len(self.held) - keep:]
+        if out:
+            self.sink(out)
+
+    def flush(self) -> None:
+        """End of stream: a held partial tag turned out to be ordinary text."""
+        if self.held and not self.blocked:
+            self.sink(self.held)
+        self.held = ""
+
+    def reset(self) -> None:
+        self.held, self.blocked = "", False
+        self.sink(None)
 
 
 def text_tools_prompt(tools: list[ToolSpec]) -> str:

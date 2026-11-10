@@ -222,8 +222,8 @@ def export_training(cases_dir: Path, out_path: Path, min_rating: int = 4) -> int
         for case_json in sorted(cases_dir.glob("*/case.json")):
             data = json.loads(case_json.read_text())
             ratings = {r["run"]: r["rating"] for r in data.get("ratings", [])}
-            for tr in sorted((case_json.parent / "transcripts").glob("*.json")):
-                session = tr.stem.split("__")[0]  # transcripts are <session>__<agent>__<n>.json
+            for tr in sorted((case_json.parent / "transcripts").rglob("*.json")):
+                session = tr.stem.split("__")[0]  # transcripts/<conversation>/<session>__<agent>__<n>.json
                 if ratings.get(session, 0) < min_rating:
                     continue
                 t = json.loads(tr.read_text())

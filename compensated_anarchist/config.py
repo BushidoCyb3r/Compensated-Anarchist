@@ -51,6 +51,7 @@ class ModelProfile:
     timeout_s: float = 300.0
     extra_body: dict[str, Any] = field(default_factory=dict)  # provider-specific knobs (temperature, etc.)
     effort: str = "high"  # anthropic only
+    stream: bool = True  # stream tokens to the UI; openai_compat falls back to non-streaming if the server refuses
 
 
 @dataclass
@@ -70,6 +71,9 @@ class HarnessConfig:
     forensics: dict[str, Any]
     memory: dict[str, Any]
     experts: dict[str, Any]
+    history_db: Path = Path("history.db")
+    skills: dict[str, Any] = field(default_factory=dict)
+    orchestration: dict[str, Any] = field(default_factory=dict)
 
     def model(self, name: str | None = None) -> ModelProfile:
         key = name or self.default_model
@@ -115,4 +119,7 @@ def load_config(path: str | Path) -> HarnessConfig:
         forensics=raw.get("forensics") or {},
         memory=raw.get("memory") or {},
         experts=raw.get("experts") or {},
+        history_db=rel((raw.get("history") or {}).get("db_path") or str(Path(h.get("cases_dir", "../cases")) / "_history.db")),
+        skills=raw.get("skills") or {},
+        orchestration=raw.get("orchestration") or {},
     )

@@ -36,7 +36,9 @@ def search_dsl(body_json: str, index: str = "") -> str:
 
 @tool(READ)
 def esql(query: str) -> str:
-    """Run an ES|QL query, e.g. 'FROM logs-* | WHERE @timestamp > NOW() - 1 day | STATS c=COUNT(*) BY host.name | SORT c DESC'."""
+    """Run an ES|QL query, e.g. 'FROM logs-* | WHERE @timestamp > NOW() - 1 day | STATS c=COUNT(*) BY host.name | SORT c DESC'.
+    For raw rows always KEEP the columns you need (| KEEP @timestamp, host.name, process.command_line) - log
+    indices have thousands of fields."""
     return es.esql(query)
 
 
@@ -48,7 +50,8 @@ def eql(query: str, index: str = "", start: str = "now-24h", end: str = "now", s
 
 @tool(READ)
 def list_indices(pattern: str = "*") -> str:
-    """List indices / data streams with doc counts - use to discover where data lives."""
+    """List indices / data streams with doc counts - use to discover where data lives. With a read-only API key
+    this falls back to a per-data-stream inventory (docs, newest event) built from a read-only aggregation."""
     return es.indices(pattern)
 
 

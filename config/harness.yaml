@@ -14,6 +14,7 @@ harness:
 # Model profiles - run any model. Anything OpenAI-compatible works via provider: openai_compat
 # (vLLM, Ollama, llama.cpp, LM Studio, TGI, LiteLLM, enterprise/government AI gateways, ...).
 # tool_mode: native = function calling; text = <tool_call> JSON in content (models without tool support)
+# stream: true (default) streams replies to the dashboard and CLI; set false for gateways that mishandle SSE
 # ---------------------------------------------------------------------------
 models:
   local-vllm:            # e.g. vllm serve <model> --enable-auto-tool-choice --tool-call-parser hermes
@@ -71,6 +72,42 @@ experts:
   disabled: []
 
 # ---------------------------------------------------------------------------
+# Orchestration: the lead is the orchestrator; experts run as subagents it spawns and follows up with
+# ---------------------------------------------------------------------------
+orchestration:
+  max_parallel: 4            # subagents working at once (lower it for a single local GPU)
+  reflect_on_retro: true     # after-action review: every subagent reflects on its work and revises its skills
+
+# ---------------------------------------------------------------------------
+# Expert skills: versioned procedures the team writes, uses, scores and revises (stored in the memory DB)
+# ---------------------------------------------------------------------------
+skills:
+  require_approval: true     # agent-written skills/revisions wait for analyst review (poisoning defense)
+  index_k: 12                # skills listed in a subagent's brief (most relevant first)
+  max_body_chars: 8000
+  max_pending_per_skill: 3   # unreviewed revisions an agent may queue per skill
+
+# ---------------------------------------------------------------------------
+# Chat history: every conversation is kept until you delete it (canarchist history delete / dashboard)
+# ---------------------------------------------------------------------------
+history:
+  db_path: ../cases/_history.db
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+dashboard:
+  classification:            # banner at the top and bottom of every page; empty text = no banner
+    text: ""                 # your system's marking, e.g. UNCLASSIFIED
+    background: "#007a33"
+    color: "#ffffff"
+    locked: false            # true = this value always wins and the Settings page cannot change it
+  # The Settings page can override the banner for everyone; that choice is saved here (default
+  # <cases_dir>/_dashboard_settings.json) and every change is audited.
+  # settings_path: ../cases/_dashboard_settings.json
+  consent_text: ""           # notice and consent shown before sign-in; acknowledging it is required and audited
+
+# ---------------------------------------------------------------------------
 # Learning memory
 # ---------------------------------------------------------------------------
 memory:
@@ -90,11 +127,14 @@ mcp_servers:
     module: compensated_anarchist.servers.security_onion
     env:
       SO_URL: ${SO_URL:-}
+      SO_API_KEY: ${SO_API_KEY:-}            # preferred: read-only API key
       SO_USER: ${SO_USER:-}
       SO_PASS: ${SO_PASS:-}
       SO_VERIFY: ${SO_VERIFY:-true}          # /etc/pki/ca.crt from the manager
       SO_INDEX: ${SO_INDEX:-logs-*-so}
-      SO_ALERT_QUERY: ${SO_ALERT_QUERY:-event.dataset:alert}
+      SO_ALERT_INDEX: ${SO_ALERT_INDEX:-logs-*.alerts-so}
+      SO_ZEEK_INDEX: ${SO_ZEEK_INDEX:-logs-zeek-so}
+      SO_ALERT_QUERY: ${SO_ALERT_QUERY:-}    # optional extra filter applied to every alert query
 
   # Security Onion Pro only: the official SO MCP server (Connect API, OQL queries, playbooks).
   # Install/configure it per github.com/Security-Onion-Solutions/securityonion-mcp (API client from

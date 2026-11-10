@@ -1,5 +1,5 @@
 from ..config import ModelProfile
-from .base import LLMBackend, LLMResponse, ToolCall, ToolSpec
+from .base import DeltaFn, LLMBackend, LLMResponse, ToolCall, ToolSpec
 
 
 def make_backend(profile: ModelProfile) -> LLMBackend:
@@ -14,4 +14,4 @@ def make_backend(profile: ModelProfile) -> LLMBackend:
     raise ValueError(f"unknown provider '{profile.provider}' (use openai_compat or anthropic)")
 
 
-__all__ = ["make_backend", "LLMBackend", "LLMResponse", "ToolCall", "ToolSpec"]
+__all__ = ["make_backend", "DeltaFn", "LLMBackend", "LLMResponse", "ToolCall", "ToolSpec"]

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Compensated Anarchist</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="cls-top" class="cls-banner" hidden></div>
+<main class="login">
+  <div class="login-card">
+    <div class="login-brand">
+      <img src="/static/logo.svg" width="64" height="64" alt="">
+      <div>
+        <h1>Compensated Anarchist</h1>
+        <p>Defensive cyber operations</p>
+      </div>
+    </div>
+    <form id="login-form" class="login-form" novalidate>
+      <section id="consent" class="thread-sec" hidden>
+        <h2>Notice and consent</h2>
+        <div id="consent-text" class="consent-text" tabindex="0" aria-label="Notice and consent text"></div>
+        <label class="check" for="consent-check">
+          <input type="checkbox" id="consent-check">
+          <span>I have read and consent to the notice above.</span>
+        </label>
+      </section>
+      <div id="token-row" class="thread-sec">
+        <label for="token" class="label">Access token</label>
+        <input id="token" type="password" autocomplete="off" spellcheck="false">
+        <p class="hint">Printed in the server console when the dashboard starts.</p>
+      </div>
+      <p id="token-note" class="hint" hidden>Using the token from your sign-in link.</p>
+      <div id="login-error" class="form-error" role="alert" hidden></div>
+      <button class="btn btn-primary btn-lg" type="submit" id="login-btn">Sign in</button>
+    </form>
+    <p class="login-foot">Every action you take here is recorded in a tamper-evident audit log.</p>
+  </div>
+</main>
+<div id="cls-bottom" class="cls-banner" hidden></div>
+<script src="/static/login.js"></script>
+</body>
+</html>

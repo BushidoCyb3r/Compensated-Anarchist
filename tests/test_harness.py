@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -54,8 +55,9 @@ class ScriptedBackend:
         self.profile_name = "fake"
         self.context_tokens = 100000
         self.seen: dict[str, list] = {}
+        self.delay = 0.0  # seconds between streamed words
 
-    async def chat(self, messages, tools):
+    async def chat(self, messages, tools, on_delta=None):
         system = messages[0]["content"]
         who = "lead"
         for name in self.scripts:
@@ -66,6 +68,10 @@ class ScriptedBackend:
         self.seen.setdefault(who, []).append(messages)
         step = self.scripts[who].pop(0) if self.scripts.get(who) else ("done.", [])
         text, calls = step
+        if on_delta and text:  # stream it word by word, like a real provider
+            for piece in re.findall(r"\S+\s*|\s+", text):
+                on_delta(piece)
+                await asyncio.sleep(self.delay)
         tcs = [ToolCall(f"c{i}_{len(self.seen[who])}", n, a) for i, (n, a) in enumerate(calls)]
         msg = {"role": "assistant", "content": text}
         if tcs:
@@ -85,8 +91,8 @@ def test_end_to_end(tmp_path, monkeypatch):
     scripts = {
         "lead": [
             ("Tasking experts in parallel.", [
-                ("delegate", {"expert": "malware_analyst", "task": f"triage {ev}"}),
-                ("delegate", {"expert": "incident_responder", "task": "isolate ws01"}),
+                ("subagent_spawn", {"expert": "malware_analyst", "task": f"triage {ev}"}),
+                ("subagent_spawn", {"expert": "incident_responder", "task": "isolate ws01"}),
             ]),
             ("Situation report: sample triaged; containment denied by analyst.", []),
         ],
@@ -97,7 +103,8 @@ def test_end_to_end(tmp_path, monkeypatch):
                          ("velociraptor__quarantine_host", {"client_id": "C.1"}),  # not in allowlist
                          ]),
             ("Found C2 URL", [("case_add_ioc", {"type": "url", "value": "http://evil.example/c2", "context": "strings"})]),
-            ("Report: static triage complete.", []),
+            ("Report: static triage complete.", [("submit_report", {"status": "completed", "summary": "static triage complete: C2 URL found",
+                                                                    "confidence": "high", "recommended_tasks": [{"expert": "cti_analyst", "task": "enrich evil.example"}]})]),
         ],
         "Incident Responder (containment / eradication / recovery)": [
             ("find host", [("velociraptor__list_clients", {"search": "host:ws01"})]),
@@ -130,6 +137,10 @@ def test_end_to_end(tmp_path, monkeypatch):
 
     h, out, retro = asyncio.run(run())
     assert "Situation report" in out
+    # orchestrator got structured reports back, with subagent ids it can follow up on
+    lead_tool_msgs = [m["content"] for m in fake.seen["lead"][1] if m["role"] == "tool"]
+    assert any("Report from SA-001" in t and "static triage complete" in t and "cti_analyst: enrich evil.example" in t for t in lead_tool_msgs)
+    assert any("Report from SA-002" in t and "free text" in t for t in lead_tool_msgs)  # unstructured fallback
     case = json.loads((tmp_path / "cases" / "TEST-1" / "case.json").read_text())
     assert case["evidence"][0]["hashes"]["sha256"]
     assert case["iocs"][0]["value"] == "http://evil.example/c2"
@@ -157,7 +168,7 @@ def test_end_to_end(tmp_path, monkeypatch):
     assert mem.search("quarantine disruptive")  # approved feedback is retrievable
     assert not mem.search("Triage C2 strings")  # candidate is not, until promoted
     # transcripts written per agent for training export
-    assert len(list((tmp_path / "cases" / "TEST-1" / "transcripts").glob("*__*__*.json"))) >= 3
+    assert len(list((tmp_path / "cases" / "TEST-1" / "transcripts").rglob("*__*__*.json"))) >= 3
     from compensated_anarchist.memory import export_training
     assert export_training(tmp_path / "cases", tmp_path / "train.jsonl", 4) >= 3
 

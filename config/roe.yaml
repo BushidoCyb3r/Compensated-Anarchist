@@ -32,7 +32,9 @@ rules:
   # --- harness internals --------------------------------------------------
   - {match: "case_*",   tier: auto}
   - {match: "memory_*", tier: auto}
-  - {match: "delegate", tier: auto}
+  - {match: "subagent_*", tier: auto, note: "orchestrator spawns / follows up with expert subagents"}
+  - {match: "submit_report", tier: auto, note: "subagent report to the orchestrator"}
+  - {match: "skill_*", tier: auto, note: "agent-written skill versions still need analyst approval before use"}
 
   # --- local forensics (read-only, jailed to evidence roots) -------------
   - {match: "local_run", tier: notify, args: {binary: [fls, icat, ils, mmls, fsstat, istat, mactime, sha256sum, ssdeep, exiftool]},

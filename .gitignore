@@ -7,3 +7,6 @@ cases/
 memory/
 evidence/
 training.jsonl
+
+# private working list
+TODO.md

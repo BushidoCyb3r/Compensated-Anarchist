@@ -24,9 +24,15 @@ BANNER = f"""{C['b']}{NAME}{C['x']} v{__version__} - Defensive Cyber Operations 
 {C['dim']}type /help for commands. Every tool call is ROE-gated and audited.{C['x']}"""
 
 HELP = """
-  <text>                       talk to the DCO lead (it plans and delegates to experts)
+  <text>                       talk to the DCO lead (the orchestrator; it tasks expert subagents)
   /playbook <name> <details>   run a playbook: triage | hunt | incident_response | compromise_assessment | forensics
   /experts                     list expert agents and their models
+  /subagents                   subagents in this conversation (id, expert, status, last bottom line)
+  /conversations               this case's saved conversations
+  /new                         start a new conversation (the current one stays saved)
+  /open <conversation-id>      resume a saved conversation
+  /delete <conversation-id>    delete a conversation permanently (asks you to confirm)
+  /skills                      skills and how they are doing; /skills pending  shows proposals awaiting review
   /tools                       list tools with their ROE tier
   /models  |  /model <name>    list / switch the lead's model profile
   /case                        show case summary
@@ -38,21 +44,77 @@ HELP = """
 """
 
 
-def event_printer(kind: str, d: dict[str, Any]) -> None:
+def _event_line(kind: str, d: dict[str, Any]) -> str | None:
+    who = d.get("agent_id") or d.get("agent", "")
     if kind == "decision":
         col = {"auto": "dim", "notify": "y", "approve": "m", "deny": "r"}.get(d["tier"], "dim")
         mark = "+" if d["allowed"] else "x"
         args = json.dumps(d["args"], default=str)
         args = args if len(args) < 160 else args[:157] + "..."
-        print(f"{C[col]}  [{d['agent']}] {mark} {d['tool']} {args}  <{d['tier']}>{'' if d['allowed'] else ' ' + d['reason']}{C['x']}")
+        return f"{C[col]}  [{who}] {mark} {d['tool']} {args}  <{d['tier']}>{'' if d['allowed'] else ' ' + d['reason']}{C['x']}"
     elif kind == "result" and d["error"]:
-        print(f"{C['r']}  [{d['agent']}] ! {d['tool']} returned an error{C['x']}")
-    elif kind == "delegate":
-        print(f"{C['c']}  >> delegating to {d['expert']}: {d['task'][:140]}{C['x']}")
+        return f"{C['r']}  [{who}] ! {d['tool']} returned an error{C['x']}"
+    elif kind == "subagent_spawn":
+        return f"{C['c']}  >> {d['id']} {d['expert']}: {d['task'][:140]}{C['x']}"
+    elif kind == "subagent_message":
+        return f"{C['c']}  >> follow-up to {d['id']} {d['expert']}: {d['message'][:140]}{C['x']}"
+    elif kind == "subagent_report":
+        col = "g" if d["status"] == "completed" else "y" if d["status"] in ("blocked", "needs_input") else "r"
+        return f"{C[col]}  << {d['id']} {d['expert']} [{d['status']}] {str(d.get('summary', ''))[:200]}{C['x']}"
+    elif kind == "skill_used":
+        return f"{C['dim']}  [{who}] using skill {d['skill']} v{d['version']}{C['x']}"
+    elif kind == "skill_proposed":
+        return f"{C['m']}  [{who}] skill {d['skill']} v{d['version']} {d['status']}{' (review: canarchist skills review)' if d['status'] == 'candidate' else ''}{C['x']}"
     elif kind == "text" and d["agent"] != "lead" and not d["final"]:
-        print(f"{C['dim']}  [{d['agent']}] {d['text'][:300]}{C['x']}")
+        return f"{C['dim']}  [{who}] {d['text'][:300]}{C['x']}"
     elif kind == "compact":
-        print(f"{C['dim']}  [{d['agent']}] compacted {d['dropped']} old messages{C['x']}")
+        return f"{C['dim']}  [{who}] compacted {d['dropped']} old messages{C['x']}"
+    return None
+
+
+# The lead's reply streams to the terminal as it is generated (TTY only; piped output gets whole lines).
+STREAM = sys.stdout.isatty() and not os.environ.get("CA_NO_STREAM")
+_live = {"open": False, "final": None}
+
+
+def _end_live() -> None:
+    if _live["open"]:
+        sys.stdout.write(C["x"] + "\n")
+        _live["open"] = False
+
+
+def event_printer(kind: str, d: dict[str, Any]) -> None:
+    lead = (d.get("agent_id") or d.get("agent")) == "lead"
+    if kind == "delta":
+        if not (STREAM and lead):
+            return
+        if d.get("reset"):
+            if _live["open"]:
+                _end_live()
+                print(f"{C['dim']}  (response restarted){C['x']}")
+            return
+        if not _live["open"]:
+            sys.stdout.write("\n")
+            _live["open"] = True
+        sys.stdout.write(d.get("text", ""))
+        sys.stdout.flush()
+        return
+    if kind == "text" and lead and _live["open"]:
+        _end_live()
+        if d.get("final"):
+            _live["final"] = d["text"]  # already on screen; say() won't print it again
+        return
+    line = _event_line(kind, d)
+    if line is not None:
+        _end_live()
+        print(line)
+
+
+def say(answer: str) -> None:
+    """Print an agent's final answer unless it was just streamed to the terminal."""
+    streamed, _live["final"] = _live["final"], None
+    if answer != streamed:
+        print(f"\n{answer}")
 
 
 def _cfg(args):
@@ -71,7 +133,7 @@ async def _with_harness(args, interactive: bool, fn):
     from .agent import Harness
 
     h = Harness(_cfg(args), args.case, args.model, args.posture, interactive, event_printer)
-    await h.start()
+    await h.start(getattr(args, "conversation", None), getattr(args, "new", False))
     try:
         return await fn(h)
     finally:
@@ -84,11 +146,52 @@ def _print_status(h) -> None:
         print(f"  mcp {k:16s} {C['g'] if v.startswith('connected') else C['r']}{v}{C['x']}")
     print(f"  experts: {', '.join(h.experts)}")
     print(f"  memory: {h.memory.stats() or 'empty'}")
+    sk = h.skills.stats()
+    print(f"  skills: {sk['active']} active" + (f", {C['m']}{sk['pending_review']} awaiting review (canarchist skills review){C['x']}"
+                                                 if sk["pending_review"] else ""))
+
+
+def _print_conversation(h, tail: int = 12) -> None:
+    c = h.conversation
+    if not c:
+        print(f"  conversation: new (saved on first message; kept until you delete it)")
+        return
+    print(f"  conversation: {C['b']}{c['id']}{C['x']} {c['title']!r} - resumed, {len(h.subagents)} subagent(s)")
+    shown = [e for e in h.history.events(c["id"]) if e["kind"] == "analyst_message"
+             or (e["kind"] == "text" and e["data"].get("agent") == "lead" and e["data"].get("final"))
+             or e["kind"] == "subagent_report"][-tail:]
+    for e in shown:
+        d = e["data"]
+        if e["kind"] == "analyst_message":
+            print(f"{C['dim']}  analyst> {(d.get('text') or d.get('playbook') or '')[:200]}{C['x']}")
+        elif e["kind"] == "subagent_report":
+            print(f"{C['dim']}    << {d['id']} {d['expert']} [{d['status']}] {str(d.get('summary', ''))[:160]}{C['x']}")
+        else:
+            print(f"{C['dim']}  lead: {d['text'][:300]}{C['x']}")
+
+
+def _print_skills(store, pending: bool = False) -> None:
+    from .skills import track_record
+
+    if pending:
+        rows = store.pending()
+        print(f"{len(rows)} skill version(s) awaiting review" + (" - canarchist skills review" if rows else ""))
+        for v in rows:
+            print(f"  #{v['id']:<4} {v['name']} v{v['version']} ({v['expert']}) by {v['author']}: {v['change_note']}")
+        return
+    rows = store.list()
+    if not rows:
+        print("no skills yet")
+    for r in rows:
+        if r["active_version"]:
+            print(f"  {r['expert']:20s} {r['name']:36s} v{r['active_version']:<3} {track_record(r)}"
+                  + (f"  ({r['pending']} pending)" if r["pending"] else ""))
 
 
 async def chat(h) -> None:
     print(BANNER)
     _print_status(h)
+    _print_conversation(h)
     while True:
         try:
             line = (await asyncio.to_thread(input, f"\n{C['b']}analyst>{C['x']} ")).strip()
@@ -103,6 +206,30 @@ async def chat(h) -> None:
                 print(HELP)
             elif line == "/case":
                 print(h.case.summary())
+            elif line == "/subagents":
+                print(h._list_subagents())
+            elif line == "/conversations":
+                for c in h.history.list(h.case.id):
+                    cur = "*" if h.conversation and c["id"] == h.conversation["id"] else " "
+                    print(f"  {cur} {c['id']}  {c['updated'][:16]}  {c['events']:5d} events  {c['title']}")
+            elif line == "/new":
+                h.new_conversation()
+                print("new conversation started (the previous one is saved)")
+            elif line.startswith("/open "):
+                h.open_conversation(line.split(maxsplit=1)[1].strip())
+                _print_conversation(h)
+            elif line.startswith("/delete "):
+                cid = line.split(maxsplit=1)[1].strip()
+                c = h.history.get(cid)
+                if not c or c["case_id"] != h.case.id:
+                    print("no such conversation in this case")
+                    continue
+                print(f"Delete {cid} {c['title']!r} ({c['events']} events) and its transcripts? The case record, audit "
+                      f"log, memories and skills are kept. This cannot be undone.")
+                ans = (await asyncio.to_thread(input, "  type the conversation id to confirm: ")).strip()
+                print("deleted" if ans == cid and h.delete_conversation(cid) else "not deleted")
+            elif line.startswith("/skills"):
+                _print_skills(h.skills, pending=line.strip().endswith("pending"))
             elif line == "/experts":
                 for n, e in h.experts.items():
                     print(f"  {n:20s} model={e.model or h.model_name:16s} {e.description}")
@@ -127,7 +254,7 @@ async def chat(h) -> None:
                 mid = h.remember(kind, title, content)
                 print(f"saved M{mid}")
             elif line == "/retro":
-                print(await h.retro())
+                say(await h.retro())
             elif line.startswith("/rate "):
                 parts = line.split(maxsplit=2)
                 h.rate(int(parts[1]), parts[2] if len(parts) > 2 else "")
@@ -135,11 +262,11 @@ async def chat(h) -> None:
             elif line.startswith("/playbook "):
                 parts = line.split(maxsplit=2)
                 text = _playbook(parts[1]) + "\n\n# Details from analyst\n" + (parts[2] if len(parts) > 2 else "(none)")
-                print(f"\n{await h.mission(text)}")
+                say(await h.mission(text, parts[2] if len(parts) > 2 else '', parts[1]))
             elif line.startswith("/"):
                 print("unknown command; /help")
             else:
-                print(f"\n{await h.mission(line)}")
+                say(await h.mission(line))
         except KeyboardInterrupt:
             print("\n(interrupted)")
         except Exception as e:
@@ -177,6 +304,95 @@ def cmd_memory(args) -> None:
                 mem.set_status(m["id"], "approved" if a == "p" else "rejected", cfg.operator)
 
 
+def cmd_history(args) -> None:
+    from .agent import delete_conversation
+    from .history import ChatStore
+
+    cfg = _cfg(args)
+    store = ChatStore(cfg.history_db)
+    if args.action == "list":
+        rows = store.list(args.case)
+        if not rows:
+            print("no saved conversations")
+        for c in rows:
+            print(f"  {c['id']}  case {c['case_id']:18s} {c['updated'][:16]}  {c['events']:5d} events  {c['title']}")
+    elif args.action == "show":
+        c = store.get(args.id or "")
+        if not c:
+            raise SystemExit("no such conversation")
+        print(f"{c['id']}  case {c['case_id']}  {c['title']!r}  created {c['created'][:16]}")
+        for e in store.events(c["id"]):
+            d = e["data"]
+            if e["kind"] == "analyst_message":
+                print(f"\n{C['b']}analyst>{C['x']} {d.get('text') or ('playbook ' + d.get('playbook', ''))}")
+            elif e["kind"] == "text" and d.get("agent") == "lead" and d.get("final"):
+                print(f"\n{C['b']}lead:{C['x']} {d['text']}")
+            elif e["kind"] in ("subagent_spawn", "subagent_message"):
+                print(f"{C['c']}  >> {d['id']} {d['expert']}: {(d.get('task') or d.get('message', ''))[:200]}{C['x']}")
+            elif e["kind"] == "subagent_report":
+                print(f"{C['dim']}  << {d['id']} [{d['status']}] {str(d.get('summary', ''))[:300]}{C['x']}")
+            elif e["kind"] == "approval_resolved":
+                print(f"{C['m']}  approval {'granted' if d.get('approved') else 'denied'} {d.get('note', '')}{C['x']}")
+    elif args.action == "delete":
+        c = store.get(args.id or "")
+        if not c:
+            raise SystemExit("no such conversation")
+        if not args.yes:
+            print(f"Delete {c['id']} {c['title']!r} (case {c['case_id']}, {c['events']} events) and its transcripts?\n"
+                  "The case record, audit log, memories and skills are kept. This cannot be undone.")
+            if input("type the conversation id to confirm: ").strip() != c["id"]:
+                raise SystemExit("not deleted")
+        delete_conversation(cfg, c["id"], cfg.operator)
+        print(f"deleted {c['id']}")
+
+
+def cmd_skills(args) -> None:
+    from .audit import AuditLog
+    from .skills import SkillStore
+
+    cfg = _cfg(args)
+    store = SkillStore(cfg.memory_db, cfg.skills, AuditLog(cfg.cases_dir / "_memory_audit.jsonl", cfg.operator))
+    a, rest, by = args.action, args.rest, cfg.operator
+    if a == "list":
+        _print_skills(store)
+    elif a == "pending":
+        _print_skills(store, pending=True)
+    elif a == "show":
+        s = store.get(rest[0]) if rest else None
+        if not s:
+            raise SystemExit("no such skill")
+        print(f"{s['name']} ({s['expert']}) active v{s['active_version']} status {s['status']}\nwhen: {s['description']}\n\n{s['body']}\n")
+        for v in store.versions(s["name"]):
+            print(f"  v{v['version']} #{v['id']} {v['status']:10s} {v['source']}:{v['author']} {v['created'][:16]} {v['change_note']}")
+    elif a == "review":
+        rows = store.pending()
+        print(f"{len(rows)} proposal(s). [a]pprove / [r]eject / [s]kip / [q]uit")
+        for v in rows:
+            print(f"\n{C['b']}#{v['id']} {v['name']} v{v['version']}{C['x']} ({v['expert']}) by {v['author']} from case {v['case_id']}")
+            print(f"change: {v['change_note']}\n{store.diff(v['id'])}")
+            ans = input("  > ").strip().lower()
+            if ans == "q":
+                break
+            if ans == "a":
+                store.approve(v["id"], by)
+            elif ans == "r":
+                store.reject(v["id"], by, input("  reason: ").strip())
+    elif a in ("approve", "reject"):
+        for vid in rest:
+            (store.approve if a == "approve" else store.reject)(int(vid.lstrip("#")), by)  # type: ignore[operator]
+            print(f"#{vid}: {a}d")
+    elif a == "rollback":
+        v = store.rollback(rest[0], int(rest[1].lstrip("v")), by)
+        print(f"{v['name']} now at v{v['version']}")
+    elif a in ("retire", "restore"):
+        print("ok" if store.set_status(rest[0], "retired" if a == "retire" else "active", by) else "no such skill")
+    elif a == "export":
+        print(f"exported {store.export_dir(Path(rest[0]))} skills to {rest[0]}")
+    elif a == "import":
+        done = store.import_dir(Path(rest[0]), by)
+        print(f"imported {len(done)}: {', '.join(done)}" if done else "nothing new")
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="canarchist", description=f"{NAME} - DCO agentic harness")
     p.add_argument("--config", help="harness.yaml (default $CA_CONFIG or ./config/harness.yaml)")
@@ -187,6 +403,9 @@ def main(argv: list[str] | None = None) -> None:
         sp.add_argument("--case", required=True, help="case id, e.g. IR-2026-0042")
         sp.add_argument("--model", help="model profile name from harness.yaml")
         sp.add_argument("--posture", choices=["observe", "respond"], help="override ROE posture")
+        g = sp.add_mutually_exclusive_group()
+        g.add_argument("--conversation", help="resume this saved conversation (default: the case's most recent)")
+        g.add_argument("--new", action="store_true", help="start a new conversation instead of resuming")
 
     common(sub.add_parser("chat", help="interactive operations console"))
     r = sub.add_parser("run", help="run one mission end-to-end")
@@ -208,6 +427,15 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("rest", nargs="*")
     m.add_argument("--status")
     m.add_argument("--kind")
+    hp = sub.add_parser("history", help="saved conversations (kept until you delete them)")
+    hp.add_argument("action", choices=["list", "show", "delete"])
+    hp.add_argument("id", nargs="?")
+    hp.add_argument("--case")
+    hp.add_argument("--yes", action="store_true", help="delete without the confirmation prompt")
+    sk = sub.add_parser("skills", help="expert skills: list, review proposals, approve, roll back, export/import SKILL.md")
+    sk.add_argument("action", choices=["list", "pending", "show", "review", "approve", "reject", "rollback", "retire",
+                                       "restore", "export", "import"])
+    sk.add_argument("rest", nargs="*")
     a = sub.add_parser("audit-verify", help="verify a case audit chain")
     a.add_argument("--case", required=True)
     e = sub.add_parser("export-training", help="export rated transcripts as fine-tuning JSONL")
@@ -221,9 +449,9 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "run":
         async def go(h):
             text = (_playbook(args.playbook) + "\n\n# Details from analyst\n" + args.mission) if args.playbook else args.mission
-            print(await h.mission(text))
+            say(await h.mission(text, args.mission, args.playbook or ""))
             if args.retro:
-                print(await h.retro())
+                say(await h.retro())
         asyncio.run(_with_harness(args, not args.non_interactive, go))
     elif args.cmd == "doctor":
         async def doc(h):
@@ -239,9 +467,13 @@ def main(argv: list[str] | None = None) -> None:
         from .web.app import serve
 
         serve(_cfg(args), args.case, args.model, args.posture, args.host, args.port, args.tls_cert, args.tls_key,
-              args.allow_plaintext)
+              args.allow_plaintext, args.conversation, args.new)
     elif args.cmd == "memory":
         cmd_memory(args)
+    elif args.cmd == "history":
+        cmd_history(args)
+    elif args.cmd == "skills":
+        cmd_skills(args)
     elif args.cmd == "audit-verify":
         ok, msg = verify(_cfg(args).cases_dir / args.case / "audit.jsonl")
         print(msg)

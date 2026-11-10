@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="Compensated Anarchist">
+  <title>Compensated Anarchist</title>
+  <g fill="#e0242c">
+    <circle cx="49" cy="57" r="33" fill="none" stroke="#e0242c" stroke-width="8.5"/>
+    <polygon points="48,0.5 53.5,27 48,31 42.5,27"/>
+    <polygon points="52.21,29.6 30.07,87.82 21,99 21.65,84.62 43.79,26.4"/>
+    <polygon points="52.06,26.06 79.94,84.28 82,99 71.82,88.16 43.94,29.94"/>
+    <polygon points="1,77 17.21,74.7 85.81,46.7 99,37 82.79,39.3 14.19,67.3"/>
+  </g>
+</svg>
