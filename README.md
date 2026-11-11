@@ -18,7 +18,8 @@ and the expert team **writes, scores and revises its own skills** as it works.
      |  <- structured reports (status, bottom line, evidence, recommended tasks)   |
      |  experts: alert_triage threat_hunter network_analyst endpoint_analyst       |
      |  forensicator malware_analyst cti_analyst incident_responder                |
-     |  detection_engineer reporter          each with its own versioned skills    |
+     |  detection_engineer reporter hunt_planner vuln_assessor code_writer         |
+     |                                       each with its own versioned skills    |
      +-----------------------------------------------------------------------------+
                   |  every tool call: expert allowlist -> ROE gate -> run -> audit
      +------------+-------------+-------------------------+---------------------------+
@@ -328,6 +329,13 @@ The ROE gate runs in code, so the model cannot talk its way past it.
    - **Review.** Agent-written skills and revisions wait for your review (`canarchist skills review`, or
      the Skills tab). Skills are instructions to the team, and agents learn from attacker-controlled
      data. `skills.require_approval: false` turns auto-approve on.
+   - **Always-on and shipped skills.** An expert's `skills:` frontmatter names skills loaded in full into
+     every brief, at their current approved version. Skills shipped in `compensated_anarchist/builtin_skills/`
+     are added once, approved, on first start; they never replace a version you revised or retired. The
+     **code_writer** expert ships with the ponytail skills (`ponytail` always on; `ponytail-review`,
+     `ponytail-audit`, `ponytail-debt` on demand), from https://github.com/DietrichGebert/ponytail
+     (MIT, (c) 2026 DietrichGebert; licence in `builtin_skills/code_writer/LICENSE-ponytail`). It writes
+     code to the case and never runs it.
    - **Management.** Every version is kept for diff and rollback (`skills rollback <name> <v>`).
      `skills export <dir>` and `skills import <dir>` move them as SKILL.md files, for git or for
      analyst-written skills, which are approved on import.

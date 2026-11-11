@@ -32,4 +32,4 @@ canarchist = "compensated_anarchist.cli:main"
 include = ["compensated_anarchist*"]
 
 [tool.setuptools.package-data]
-compensated_anarchist = ["prompts/*.md", "playbooks/*.md", "experts/*.md", "web/static/*"]
+compensated_anarchist = ["prompts/*.md", "playbooks/*.md", "experts/*.md", "web/static/*", "builtin_skills/*/LICENSE-*", "builtin_skills/*/*/SKILL.md"]

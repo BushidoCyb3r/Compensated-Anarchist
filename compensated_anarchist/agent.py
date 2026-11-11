@@ -39,7 +39,7 @@ from .llm.base import LoopDetector, RepetitionLoop, estimate_tokens
 from .mcp_manager import McpManager
 from .memory import Memory
 from .roe import RoeGate, cli_approver, deny_all_approver
-from .skills import LEAD, SkillStore, skill_tools
+from .skills import BUILTIN_DIR, LEAD, SkillStore, skill_tools
 from . import attack, casefiles, huntplans, vault
 from .tools import vulnscan
 from .tools.forensics import Forensics
@@ -80,6 +80,7 @@ class ExpertDef:
     deny_tools: list[str] = field(default_factory=list)
     model: str | None = None
     max_steps: int = 30
+    skills: list[str] = field(default_factory=list)  # always on: loaded in full into every brief
 
 
 def _parse_expert(text: str) -> ExpertDef:
@@ -425,6 +426,7 @@ class Harness:
         self.memory = Memory(cfg.memory_db, cfg.memory, self.audit)
         self.memory.case_id = case_id
         self.skills = SkillStore(cfg.memory_db, cfg.skills, self.audit)
+        self.skills.import_dir(BUILTIN_DIR, "built-in", only_new=True)  # shipped skills, e.g. ponytail for code_writer
         self.history = ChatStore(cfg.history_db)
         self.conversation: dict[str, Any] | None = None
         self.roe = RoeGate(cfg.roe_path, self.audit, cli_approver if interactive else deny_all_approver, posture)
@@ -749,13 +751,29 @@ class Harness:
         self.subagents[sa.id] = sa
         sa.agent = self._build_subagent(sa)
         mem = self.memory.context_block(f"{e.name} {task} {context}")
-        skills = self.skills.index_block(e.name, f"{task} {context}")
+        skills = self._default_skills(e, sa.id) + self.skills.index_block(e.name, f"{task} {context}")
         brief = (f"# Tasking from the orchestrator (you are subagent {sa.id})\n{task}\n\n"
                  f"# Known context\n{context or '(none)'}\n\n"
                  f"# Expected output\n{expected_output or 'Answer the tasking with evidence for every claim.'}\n\n"
                  f"{skills}\n\n{mem}").rstrip()
         self.emit("subagent_spawn", {"id": sa.id, "expert": e.name, "title": e.title, "task": task, "context": context[:2000]})
         return await self._run_sub(sa, brief)
+
+    def _default_skills(self, e: ExpertDef, agent_id: str) -> str:
+        """The expert's always-on skills, in full and at their current approved version (revisions apply; a
+        retired skill drops out). Each counts as a use, so it is scored like any skill the agent loads."""
+        c, parts = self._skill_ctx(), []
+        for name in e.skills:
+            try:
+                s = self.skills.record_use(name, e.name, agent_id, c["conversation_id"], c["case_id"])
+            except KeyError:
+                continue
+            self.emit("skill_used", {"agent": e.name, "agent_id": agent_id, "skill": name, "version": s["active_version"]})
+            parts.append(f"## Skill {name} v{s['active_version']}\n{s['body']}")
+        if not parts:
+            return ""
+        return ("# Skills always on for your role (already loaded: follow them, and list them in skills_used)\n"
+                + "\n\n".join(parts) + "\n\n")
 
     async def _message(self, subagent_id: str, message: str) -> str:
         sa = self.subagents.get(subagent_id.strip().upper())

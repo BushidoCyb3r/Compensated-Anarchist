@@ -273,6 +273,61 @@ def test_skill_store_rules(tmp_path):
     assert other.get("analyst-one")["status"] == "active" and other.import_dir(tmp_path / "out", "op") == []
 
 
+def test_code_writer_has_ponytail_by_default(tmp_path, monkeypatch):
+    cfg = load_config(write_config(tmp_path))
+    CW = "Code Writer"
+    spawn = ("Tasking the code writer.", [("subagent_spawn", {"expert": "code_writer", "task": "parse EVTX 4624 logons to CSV"})])
+    scripts = {
+        "lead": [spawn, ("SITREP", []), spawn, ("SITREP", []), spawn, ("SITREP", [])],
+        CW: [("Writing it.", [("case_save_artifact", {"filename": "logons.py", "content": "print('ok')\n"})]),
+             ("done", [("submit_report", {"status": "completed", "summary": "logons.py saved",
+                                          "skills_used": [{"name": "ponytail", "worked": True}]})]),
+             ("done", [("submit_report", {"status": "completed", "summary": "2"})]),
+             ("done", [("submit_report", {"status": "completed", "summary": "3"})])],
+    }
+    fake = ScriptedBackend(scripts)
+    monkeypatch.setattr(agent_mod, "make_backend", lambda profile: fake)
+    store = SkillStore(cfg.memory_db, cfg.skills)
+
+    def brief(h, sid):
+        return next(m["content"] for m in h.subagents[sid].agent.messages if m["role"] == "user")
+
+    async def go():
+        h = agent_mod.Harness(cfg, "CW-1")
+        await h.start()
+        # the shipped ponytail skills are added, approved, for the code writer
+        assert {s["name"] for s in store.list("code_writer")} == {"ponytail", "ponytail-review", "ponytail-audit", "ponytail-debt"}
+        await h.mission("write a logon parser")
+        b = brief(h, "SA-001")
+        assert "# Skills always on for your role" in b and "## Skill ponytail v1" in b and "You are a lazy senior developer" in b
+        assert "ponytail-review (v1, code_writer)" in b  # the others are listed, loaded on demand
+        assert (tmp_path / "cases" / "CW-1" / "artifacts" / "authored" / "logons.py").exists()
+        s = store.get("ponytail")
+        assert (s["uses"], s["successes"]) == (1, 1)  # scored like any skill
+        await h.close()
+
+        # an approved revision survives a restart (the shipped v1 is not re-imported) and reaches the brief
+        v2 = store.propose("ponytail", "code_writer", s["description"], s["body"] + "\nDCO: dry-run by default.",
+                           "dry-run rule", source="analyst", author="tester")
+        assert v2["status"] == "approved"
+        h = agent_mod.Harness(cfg, "CW-1")
+        await h.start()
+        assert store.get("ponytail")["active_version"] == 2
+        await h.mission("again")
+        assert "## Skill ponytail v2" in brief(h, "SA-002") and "DCO: dry-run by default." in brief(h, "SA-002")
+        # retired: no longer always on, and not re-added at start
+        store.set_status("ponytail", "retired", "tester")
+        await h.mission("third")
+        assert "Skills always on" not in brief(h, "SA-003")
+        await h.close()
+        h = agent_mod.Harness(cfg, "CW-1")
+        await h.start()
+        assert h.skills.get("ponytail")["status"] == "retired"
+        await h.close()
+
+    asyncio.run(go())
+
+
 # ---------------------------------------------------------------------------
 # dashboard: conversations (switch / new / delete with confirmation), replay, skills review
 # ---------------------------------------------------------------------------

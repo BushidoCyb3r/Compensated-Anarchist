@@ -34,6 +34,7 @@ from .tools.registry import Tool, schema
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
 SHARED, LEAD = "shared", "lead"
+BUILTIN_DIR = Path(__file__).parent / "builtin_skills"  # <expert>/<skill>/SKILL.md, added on first start
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS skills (
@@ -345,14 +346,17 @@ class SkillStore:
             n += 1
         return n
 
-    def import_dir(self, src: Path, by: str) -> list[str]:
-        """Import analyst-authored SKILL.md files (approved on import; unchanged files are skipped)."""
+    def import_dir(self, src: Path, by: str, only_new: bool = False) -> list[str]:
+        """Import analyst-authored SKILL.md files (approved on import; unchanged files are skipped).
+        only_new: skip skills that already exist, so a shipped default never replaces a revised or retired one."""
         done = []
         for f in sorted(src.rglob("SKILL.md")):
             m = re.match(r"^---\n(.*?)\n---\n(.*)$", f.read_text(encoding="utf-8"), re.S)
             if not m:
                 raise ValueError(f"{f}: missing YAML frontmatter")
             meta = yaml.safe_load(m.group(1)) or {}
+            if only_new and self.get(str(meta["name"]).strip().lower()):
+                continue
             expert = str(meta.get("expert") or f.parent.parent.name)
             v = self.propose(str(meta["name"]), expert, str(meta["description"]), m.group(2), f"imported from {f}",
                              source="analyst", author=by)
