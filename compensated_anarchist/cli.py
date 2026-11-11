@@ -25,7 +25,8 @@ BANNER = f"""{C['b']}{NAME}{C['x']} v{__version__} - Defensive Cyber Operations 
 
 HELP = """
   <text>                       talk to the DCO lead (the orchestrator; it tasks expert subagents)
-  /playbook <name> <details>   run a playbook: triage | hunt | incident_response | compromise_assessment | forensics
+  /playbook <name> <details>   run a playbook: triage | hunt | hunt_plan | incident_response | compromise_assessment
+                               | forensics | vulnerability_assessment (every action needs your approval)
   /experts                     list expert agents and their models
   /subagents                   subagents in this conversation (id, expert, status, last bottom line)
   /conversations               this case's saved conversations
@@ -72,7 +73,36 @@ def _event_line(kind: str, d: dict[str, Any]) -> str | None:
         return f"{C['y']}  [{who}] loop guard: {what} ({d['unit'][:60]!r}{', in reasoning' if d['where'] == 'reasoning' else ''}){C['x']}"
     elif kind == "compact":
         return f"{C['dim']}  [{who}] compacted {d['dropped']} old messages{C['x']}"
+    elif kind == "gate_on":
+        return f"{C['m']}  APPROVAL MODE: {d['reason']}{C['x']}"
+    elif kind == "plan_saved":
+        label = {"plan": "hunt plan", "results": "hunt results", "layer": "ATT&CK Navigator layer",
+                 "vuln_report": "vulnerability report"}.get(d["kind"], "file")
+        return f"{C['c']}  saved {label}: {_file_link(d['path'])}{C['x']}"
     return None
+
+
+def _print_models(cfg, current: str) -> None:
+    """Model profiles by group (config/models.yaml + models.local.yaml), with what each still needs."""
+    print(f"  models from {', '.join(str(f) for f in cfg.model_files if f.exists()) or 'harness.yaml'}")
+    if cfg.models_error:
+        print(f"{C['r']}  last edit not applied: {cfg.models_error}{C['x']}")
+    groups: dict[str, list] = {}
+    for p in cfg.models.values():
+        groups.setdefault(p.group or "Other", []).append(p)
+    for g, profs in groups.items():
+        print(f"  {C['dim']}{g}{C['x']}")
+        for p in profs:
+            why = p.problem()
+            state = f"{C['y']}needs setup: {why}{C['x']}" if why else f"{C['dim']}{p.provider} {p.model} tool_mode={p.tool_mode}{C['x']}"
+            print(f"  {'*' if p.name == current else ' '} {p.name:18s} {(p.label or p.name)[:28]:28s} {state}")
+
+
+def _file_link(path: str) -> str:
+    """The path as a terminal hyperlink (OSC 8): Ctrl+click opens it in most terminals, VS Code's included."""
+    if not sys.stdout.isatty():
+        return path
+    return f"\033]8;;{Path(path).as_uri()}\033\\{path}\033]8;;\033\\"
 
 
 # The lead's reply streams to the terminal as it is generated (TTY only; piped output gets whole lines).
@@ -251,8 +281,8 @@ async def chat(h) -> None:
                     tier, why = h.roe.classify(t.name, {}, t.annotations, t.server)
                     print(f"  {tier:8s} {t.name:45s} {C['dim']}{why}{C['x']}")
             elif line == "/models":
-                for n, p in h.cfg.models.items():
-                    print(f"  {'*' if n == h.model_name else ' '} {n:20s} {p.provider:14s} {p.model} {p.base_url}")
+                h.cfg.reload_models()
+                _print_models(h.cfg, h.model_name)
             elif line.startswith("/model "):
                 h.switch_model(line.split(maxsplit=1)[1])
                 print(f"lead now on {h.model_name}")
@@ -406,6 +436,70 @@ def cmd_skills(args) -> None:
         print(f"imported {len(done)}: {', '.join(done)}" if done else "nothing new")
 
 
+ATTACK_URL = "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/{d}-attack/{d}-attack.json"
+
+
+def _attack_cmd(args) -> None:
+    import hashlib
+    import shutil
+    import tempfile
+
+    from .attack import AttackKB, tools
+
+    cfg = _cfg(args)
+    if args.action == "status":
+        kb = AttackKB(cfg.attack_paths)
+        ok = kb.load()
+        for p in cfg.attack_paths:
+            print(f"  {'found  ' if p.is_file() else 'missing'} {p}")
+        if ok:
+            n = kb.counts()
+            print(f"  {kb.version}: {n['groups']} groups, {n['techniques']} techniques, {n['software']} software, "
+                  f"{n['campaigns']} campaigns")
+        else:
+            print(f"  {kb.error}")
+        return
+    if args.action == "group":
+        if not args.name:
+            raise SystemExit("usage: canarchist attack group <name | alias | G-id>")
+        kb = AttackKB(cfg.attack_paths)
+        fn = {t.name: t.handler for t in tools(kb, lambda: cfg.cases_dir, lambda: [])}["attack_group"]
+        print(fn(name=args.name))
+        return
+    # fetch: download (or import) one ATT&CK domain bundle into the configured location
+    dest = next((p for p in cfg.attack_paths if p.name.startswith(args.domain)), None)
+    dest = dest or cfg.attack_paths[0].with_name(f"{args.domain}-attack.json")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, suffix=".part")
+    os.close(fd)
+    try:
+        if args.from_file:
+            shutil.copyfile(args.from_file, tmp)
+            src = args.from_file
+        else:
+            import httpx
+
+            src = ATTACK_URL.format(d=args.domain)
+            print(f"downloading {src}")
+            with httpx.stream("GET", src, timeout=120, follow_redirects=True) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as fh:
+                    for chunk in r.iter_bytes():
+                        fh.write(chunk)
+        data = json.loads(Path(tmp).read_text(encoding="utf-8"))
+        coll = [o for o in data.get("objects") or [] if o.get("type") == "x-mitre-collection"]
+        if data.get("type") != "bundle" or not coll:
+            raise SystemExit(f"{src} is not an ATT&CK STIX bundle (no x-mitre-collection object)")
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    sha = hashlib.sha256(dest.read_bytes()).hexdigest()
+    print(f"saved {dest}: {coll[0].get('name')} v{coll[0].get('x_mitre_version')} ({dest.stat().st_size // 1024} KB, sha256 {sha})")
+    if dest not in cfg.attack_paths:
+        print(f"note: add {dest} to attack.stix in harness.yaml (or ATTACK_STIX) to use it")
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="canarchist", description=f"{NAME} - DCO agentic harness")
     p.add_argument("--config", help="harness.yaml (default $CA_CONFIG or ./config/harness.yaml)")
@@ -449,6 +543,11 @@ def main(argv: list[str] | None = None) -> None:
     sk.add_argument("action", choices=["list", "pending", "show", "review", "approve", "reject", "rollback", "retire",
                                        "restore", "export", "import"])
     sk.add_argument("rest", nargs="*")
+    at = sub.add_parser("attack", help="MITRE ATT&CK data for hunt planning: status, fetch, group <name>")
+    at.add_argument("action", choices=["status", "fetch", "group"])
+    at.add_argument("name", nargs="?", help="group name, alias or G-id (for `group`)")
+    at.add_argument("--domain", choices=["enterprise", "ics", "mobile"], default="enterprise")
+    at.add_argument("--from", dest="from_file", help="import a copied STIX bundle instead of downloading (air-gapped)")
     a = sub.add_parser("audit-verify", help="verify a case audit chain")
     a.add_argument("--case", required=True)
     e = sub.add_parser("export-training", help="export rated transcripts as fine-tuning JSONL")
@@ -474,8 +573,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "doctor":
         async def doc(h):
             _print_status(h)
-            for n, prof in h.cfg.models.items():
-                print(f"  model {n:16s} {prof.provider:14s} {prof.model} tool_mode={prof.tool_mode}")
+            _print_models(h.cfg, h.model_name)
             print()
             for t in h.registry.tools.values():
                 tier, why = h.roe.classify(t.name, {}, t.annotations, t.server)
@@ -492,6 +590,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_history(args)
     elif args.cmd == "skills":
         cmd_skills(args)
+    elif args.cmd == "attack":
+        _attack_cmd(args)
     elif args.cmd == "audit-verify":
         ok, msg = verify(_cfg(args).cases_dir / args.case / "audit.jsonl")
         print(msg)

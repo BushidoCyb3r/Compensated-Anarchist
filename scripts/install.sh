@@ -23,13 +23,14 @@ Usage: scripts/install.sh [options]
   --wheelhouse DIR    offline install: pip --no-index --find-links DIR (air-gapped networks)
   --test              install pytest and run the test suite
   --harden-vault      bind-mount evidence/vault noexec,nosuid,nodev and add it to /etc/fstab (uses sudo)
+  --attack            download the MITRE ATT&CK data (enterprise-attack.json, ~45 MB) for hunt planning
   --skip-install      do not run pip (configure folders and files only)
   -y, --yes           do not ask before using sudo
   -h, --help          this help
 EOF
 }
 
-PY="" EXTRAS="connectors" WHEELHOUSE="" RUN_TESTS=0 HARDEN=0 SKIP_INSTALL=0 YES=0 FORENSICS=0
+PY="" EXTRAS="connectors" WHEELHOUSE="" RUN_TESTS=0 HARDEN=0 SKIP_INSTALL=0 YES=0 FORENSICS=0 ATTACK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --python) PY="$2"; shift 2 ;;
@@ -38,6 +39,7 @@ while [ $# -gt 0 ]; do
     --wheelhouse) WHEELHOUSE="$2"; shift 2 ;;
     --test) RUN_TESTS=1; shift ;;
     --harden-vault) HARDEN=1; shift ;;
+    --attack) ATTACK=1; shift ;;
     --skip-install) SKIP_INSTALL=1; shift ;;
     -y|--yes) YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -113,6 +115,27 @@ chmod 600 config/.env
 
 mkdir -p config/secrets && chmod 700 config/secrets && ok "config/secrets/ (700) for API configs, CA bundles, client certs"
 
+if [ ! -f config/models.local.yaml ]; then
+  cat > config/models.local.yaml <<'MODELS'
+# Site model profiles (git-ignored). Merged over config/models.yaml, which documents every field:
+# add your own profiles here, override fields of a shipped one, set default_model, or hide one with
+# `enabled: false`. Secrets stay in config/.env as ${VARIABLES}.
+#
+# default_model: claude-sonnet
+models: {}
+#   my-ollama:
+#     label: Ollama - Qwen3 32B
+#     group: Local
+#     provider: openai_compat
+#     base_url: http://127.0.0.1:11434/v1
+#     model: qwen3:32b
+#     context_tokens: 32000
+MODELS
+  ok "created config/models.local.yaml for your site's model profiles (config/models.yaml has the templates)"
+else
+  ok "config/models.local.yaml exists - left unchanged"
+fi
+
 if [ ! -f config/roe.local.yaml ]; then
   { echo "# Site ROE: copy of roe.yaml. Fill in scope.allowed_targets and scope.protected_assets (SETUP.md section 9)."
     echo "# Git-ignored. Selected with CA_ROE=roe.local.yaml in config/.env."
@@ -166,7 +189,17 @@ info "Install only what your team needs, after clearing it with your security te
 info "--forensics installs the Python ones (YARA, Volatility 3, capa, FLOSS, MemProcFS, sigma-cli) into .venv."
 
 # ---------------------------------------------------------------------------------------------------------------
-step "6. Checks"
+step "6. MITRE ATT&CK data (hunt planning)"
+if [ -f data/attack/enterprise-attack.json ]; then
+  ok "data/attack/enterprise-attack.json present"
+elif [ "$ATTACK" = 1 ] && [ -x .venv/bin/canarchist ]; then
+  .venv/bin/canarchist attack fetch && ok "ATT&CK data downloaded" || warn "ATT&CK download failed - retry: .venv/bin/canarchist attack fetch"
+else
+  info "not downloaded. Hunt plans need it: .venv/bin/canarchist attack fetch   (or --from <file> when air-gapped)"
+fi
+
+# ---------------------------------------------------------------------------------------------------------------
+step "7. Checks"
 if [ -x .venv/bin/canarchist ]; then
   if [ "$RUN_TESTS" = 1 ]; then
     .venv/bin/python -m pytest -q && ok "test suite passed" || warn "some tests failed (see above)"
@@ -188,12 +221,12 @@ fi
 step "Ready for configuration"
 cat <<EOF
   Next, follow SETUP.md:
-    1. Model (required): edit config/.env - CA_MODEL plus that profile's URL / model / key (section 1).
+    1. Model (required): pick or fill in a profile in config/models.yaml (e.g. the my-local-model template)
+       and put its key in config/.env; the dashboard's model picker lists them all (SETUP.md section 1).
     2. Connectors you have: Security Onion, Elastic, Splunk, Velociraptor, MISP, OpenCTI (sections 2-7).
        Velociraptor: run scripts/velociraptor_setup.sh on the Velociraptor server; put the key files
        in config/secrets/ (section 5).
     3. Scope: config/roe.local.yaml - allowed_targets and protected_assets (section 9).
-    4. Check:     set -a; source config/.env; set +a
-                  .venv/bin/canarchist doctor --case SETUP-CHECK
+    4. Check:     .venv/bin/canarchist doctor --case SETUP-CHECK   (it reads config/.env itself)
     5. Use it:    .venv/bin/canarchist dashboard --case IR-0001     (or: chat / run)
 EOF

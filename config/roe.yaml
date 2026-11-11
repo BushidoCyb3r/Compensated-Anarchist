@@ -29,6 +29,13 @@ scope:
     # - "C.1234567890abcdef"
     # - 10.0.1.5
 
+# Gate everything: every action by these experts, and by any agent in a conversation that ran these playbooks (or
+# used these experts), needs an analyst's approval - reads included. Built in: the vuln_assessor and the
+# vulnerability_assessment playbook. Lists here add to those; they cannot remove them.
+gate_everything:
+  experts: []
+  playbooks: []
+
 rules:
   # --- harness internals --------------------------------------------------
   - {match: "case_*",   tier: auto}
@@ -49,6 +56,11 @@ rules:
   - {match: "security_onion__*", tier: auto}
   - {match: "splunk__*",         tier: auto}
   - {match: "elastic__*",        tier: auto}
+  - {match: "attack_*",          tier: auto, note: "local MITRE ATT&CK knowledge (read-only)"}
+  - {match: "hunt_plan_*",       tier: auto, note: "hunt plans folder in the case (plans and results)"}
+  # Vulnerability assessment (vuln_assessor). Every vuln_* call needs approval no matter what (built-in floor);
+  # observe: ask lets the analyst approve scans one by one in OBSERVE posture too. Set observe: deny to forbid that.
+  - {match: "vuln_*",            tier: approve, observe: ask, note: "vulnerability assessment: scanners and their output, each approved"}
 
   # --- Velociraptor: visibility vs. response ------------------------------
   # Human in the loop: everything that runs on, changes, or pulls files from an endpoint needs an analyst's

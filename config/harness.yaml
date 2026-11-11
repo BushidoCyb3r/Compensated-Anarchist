@@ -2,7 +2,7 @@
 # Secrets are referenced as ${ENV_VAR} and never written here. See config/env.example.
 
 harness:
-  default_model: local-vllm          # override per run: --model <profile>  or  CA_MODEL=<profile>
+  # default_model: set in models.yaml (default_model:); per run: --model <profile> or CA_MODEL=<profile>
   operator: ${CA_OPERATOR:-analyst}  # recorded in the audit log as the approving analyst
   roe: ${CA_ROE:-roe.yaml}           # site copy (e.g. roe.local.yaml, git-ignored) via CA_ROE
   cases_dir: ../cases
@@ -13,111 +13,35 @@ harness:
   max_tool_result_chars: 12000       # larger outputs spill to the case dir; size this to your model's context
 
 # ---------------------------------------------------------------------------
-# Model profiles - run any model. Anything OpenAI-compatible works via provider: openai_compat
-# (vLLM, Ollama, llama.cpp, LM Studio, TGI, LiteLLM, enterprise/government AI gateways, ...).
-# tool_mode: native = function calling; text = <tool_call> JSON in content (models without tool support)
-# stream: true (default) streams replies to the dashboard and CLI; set false for gateways that mishandle SSE
+# Model profiles: the choices in the dashboard's model picker and for --model. They live in their own file,
+# models.yaml (shipped with GenAI, Claude, ChatGPT and local profiles, plus a template for your own local model),
+# merged with models.local.yaml (git-ignored) for site-specific profiles. Paths are relative to this file.
+# (A `models:` section here still works and is merged first.)
 # ---------------------------------------------------------------------------
-models:
-  local-vllm:            # e.g. vllm serve <model> --enable-auto-tool-choice --tool-call-parser hermes
-    provider: openai_compat
-    base_url: ${VLLM_URL:-http://127.0.0.1:8000/v1}
-    model: ${VLLM_MODEL:-Qwen/Qwen3-32B}
-    api_key: ${VLLM_API_KEY:-}
-    context_tokens: 32000
-    max_output_tokens: 4096
-    extra_body: {temperature: 0.2}
+models_file: models.yaml
 
-  local-ollama:
-    provider: openai_compat
-    base_url: ${OLLAMA_URL:-http://127.0.0.1:11434/v1}
-    model: ${OLLAMA_MODEL:-qwen3:32b}
-    context_tokens: 32000
-    extra_body: {temperature: 0.2}
+# ---------------------------------------------------------------------------
+# MITRE ATT&CK (local STIX bundles) for actor-based hunt planning (hunt_planner expert, hunt_plan playbook).
+# Get the data with `canarchist attack fetch`, or copy enterprise-attack.json from
+# github.com/mitre-attack/attack-stix-data on air-gapped networks. ATTACK_STIX (comma-separated) overrides.
+# ---------------------------------------------------------------------------
+attack:
+  stix: [../data/attack/enterprise-attack.json]
 
-  lab-mlx:               # OpenAI-compatible MLX server (omlx) on the lab network; set LAB_LLM_* in config/.env
-    provider: openai_compat
-    base_url: ${LAB_LLM_URL:-http://127.0.0.1:8080/v1}
-    model: ${LAB_LLM_MODEL:-mlx-community--NVIDIA-Nemotron-3-Nano-4B-8bit}
-    api_key: ${LAB_LLM_API_KEY:-}
-    context_tokens: 65536  # the server allows 262144; compacting earlier keeps prompts fast on Apple silicon
-    max_output_tokens: 8192  # the model reasons before answering, and reasoning counts against this
-    timeout_s: 600
-    extra_body: {temperature: 0.2}
-
-  lab-qwen3-14b:         # same lab server, larger model
-    provider: openai_compat
-    base_url: ${LAB_LLM_URL:-http://127.0.0.1:8080/v1}
-    model: ${LAB_QWEN_MODEL:-mlx-community--Qwen3-14B-4bit}
-    api_key: ${LAB_LLM_API_KEY:-}
-    context_tokens: 16000  # memory-bound, not the model's 40960: 8.1 GB of weights leave ~2.5 GB for context on a 12 GB oMLX ceiling
-    max_output_tokens: 8192
-    timeout_s: 900
-    extra_body: {temperature: 0.3}
-
-  lab-gemma4-12b:        # same lab server; 6.6 GB of weights leaves more room for context than Qwen3 14B
-    provider: openai_compat
-    base_url: ${LAB_LLM_URL:-http://127.0.0.1:8080/v1}
-    model: ${LAB_GEMMA_MODEL:-mlx-community--gemma-4-12b-it-4bit}
-    api_key: ${LAB_LLM_API_KEY:-}
-    context_tokens: 24000
-    max_output_tokens: 8192
-    timeout_s: 900
-    extra_body: {temperature: 0.3}
-
-  local-textmode:        # for local models that don't support native function calling
-    provider: openai_compat
-    base_url: ${LLAMACPP_URL:-http://127.0.0.1:8080/v1}
-    model: local
-    tool_mode: text
-    context_tokens: 16000
-
-  genai-gateway:         # government / enterprise AI gateway exposing an OpenAI-compatible API
-    provider: openai_compat
-    base_url: ${GENAI_BASE_URL:-https://CHANGE-ME/v1}
-    model: ${GENAI_MODEL:-CHANGE-ME}
-    api_key: ${GENAI_API_KEY:-}
-    api_key_header: ${GENAI_API_KEY_HEADER:-Authorization}   # or e.g. x-api-key
-    ca_bundle: ${DOD_CA_BUNDLE:-}                            # DoD PKI root/intermediate CAs (PEM)
-    client_cert: ${GENAI_CLIENT_CERT:-}                      # mTLS client cert if the gateway requires it
-    client_key: ${GENAI_CLIENT_KEY:-}
-    context_tokens: 128000
-    max_output_tokens: 8192
-
-  # Claude via the Anthropic API (ANTHROPIC_API_KEY). Everything the agents read - alerts, hosts, endpoint
-  # results - is sent to Anthropic: check your data-handling rules first (CUI / classified -> genai-gateway).
-  # Prompt caching is on; context_tokens is kept below the models' 1M so each step stays affordable.
-  claude-opus:            # Claude Opus 5.5 - strongest general choice for the lead ($4/$20 per MTok)
-    provider: anthropic           # pip install 'compensated-anarchist[anthropic]'
-    model: claude-opus-5-5
-    api_key: ${ANTHROPIC_API_KEY:-}
-    effort: high
-    context_tokens: 400000
-    max_output_tokens: 32000
-
-  claude-sonnet:          # Claude Sonnet 5.5 - fast, about half Opus's price ($2/$10); good for lead and subagents
-    provider: anthropic
-    model: claude-sonnet-5-5
-    api_key: ${ANTHROPIC_API_KEY:-}
-    effort: high
-    context_tokens: 400000
-    max_output_tokens: 32000
-
-  claude-haiku:           # Claude Haiku 5.5 - fastest and cheapest ($0.10/$0.50 up to 100K-token prompts); suits
-    provider: anthropic   # narrow subagent work (triage lookups, enrichment). No automatic fallback on refusals.
-    model: claude-haiku-5-5
-    api_key: ${ANTHROPIC_API_KEY:-}
-    effort: medium
-    context_tokens: 400000
-    max_output_tokens: 32000
-
-  # claude-mythos:        # Claude Mythos 5.2: for organizations verified through Anthropic's Cyber Verification
-  #   provider: anthropic # Program (meant for security work). Uncomment only if your org has access.
-  #   model: claude-mythos-5-2
-  #   api_key: ${ANTHROPIC_API_KEY:-}
-  #   effort: high
-  #   context_tokens: 400000
-  #   max_output_tokens: 32000
+# ---------------------------------------------------------------------------
+# Vulnerability assessment (vuln_assessor expert, vulnerability_assessment playbook). Every action is approved
+# by the analyst. vuln_run runs one allowlisted program per call, argv only (no shell), against targets inside
+# the ROE scope (scope.allowed_targets must be set), with output kept in cases/<case>/vuln_assessment/raw/.
+# Defaults suit a Kali VM; on other hosts only the installed tools are offered.
+# ---------------------------------------------------------------------------
+vuln_assessment:
+  timeout_s: 900                    # per command (the agent may ask for up to max_timeout_s)
+  max_timeout_s: 3600
+  # tools: [nmap, nuclei, ...]      # replace the built-in allowlist (see compensated_anarchist/tools/vulnscan.py)
+  extra_tools: []                   # add programs to the built-in allowlist
+  deny_args: {}                     # more refused options per program, regexes over the argument string,
+                                    #   e.g. {nmap: ["-T5"], "*": ["--proxy"]}
+  # read_dirs: [/usr/share, /opt]   # absolute paths the tools may read (wordlists, templates)
 
 # ---------------------------------------------------------------------------
 # Expert agents (definitions in compensated_anarchist/experts/*.md; add your own in extra_dir)
@@ -140,7 +64,7 @@ orchestration:
   # Tool schemas are most of a prompt: the full set is ~80 tools / ~10K tokens, this list ~25 tools.
   # ["*"] gives the lead every tool (slow and memory-hungry on local models).
   lead_tools: ["subagent_*", "case_*", "memory_*", "*__alerts_summary", "*__notable_events", "*__list_clients",
-               "local_case_evidence"]
+               "local_case_evidence", "hunt_plan_list"]
 
 # ---------------------------------------------------------------------------
 # Expert skills: versioned procedures the team writes, uses, scores and revises (stored in the memory DB)
@@ -170,6 +94,16 @@ dashboard:
   # <cases_dir>/_dashboard_settings.json) and every change is audited.
   # settings_path: ../cases/_dashboard_settings.json
   consent_text: ""           # notice and consent shown before sign-in; acknowledging it is required and audited
+  # Opening hunt plans (and hunt results / Navigator layers) from the dashboard in an editor.
+  editors:
+    # A browser on the dashboard's own host gets "Open in <editor>": the server launches VS Code, Obsidian, the
+    # desktop's default text editor or another installed editor on the host's screen. Audited. Set false if the
+    # dashboard sits behind a reverse proxy on this host (every viewer would look local).
+    open_on_host: true
+    # Browsers elsewhere get links that open the file on the viewer's own computer (same path needed, or Remote-SSH).
+    links: [vscode, obsidian]
+    # VS Code Remote-SSH target, e.g. "ssh-remote+soc-box": VS Code links then open the file on this host over SSH.
+    vscode_remote: ""
 
 # ---------------------------------------------------------------------------
 # Learning memory

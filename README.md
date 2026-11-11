@@ -40,8 +40,7 @@ and the expert team **writes, scores and revises its own skills** as it works.
 ./scripts/install.sh                                             # venv, install, config/.env, folders, doctor
 $EDITOR config/.env                                              # models + connector credentials (SETUP.md)
 # evidence for a case goes in forensics/<case-id>/ (created per case; the forensics playbook starts there)
-set -a; source config/.env; set +a
-
+.venv/bin/canarchist attack fetch                                # MITRE ATT&CK data for actor-based hunt plans (optional)
 .venv/bin/canarchist doctor    --case TEST                       # models, connectors, ROE tier per tool
 .venv/bin/canarchist dashboard --case IR-2026-0042               # web GUI -> open the printed login URL
 .venv/bin/canarchist chat      --case IR-2026-0042               # terminal console
@@ -102,7 +101,11 @@ single-page app (no CDNs, system fonts), so it works air-gapped, and nothing rel
 
 ## Any model
 
-Model profiles live in `config/harness.yaml` and you switch with `--model`, `CA_MODEL` or `/model`:
+Model profiles live in `config/models.yaml`, and each one is a choice in the dashboard's model picker. It ships
+with GenAI (government / enterprise gateway), Claude, ChatGPT and local-server profiles, plus a `my-local-model`
+template to fill in. Site profiles go in `config/models.local.yaml` (git-ignored, merged over it). Edits show up
+in a running dashboard without a restart, and profiles still missing a key or a `CHANGE-ME` value show as
+"needs setup". Switch with the picker, `--model`, `CA_MODEL` or `/model`:
 
 | provider | covers | notes |
 |---|---|---|
@@ -233,6 +236,28 @@ and a Velociraptor `investigator,api` client.
 - Reads are jailed to `evidence_roots` and the case directory, and outputs go to `cases/<id>/artifacts/`.
 - `local_tools_inventory` shows what is installed. Missing tools fail gracefully.
 
+## Vulnerability assessment (every action approved)
+
+The `vulnerability_assessment` playbook and the `vuln_assessor` expert assess in-scope hosts and write a
+vulnerability report with the most likely attack chains (mapped to ATT&CK, with the cheapest fix that breaks each
+chain). The assessor can use every connector, plus command-line scanners through `vuln_run`. On a Kali VM those
+are all installed (nmap, nuclei, nikto, testssl.sh, sslscan, enum4linux-ng, whatweb, gobuster, searchsploit, ...).
+
+- **The analyst approves every action**, reads included (see the built-in floors under the rules of engagement
+  below). Approval prompts show the exact command line.
+- **`vuln_run` checks each command itself**, beyond the approval:
+  - one allowlisted program, argv only (no shell);
+  - every host in the arguments must be listed in `targets` and sit inside `scope.allowed_targets`
+    (hostnames: every address they resolve to). No scope, no scanning;
+  - no target ranges or target-list files;
+  - exploit, brute-force, DoS and upload options are refused;
+  - paths stay in the case folder (or read-only data such as wordlists);
+  - a minimal environment, so no API keys reach the tools; a timeout.
+- **Outputs:** the full output of every command is kept in `cases/<id>/vuln_assessment/raw/`. The report is
+  saved as `vuln_report_<name>.md`, with an Open button in the dashboard.
+- **Limits:** no exploitation, password attacks or denial of service, by design. Configure the allowlist, extra
+  refused options and timeouts under `vuln_assessment:` in `harness.yaml`.
+
 ## Rules of engagement (`config/roe.yaml`)
 
 The ROE gate runs in code, so the model cannot talk its way past it.
@@ -246,6 +271,13 @@ The ROE gate runs in code, so the model cannot talk its way past it.
   - Velociraptor client ids are resolved live to hostname, FQDN and last IP, so CIDR and hostname rules
     apply to endpoint actions.
   - An id that can't be resolved is denied (fail closed). This was verified against a live server.
+- **Built-in floors** that no ROE file can lower:
+  - Velociraptor actions that touch an endpoint (collection, hunts, memory, downloads, quarantine) and every
+    `vuln_*` tool always need approval.
+  - **Gate everything:** every action by the `vuln_assessor`, and by any agent in a conversation that ran the
+    `vulnerability_assessment` playbook or used that expert, needs approval: reads, notes, memory, tasking and
+    reports included. The dashboard shows APPROVE EVERYTHING in the top bar, and the mode stays on for that
+    conversation.
 - **Defaults:** unknown tools default to `approve`. MCP annotations are trusted only from your own servers.
 - **Audit:** every decision, approval (with the analyst's note), result hash, memory write and verdict goes
   into `cases/<id>/audit.jsonl`. The log is hash-chained, so `canarchist audit-verify --case <id>` detects
@@ -303,7 +335,7 @@ compensated_anarchist/
   servers/          MCP servers: security_onion, splunk, elastic, velociraptor, misp, opencti
   web/              dashboard (Starlette app + self-contained single-page UI, sign-in page, logo)
   experts/ prompts/ playbooks/
-config/             harness.yaml, roe.yaml, env.example
+config/             harness.yaml, models.yaml, roe.yaml, env.example
 tests/              end-to-end (real MCP subprocess, scripted model) + unit tests
 ```
 

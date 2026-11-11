@@ -71,6 +71,7 @@ const ICONS = {
   sun: [["circle", { cx: 12, cy: 12, r: 4 }], ["path", { d: "M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4" }]],
   external: [["path", { d: "M14 4h6v6" }], ["path", { d: "M20 4l-9 9" }], ["path", { d: "M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" }]],
   clock: [["circle", { cx: 12, cy: 12, r: 9 }], ["path", { d: "M12 7v5l3 2" }]],
+  download: [["path", { d: "M12 4v11" }], ["path", { d: "m7 10 5 5 5-5" }], ["path", { d: "M5 20h14" }]],
 };
 function icon(name, size = 16, sw = 1.8) {
   const s = svgEl("svg", { width: size, height: size, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor",
@@ -145,14 +146,15 @@ async function copyText(text) {
 /* ---------------------------------------------------------------- safe markdown -> DOM */
 function inline(text) {
   const frag = document.createDocumentFragment();
-  const re = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\*[^*\s][^*\n]*\*)/g;
+  const re = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\*[^*\s][^*\n]*\*|(?:[\w.~-]*\/)*(?:hunt_plan_|hunt_results_|attack_layer_|vuln_report_)[\w.-]+\.(?:md|json))/g;
   let last = 0, m;
   while ((m = re.exec(text))) {
     if (m.index > last) frag.append(document.createTextNode(text.slice(last, m.index)));
     const t = m[0];
     if (t.startsWith("**")) frag.append(el("strong", { text: t.slice(2, -2) }));
-    else if (t.startsWith("`")) frag.append(el("code", { text: t.slice(1, -1) }));
-    else frag.append(el("em", { text: t.slice(1, -1) }));
+    else if (t.startsWith("`")) frag.append(fileRef(t.slice(1, -1)) || el("code", { text: t.slice(1, -1) }));
+    else if (t.startsWith("*")) frag.append(el("em", { text: t.slice(1, -1) }));
+    else frag.append(fileRef(t) || document.createTextNode(t));
     last = m.index + t.length;
   }
   if (last < text.length) frag.append(document.createTextNode(text.slice(last)));
@@ -230,6 +232,7 @@ const S = {
   stopArmed: new Map(),   // subagent id -> time until which "Confirm stop" stays armed (survives re-renders)
   steerDrafts: new Map(), // subagent id -> unsent guidance text
   clsDraft: null,         // unsaved edits to the classification banner on the Settings page
+  plans: null,            // /api/plans: the case's hunt plans folder and how this browser can open its files
   wasConnected: false,
   skillsTab: "review", skillsSel: null, memStatus: "candidate", roeFilter: "",
 };
@@ -241,6 +244,8 @@ const TOOL_LABELS = {
   case_write_report: "Wrote the report", case_set_verdict: "Set a verdict",
   skill_view: "Loaded skill", skill_create: "Proposed a new skill", skill_update: "Proposed a skill revision",
   skill_feedback: "Scored a skill", skill_list: "Listed skills", subagent_list: "Checked subagents", submit_report: "Submitted report",
+  vuln_environment: "Checked the assessment toolkit", vuln_run: "Ran an assessment tool", vuln_parse: "Parsed scan output",
+  vuln_report_save: "Saved the vulnerability report",
 };
 const SERVER_NAMES = { security_onion: "Security Onion", elastic: "Elastic", splunk: "Splunk", velociraptor: "Velociraptor",
   velociraptor_admin: "Velociraptor admin", misp: "MISP", opencti: "OpenCTI" };
@@ -250,6 +255,8 @@ const PB_DESC = {
   incident_response: "Scope, contain and eradicate a confirmed incident",
   compromise_assessment: "Check hosts or a segment for signs of compromise",
   forensics: "Examine disk, memory or log evidence",
+  hunt_plan: "Build an ATT&CK hunt plan for named threat actors, with queries for your tools",
+  vulnerability_assessment: "Scan in-scope hosts for vulnerabilities and attack chains; every action needs your approval",
 };
 function toolLabel(name) {
   if (TOOL_LABELS[name]) return TOOL_LABELS[name];
@@ -267,7 +274,7 @@ function toolIcon(name) {
   if (srv.startsWith("velociraptor")) return "monitor";
   if (["security_onion", "elastic", "splunk"].includes(srv)) return "search";
   if (["misp", "opencti"].includes(srv)) return "globe";
-  if (name.startsWith("local_")) return "terminal";
+  if (name.startsWith("local_") || name.startsWith("vuln_")) return "terminal";
   return "box";
 }
 const ARG_KEYS = ["query", "q", "search", "value", "values", "title", "name", "path", "client_id", "artifact", "expert", "task",
@@ -282,6 +289,12 @@ function argSummary(args) {
   }
   const s = Object.values(args).find((v) => typeof v === "string" && v);
   return s ? firstLine(s, 160) : "";
+}
+// vuln_run: the exact command line the analyst is approving
+function commandOf(tool, args) {
+  if (tool !== "vuln_run" || !args) return "";
+  const q = (a) => /^[\w@%+=:,./-]+$/.test(a) ? a : "'" + String(a).replace(/'/g, "'\\''") + "'";
+  return [args.tool, ...(Array.isArray(args.args) ? args.args : [])].map((a) => q(String(a))).join(" ");
 }
 function agentOf(why) { const m = /^\[([^\]]+)\]\s*/.exec(why || ""); return m ? m[1] : ""; }
 function ruleOf(why) { return String(why || "").replace(/^\[[^\]]+\]\s*/, ""); }
@@ -378,11 +391,12 @@ function buildOps() {
   ui.title = el("h1", { class: "ellipsis" });
   ui.sub = el("div", { class: "sub ellipsis" });
   ui.posture = el("span", { class: "posture" });
+  ui.gate = el("span", { class: "posture gate", hidden: true }, icon("shield", 13), "APPROVE EVERYTHING");
   ui.inspBtn = el("button", { type: "button", class: "btn btn-ghost icon-btn", "aria-label": "Toggle case panel", title: "Case panel (Ctrl+.)", onclick: toggleInsp }, icon("panel"));
   const more = el("button", { type: "button", class: "btn btn-ghost icon-btn", "aria-label": "Conversation actions", title: "Conversation actions",
     onclick: (e) => openMenu(e.currentTarget, convMenuItems()) }, icon("more"));
   const menuBtn = el("button", { type: "button", class: "btn btn-ghost icon-btn menu-btn", "aria-label": "Open sidebar", onclick: () => $("side").classList.toggle("open") }, icon("menu"));
-  const top = el("header", { class: "topbar" }, menuBtn, el("div", { class: "topbar-title" }, ui.title, ui.sub), ui.posture, ui.inspBtn, more);
+  const top = el("header", { class: "topbar" }, menuBtn, el("div", { class: "topbar-title" }, ui.title, ui.sub), ui.gate, ui.posture, ui.inspBtn, more);
   ui.banner = el("div", { class: "banner", role: "alert", hidden: true });
   ui.feed = el("div", { class: "feed", role: "log", "aria-label": "Operation feed" });
   ui.jump = el("button", { type: "button", class: "btn jump", hidden: true, onclick: scrollBottom }, icon("chevD", 15), "Jump to latest");
@@ -391,7 +405,7 @@ function buildOps() {
   ui.input = el("textarea", { rows: 1, placeholder: "Task the lead…", "aria-label": "Message the lead", oninput: onComposerInput, onkeydown: onComposerKey });
   ui.pbPill = el("div", { class: "pb-pill", hidden: true });
   ui.pbBtn = el("button", { type: "button", class: "btn btn-ghost btn-sm", onclick: (e) => openMenu(e.currentTarget, playbookMenu()) }, icon("list", 15), "Playbook");
-  ui.modelBtn = el("button", { type: "button", class: "btn btn-ghost btn-sm", onclick: (e) => openMenu(e.currentTarget, modelMenu()) });
+  ui.modelBtn = el("button", { type: "button", class: "btn btn-ghost btn-sm", title: "Model for the lead (config/models.yaml)", onclick: (e) => openModelMenu(e.currentTarget) });
   ui.sendBtn = el("button", { type: "submit", class: "btn btn-primary icon-btn", "aria-label": "Send", title: "Send" }, icon("up", 16, 2));
   const form = el("form", { class: "composer", onsubmit: (e) => { e.preventDefault(); sendOrStop(); } },
     ui.pbPill, ui.input,
@@ -405,11 +419,13 @@ function renderHeader() {
   const c = st.conversation;
   S.ui.title.textContent = c ? (c.title || "Untitled") : "New conversation";
   const n = [...S.subs.values()].filter((s) => s.expert).length;
-  S.ui.sub.textContent = `${st.case.id} · lead on ${st.model}${n ? " · " + plural(n, "subagent") : ""}`;
+  S.ui.sub.textContent = `${st.case.id} · lead on ${modelLabel(st.model)}${n ? " · " + plural(n, "subagent") : ""}`;
   const respond = st.posture === "respond";
   clear(S.ui.posture).append(el("span", { class: "dot" + (respond ? " red" : "") }), respond ? "RESPOND" : "OBSERVE");
   S.ui.posture.className = "posture" + (respond ? " respond" : "");
   S.ui.posture.title = respond ? "Response actions are possible (each still passes ROE and approval)" : "Observe only: response actions are denied";
+  S.ui.gate.hidden = !st.gated;
+  S.ui.gate.title = st.gated ? `${st.gated}. Start a new conversation to leave approval mode.` : "";
   S.ui.inspBtn.classList.toggle("on", S.insp.open);
   S.ui.inspBtn.setAttribute("aria-pressed", String(S.insp.open));
   document.title = (S.pending.size ? `(${S.pending.size}) Approval needed · ` : "") + (c ? c.title + " · " : "") + "Compensated Anarchist";
@@ -444,7 +460,7 @@ function renderStatus() {
 }
 function renderComposerState() {
   const st = S.st; if (!st) return;
-  clear(S.ui.modelBtn).append(el("span", { class: "dot ok" }), st.model, icon("chevD", 14));
+  clear(S.ui.modelBtn).append(el("span", { class: "dot ok" }), modelLabel(st.model), icon("chevD", 14));
   S.ui.modelBtn.disabled = S.running;
   const btn = clear(S.ui.sendBtn);
   if (S.running) { btn.append(icon("stop", 15, 2.2)); btn.setAttribute("aria-label", "Stop the operation"); btn.title = "Stop the operation"; }
@@ -701,6 +717,8 @@ function approvalCard(t, d, replay) {
     el("div", { class: "kv" },
       el("span", { class: "label", text: "Requested by" }), el("span", { text: who || "agent" }),
       tgt ? el("span", { class: "label", text: "Target" }) : null, tgt ? el("span", { class: "mono", text: tgt }) : null,
+      commandOf(d.tool, d.arguments) ? el("span", { class: "label", text: "Command" }) : null,
+      commandOf(d.tool, d.arguments) ? el("span", { class: "mono cmd", text: commandOf(d.tool, d.arguments) }) : null,
       el("span", { class: "label", text: "Rule" }), el("span", { text: ruleOf(d.why) })),
     a.actions);
   if (replay) a.actions.hidden = true;
@@ -734,11 +752,13 @@ function openApproval(id) {
   const deny = el("button", { type: "button", class: "btn btn-danger", onclick: async () => { await decide(id, false, note.value); dlg.close(); } }, "Deny");
   const tgt = targetsOf(p.arguments);
   dlg = openDialog({
-    title: "Approve response action", sub: p.tool, iconName: "shield",
+    title: S.st && S.st.gated ? "Approve action" : "Approve response action", sub: p.tool, iconName: "shield",
     body: [
       el("div", { class: "kv" },
         el("span", { class: "label", text: "Action" }), el("span", { text: toolLabel(p.tool) }),
         tgt ? el("span", { class: "label", text: "Target" }) : null, tgt ? el("span", { class: "mono", text: tgt }) : null,
+        commandOf(p.tool, p.arguments) ? el("span", { class: "label", text: "Command" }) : null,
+        commandOf(p.tool, p.arguments) ? el("span", { class: "mono cmd", text: commandOf(p.tool, p.arguments) }) : null,
         el("span", { class: "label", text: "Requested by" }), el("span", { text: agentOf(p.why) || "agent" }),
         el("span", { class: "label", text: "ROE" }), el("span", { text: ruleOf(p.why) }),
         el("span", { class: "label", text: "Requested" }), el("span", { text: `${fmtClock(p.requested)} · ${fmtRel(p.requested)}` })),
@@ -870,6 +890,17 @@ const H = {
     if (!isLead(d)) { subLog(d.agent_id || d.agent, "text", { text: `${what}: ${detail}` }, ev.ts); return; }
     const st = addStep(ensureTurn(ev.ts), { icon: "alert", what, detail });
     if (d.gave_up) setEnd(st, el("span", { class: "chip red", text: "Stopped" }));
+  },
+  gate_on(d, ev) {
+    const st = addStep(ensureTurn(ev.ts), { icon: "shield", what: "Approval mode on: every action in this conversation needs your approval", detail: d.reason });
+    setEnd(st, el("span", { class: "chip warn", text: "Approve everything" }));
+    if (S.st && !S.replaying) { S.st.gated = d.reason; renderHeader(); }
+  },
+  plan_saved(d, ev) {
+    if (d.agent_id && d.agent_id !== "lead") subLog(d.agent_id, "text", { text: `Saved ${PLAN_KIND[d.kind] || "file"}: ${d.name}` }, ev.ts);
+    const t = ensureTurn(ev.ts);
+    mutate(() => t.cards.append(planCard(d)));
+    if (!S.replaying) refreshPlans();
   },
   compact(d, ev) {
     if (!isLead(d)) { subLog(d.agent_id || d.agent, "text", { text: `Compacted ${d.dropped} old messages` }, ev.ts); return; }
@@ -1103,9 +1134,26 @@ function playbookMenu() {
   if (S.playbook) items.push("-", { icon: "x", label: "No playbook", run: () => setPlaybook("") });
   return items;
 }
-function modelMenu() {
-  return S.st.models.map((m) => ({ icon: m.name === S.st.model ? "check" : "box", label: m.name, end: m.model, disabled: S.running,
-    run: async () => { try { await api("/api/model", { name: m.name }); toast(`Lead now on ${m.name}`); scheduleRefresh(); } catch (e) { toast(e.message, true); } } }));
+function modelLabel(name) { const m = S.st && S.st.models.find((x) => x.name === name); return m ? m.label : name; }
+function modelGroups(models) {
+  const groups = new Map();
+  for (const m of models) { if (!groups.has(m.group)) groups.set(m.group, []); groups.get(m.group).push(m); }
+  return groups;
+}
+async function switchModel(m) {
+  try { await api("/api/model", { name: m.name }); toast(`Lead now on ${m.label}`); scheduleRefresh(); } catch (e) { toast(e.message, true); }
+}
+// Profiles come from config/models.yaml (+ models.local.yaml); the state is re-read first so file edits show up.
+async function openModelMenu(anchor) {
+  try { await refreshState(); } catch (e) { /* show what we have */ }
+  const items = [];
+  for (const [g, list] of modelGroups(S.st.models)) {
+    items.push({ header: g });
+    for (const m of list) items.push({ icon: m.name === S.st.model ? "check" : "box", label: m.label, disabled: S.running || !m.ready,
+      end: m.ready ? m.model : "needs setup", title: m.ready ? `${m.name} · ${m.provider} · ${m.model}` : `${m.name}: ${m.problem}`, run: () => switchModel(m) });
+  }
+  items.push("-", { icon: "sliders", label: "Manage models…", end: "models.yaml", run: () => go("settings") });
+  openMenu(anchor, items);
 }
 async function signOut() { try { await api("/api/logout", {}); } catch (e) { /* ignore */ } location.replace("/login"); }
 
@@ -1140,16 +1188,17 @@ function inspClose() { return el("button", { type: "button", class: "btn btn-gho
 function renderCase(box) {
   const c = S.st.case;
   const tabs = [["findings", "Findings", c.findings.length], ["iocs", "IOCs", c.iocs.length], ["timeline", "Timeline", c.timeline.length],
-    ["evidence", "Evidence", c.evidence.length], ["report", "Report", null]];
+    ["evidence", "Evidence", c.evidence.length], ["plans", "Plans & reports", S.plans ? S.plans.files.filter((f) => f.kind === "plan" || f.kind === "vuln_report").length : null],
+    ["report", "Report", null]];
   box.append(el("div", { class: "insp-head" },
     el("div", { class: "t" }, el("strong", { text: `Case ${c.id}` }), el("span", { class: "muted small", text: c.mission ? firstLine(c.mission, 140) : "No mission recorded yet" })),
     inspClose()));
   box.append(el("div", { class: "tabs", role: "tablist", "aria-label": "Case sections" }, tabs.map(([id, label, n]) =>
     el("button", { type: "button", role: "tab", class: "tab" + (S.insp.tab === id ? " on" : ""), "aria-selected": String(S.insp.tab === id),
-      onclick: () => { S.insp.tab = id; renderInsp(); } }, label, n ? el("span", { class: "count", text: n }) : null))));
+      onclick: () => { S.insp.tab = id; renderInsp(); if (id === "plans") refreshPlans(); } }, label, n ? el("span", { class: "count", text: n }) : null))));
   const body = el("div", { class: "insp-body fade", role: "tabpanel" });
   box.append(body);
-  ({ findings: caseFindings, iocs: caseIocs, timeline: caseTimeline, evidence: caseEvidence, report: caseReport })[S.insp.tab](body, c);
+  ({ findings: caseFindings, iocs: caseIocs, timeline: caseTimeline, evidence: caseEvidence, plans: casePlans, report: caseReport })[S.insp.tab](body, c);
 }
 const SEV_ORDER = ["critical", "high", "medium", "low", "informational"];
 function caseFindings(body, c) {
@@ -1219,6 +1268,117 @@ function caseEvidence(body, c) {
       el("div", { class: "muted small", text: [e.description, e.size ? `${e.size} bytes` : null, e.acquired_by].filter(Boolean).join(" · ") })));
   }
 }
+function casePlans(body) {
+  const P = S.plans, folder = (P && P.folder) || (S.st && S.st.plans_folder) || "";
+  body.append(el("div", { class: "card drop-card" },
+    el("div", { class: "label", text: "Hunt plans folder" }),
+    el("div", { class: "path-row" }, el("span", { class: "mono", text: folder }),
+      el("button", { type: "button", class: "btn btn-ghost icon-btn btn-sm", "aria-label": "Copy folder path", title: "Copy path", onclick: () => copyText(folder) }, icon("copy", 14))),
+    el("div", { class: "muted small", text: "The hunt planner saves plans and ATT&CK Navigator layers here. The threat hunter reads them and saves its results next to them, and hunts only when you ask." }),
+    P && P.vuln_folder ? el("div", { class: "label", css: { marginTop: "6px" }, text: "Vulnerability assessment folder" }) : null,
+    P && P.vuln_folder ? el("div", { class: "path-row" }, el("span", { class: "mono", text: P.vuln_folder }),
+      el("button", { type: "button", class: "btn btn-ghost icon-btn btn-sm", "aria-label": "Copy folder path", title: "Copy path", onclick: () => copyText(P.vuln_folder) }, icon("copy", 14))) : null,
+    el("div", { class: "toolbar" }, el("button", { type: "button", class: "btn btn-sm", onclick: () => setPlaybook("hunt_plan") }, icon("list", 14), "Plan a hunt"),
+      el("button", { type: "button", class: "btn btn-sm", onclick: () => setPlaybook("vulnerability_assessment") }, icon("shield", 14), "Assess vulnerabilities"))));
+  if (!P) { body.append(el("div", { class: "empty", text: "Loading…" })); return; }
+  if (!P.host.available && P.host.why) body.append(el("div", { class: "muted small plans-why", text: `Opening in an editor on the host: ${P.host.why}.` }));
+  if (!P.files.length) { body.append(el("div", { class: "empty", text: "No hunt plans or vulnerability reports yet. Pick the hunt plan or vulnerability assessment playbook." })); return; }
+  for (const f of P.files) body.append(planCard(f, true));
+}
+
+/* ---------------------------------------------------------------- hunt plans: view, download, open in an editor */
+const PLAN_KIND = { plan: "Hunt plan", results: "Hunt results", layer: "ATT&CK Navigator layer", vuln_report: "Vulnerability report", other: "File" };
+const PLAN_FILE_RE = /^(hunt_plan_|hunt_results_|attack_layer_|vuln_report_)[\w.-]+\.(md|json)$/i;
+const LINK_NAMES = { vscode: "VS Code", obsidian: "Obsidian" };
+async function refreshPlans() {
+  try { S.plans = await api("/api/plans"); } catch (e) { return; }
+  labelOpenButtons();
+  if (S.insp.open && !S.insp.thread) renderInspSoon();
+}
+function planUrl(name, download) { return `/api/plans/${encodeURIComponent(name)}${download ? "?download=1" : ""}`; }
+function planPath(name) {
+  const f = S.plans && S.plans.files.find((x) => x.name.toLowerCase() === name.toLowerCase());
+  const vuln = /^vuln_report_/i.test(name);
+  const folder = vuln ? (S.plans && S.plans.vuln_folder) || (S.st && S.st.vuln_folder) || ""
+    : (S.plans && S.plans.folder) || (S.st && S.st.plans_folder) || "";
+  return f ? f.path : folder ? `${folder}/${name}` : name;
+}
+function linkUrl(kind, path) {
+  const remote = S.plans && S.plans.vscode_remote;
+  if (kind === "vscode") return remote ? `vscode://vscode-remote/${remote}${encodeURI(path)}` : `vscode://file${encodeURI(path)}`;
+  return `obsidian://open?path=${encodeURIComponent(path)}`;
+}
+// The ways this browser can open a file: editors on the host (when the browser is on the host), else links that
+// hand the file to VS Code / Obsidian on the viewer's own computer.
+function openChoices(name) {
+  const P = S.plans;
+  if (!P) return [];
+  if (P.host.available) return P.host.editors.map((e) => ({ key: "host:" + e.id, label: e.name, isDefault: e.default,
+    end: e.default ? "default" : "", run: () => openOnHost(name, e) }));
+  return (P.links || []).map((k) => ({ key: "link:" + k, label: LINK_NAMES[k] || k, end: "on your computer", run: () => openLink(k, name) }));
+}
+function preferredChoice(choices) { const k = pref("editor", ""); return choices.find((c) => c.key === k) || choices.find((c) => c.isDefault) || choices[0] || null; }
+async function openOnHost(name, e) {
+  try { await api(`/api/plans/${encodeURIComponent(name)}/open`, { editor: e.id }); toast(`Opening ${name} in ${e.name}`); }
+  catch (err) { toast(err.message, true); }
+}
+function clickLink(href, download) { const a = el("a", { href, download, hidden: true }); document.body.append(a); a.click(); a.remove(); }
+function openLink(kind, name) {
+  clickLink(linkUrl(kind, planPath(name)));
+  toast(kind === "obsidian" ? "Sent to Obsidian. The file must be inside one of your vaults." : `Sent to ${LINK_NAMES[kind] || kind}`);
+}
+function downloadPlan(name) { clickLink(planUrl(name, true), name); }
+async function viewPlan(name) {
+  let text;
+  try { text = await api(planUrl(name)); } catch (e) { toast(e.message, true); return; }
+  const dlg = openDialog({ title: name, sub: planPath(name), iconName: "file", wide: true, cls: "plan-view",
+    body: [name.toLowerCase().endsWith(".json") ? el("pre", { class: "code", text }) : md(text)],
+    foot: [el("span", { class: "note" }), ...planActions(name, false), el("button", { type: "button", class: "btn btn-sm", onclick: () => dlg.close() }, "Close")] });
+}
+function fileMenu(name) {
+  const items = openChoices(name).map((c) => ({ icon: "external", label: `Open in ${c.label}`, end: c.end,
+    run: () => { setPref("editor", c.key); labelOpenButtons(); c.run(); } }));
+  const why = S.plans && !S.plans.host.available ? S.plans.host.why : "";
+  if (why && S.plans.links && S.plans.links.length) items.push({ icon: "alert", label: `Not on the host: ${why}`, disabled: true, run: () => {} });
+  if (items.length) items.push("-");
+  items.push({ icon: "file", label: "View here", run: () => viewPlan(name) },
+    { icon: "download", label: "Download", run: () => downloadPlan(name) },
+    { icon: "copy", label: "Copy path", end: planPath(name).length > 46 ? "…" + planPath(name).slice(-45) : planPath(name), run: () => copyText(planPath(name)) });
+  return items;
+}
+function openLabel(name) { const c = preferredChoice(openChoices(name)); return c ? `Open in ${c.label}` : "Open"; }
+function labelOpenButtons() { for (const b of document.querySelectorAll("button[data-plan]")) b.lastChild.textContent = openLabel(b.dataset.plan); }
+function planActions(name, withView = true) {
+  const main = el("button", { type: "button", class: "btn btn-sm btn-primary", "data-plan": name, title: "Open it in your editor",
+    onclick: () => { const c = preferredChoice(openChoices(name)); if (c) c.run(); else viewPlan(name); } }, icon("external", 14), document.createTextNode(openLabel(name)));
+  const caret = el("button", { type: "button", class: "btn btn-sm btn-primary split-caret", "aria-label": "Open with…", title: "Open with…",
+    onclick: (e) => openMenu(e.currentTarget, fileMenu(name)) }, icon("chevD", 14));
+  return [el("span", { class: "split" }, main, caret),
+    withView ? el("button", { type: "button", class: "btn btn-sm", onclick: () => viewPlan(name) }, icon("file", 14), "View") : null,
+    el("button", { type: "button", class: "btn btn-sm", onclick: () => downloadPlan(name) }, icon("download", 14), "Download"),
+    el("button", { type: "button", class: "btn btn-ghost icon-btn btn-sm", "aria-label": "Copy path", title: "Copy path", onclick: () => copyText(planPath(name)) }, icon("copy", 14))].filter(Boolean);
+}
+function planCard(f, inPanel) {
+  const meta = inPanel ? [f.mtime ? fmtRel(f.mtime) : null, f.kind === "plan" ? (f.hunted ? "hunted" : "not hunted yet") : null].filter(Boolean).join(" · ") : "";
+  return el("div", { class: "file-card" + (inPanel ? " in-panel" : "") },
+    el("div", { class: "head" }, el("span", { class: "ic" }, icon("file", 16)), el("span", { class: "kind", text: PLAN_KIND[f.kind] || "File" }),
+      el("span", { class: "mono name", title: f.path || f.name, text: f.name })),
+    f.title ? el("div", { class: "title", text: f.title }) : null,
+    f.kind === "layer" ? el("div", { class: "muted small", text: "Download it, then in ATT&CK Navigator: Open Existing Layer, Upload from local." }) : null,
+    meta ? el("div", { class: "muted small", text: meta }) : null,
+    el("div", { class: "toolbar" }, ...planActions(f.name)));
+}
+// A plan file named in agent text becomes a link that opens the same menu.
+function fileRef(text) {
+  const base = String(text).split("/").pop();
+  if (!PLAN_FILE_RE.test(base)) return null;
+  const n = el("span", { class: "file-ref", role: "button", tabindex: "0", title: "Open, view or download this file" }, icon("file", 12), text);
+  const go = (e) => { e.preventDefault(); e.stopPropagation(); openMenu(n, fileMenu(base)); };
+  n.addEventListener("click", go);
+  n.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") go(e); });
+  return n;
+}
+
 async function caseReport(body) {
   const ask = el("button", { type: "button", class: "btn", onclick: () => send("Task the reporter to write the incident report from the case record now.", "") }, "Ask the reporter to draft it");
   try {
@@ -1444,8 +1604,9 @@ const PAGES = {
     root.append(grid);
   },
   async settings(root) {
+    try { applyState(await api("/api/state")); } catch (e) { /* render what we have */ } // picks up edits to models.yaml
     const st = S.st;
-    root.append(pageHead("Settings", "The theme is stored in this browser. The classification banner applies to everyone using this dashboard. Other server settings live in config/harness.yaml and config/roe.yaml."));
+    root.append(pageHead("Settings", "The theme is stored in this browser. The classification banner applies to everyone using this dashboard. Models live in config/models.yaml; other server settings in config/harness.yaml and config/roe.yaml."));
     const mode = pref("theme", "dark");
     const seg = el("div", { class: "seg", role: "group", "aria-label": "Theme" }, [["dark", "Dark"], ["light", "Light"], ["system", "Match system"]].map(([v, label]) =>
       el("button", { type: "button", class: mode === v ? "on" : "", onclick: () => { applyTheme(v); renderPage("settings"); } }, label)));
@@ -1457,13 +1618,35 @@ const PAGES = {
       el("span", { class: "label", text: "Session" }), el("span", { class: "mono", text: st.session }),
       el("span", { class: "label", text: "Version" }), el("span", { text: `${st.ui.name} ${st.ui.version}` })));
     root.append(classificationSettings());
-    const tb = el("tbody");
-    for (const m of st.models) tb.append(el("tr", {}, el("td", {}, m.name === st.model ? el("span", { class: "chip red", text: "lead" }) : null), el("td", { class: "mono", text: m.name }), el("td", { text: m.provider }), el("td", { class: "mono", text: m.model })));
-    root.append(el("h2", { css: { fontSize: "15px" }, text: "Model profiles" }),
-      el("div", { class: "table-box" }, el("table", { class: "list" }, el("thead", {}, el("tr", {}, ["", "Profile", "Provider", "Model"].map((h) => el("th", { text: h })))), tb)));
+    root.append(modelSettings(st));
     root.append(el("h2", { css: { fontSize: "15px" }, text: "Keyboard shortcuts" }), shortcutsTable());
   },
 };
+/* ---------------------------------------------------------------- model profiles (config/models.yaml) */
+function modelSettings(st) {
+  const box = el("section", { class: "settings-sec" });
+  const files = st.models_files || [];
+  box.append(el("h2", { css: { fontSize: "15px" }, text: "Models" }),
+    el("p", { class: "muted small", css: { margin: "0 0 8px" } },
+      "The model picker lists the profiles in ", el("code", { text: files[0] || "config/models.yaml" }),
+      files[1] ? [" and your site file ", el("code", { text: files[1] })] : null,
+      ". Edit them to add, change or remove models; changes show up here without a restart. API keys go in ", el("code", { text: "config/.env" }), ", referenced as ${VAR}."));
+  if (st.models_error) box.append(el("div", { class: "card warn-card" }, el("strong", { text: "Your last edit was not applied: " }), el("span", { class: "mono", text: st.models_error }),
+    el("div", { class: "muted small", text: "The dashboard keeps using the profiles from before that edit. Fix the file and reopen this page." })));
+  const tb = el("tbody");
+  for (const [g, list] of modelGroups(st.models)) {
+    tb.append(el("tr", { class: "group-row" }, el("td", { colspan: "5", text: g })));
+    for (const m of list) tb.append(el("tr", {},
+      el("td", {}, m.name === st.model ? el("span", { class: "chip red", text: "lead" }) : null),
+      el("td", {}, el("div", { text: m.label }), el("div", { class: "mono muted", css: { fontSize: "11.5px" }, text: m.name })),
+      el("td", { text: m.provider }), el("td", { class: "mono", text: m.model }),
+      el("td", {}, m.ready ? el("span", { class: "chip ok", text: "ready" }) : el("span", { class: "chip warn", title: m.problem, text: "needs setup" }),
+        m.ready ? null : el("div", { class: "muted small", text: m.problem }))));
+  }
+  box.append(el("div", { class: "table-box" }, el("table", { class: "list" }, el("thead", {}, el("tr", {}, ["", "Profile", "Provider", "Model", "Status"].map((h) => el("th", { text: h })))), tb)));
+  return box;
+}
+
 /* ---------------------------------------------------------------- classification banner setting */
 // Common US banner colors. Picking one fills the text and colors; the text stays editable (e.g. SECRET//NOFORN).
 const MARKINGS = [
@@ -1695,7 +1878,8 @@ function openMenu(anchor, items) {
   const m = el("div", { class: "menu", role: "menu" });
   for (const it of items) {
     if (it === "-") { m.append(el("div", { class: "menu-sep", role: "separator" })); continue; }
-    m.append(el("button", { type: "button", class: "menu-item" + (it.danger ? " danger" : ""), role: "menuitem", disabled: !!it.disabled,
+    if (it.header) { m.append(el("div", { class: "menu-head", role: "presentation", text: it.header })); continue; }
+    m.append(el("button", { type: "button", class: "menu-item" + (it.danger ? " danger" : ""), role: "menuitem", disabled: !!it.disabled, title: it.title || null,
       onclick: () => { closeMenu(); it.run(); } }, it.icon ? icon(it.icon, 15) : null, it.label, it.end ? el("span", { class: "end", text: it.end }) : null));
   }
   document.body.append(m);
@@ -1732,8 +1916,7 @@ function paletteItems() {
   for (const p of st.playbooks || []) add("Playbooks", "list", `Start playbook: ${humanPb(p)}`, () => { go("ops"); setPlaybook(p); }, "", PB_DESC[p] || "");
   for (const s of S.subs.values()) if (s.expert) add("Subagents", "users", `${s.id} · ${shortTitle(s.title)}`, () => { go("ops"); openThread(s.id); }, s.status, s.task);
   for (const c of S.convs) add("Conversations", "chat", c.title || "Untitled", () => { go("ops"); openConversation(c.id); }, fmtRel(c.updated));
-  for (const m of st.models) if (m.name !== st.model) add("Models", "box", `Switch the lead to ${m.name}`, async () => {
-    try { await api("/api/model", { name: m.name }); toast(`Lead now on ${m.name}`); scheduleRefresh(); } catch (e) { toast(e.message, true); } }, m.model);
+  for (const m of st.models) if (m.name !== st.model && m.ready) add("Models", "box", `Switch the lead to ${m.label}`, () => switchModel(m), m.model, m.name);
   return items;
 }
 function openPalette() {
@@ -1820,6 +2003,7 @@ window.addEventListener("popstate", route);
   route();
   connect();
   refreshAudit();
+  refreshPlans();
   setInterval(tick, 1000);
   if (S.view === "ops") S.ui.input.focus();
 })();

@@ -1,0 +1,191 @@
+# Compensated Anarchist - model profiles
+#
+# Every enabled profile below is a choice in the dashboard's model picker and for `--model <name>` / `/model` on
+# the CLI. Add, change or remove models here. A running dashboard picks the changes up the next time the picker
+# or the Settings page opens; no restart needed.
+#
+# Site-specific profiles go in models.local.yaml next to this file. It is git-ignored, has the same layout, and is
+# merged over this file, so it can add profiles, override fields of a profile here, set default_model, or turn
+# one off with `enabled: false`.
+#
+# SECRETS NEVER GO IN THIS FILE. Write ${VAR} and put the value in config/.env (git-ignored, chmod 600).
+# ${VAR:-default} uses the default when VAR is unset.
+#
+# Profile fields:
+#   label              name shown in the picker (default: the profile name)
+#   group              picker section: GenAI | Claude | ChatGPT | Local, or your own
+#   enabled            false hides the profile from the picker and --model
+#   provider           openai_compat (any OpenAI-compatible API) | anthropic (Claude API)
+#   base_url           openai_compat: the API root, usually ending in /v1
+#   model              the model id the server expects. Ask the server: GET <base_url>/models
+#   api_key            a ${VAR} reference; leave empty for local servers without auth
+#   api_key_header     Authorization (sends "Bearer <key>") or a raw header name such as x-api-key
+#   extra_headers      more HTTP headers, e.g. {x-org-id: "${ORG_ID}"}
+#   ca_bundle          PEM bundle of private CAs (e.g. DoD PKI roots) for TLS to the server
+#   client_cert, client_key   mTLS client certificate and key (PEM) when the gateway requires one
+#   verify_tls         false skips TLS verification (lab only)
+#   tool_mode          native (function calling) | text (<tool_call> JSON in the reply, for models without tools)
+#   context_tokens     when to compact the conversation; keep it under what the server really allows
+#   max_output_tokens  cap per reply (reasoning models count their reasoning against it)
+#   max_tokens_param   max_tokens (most servers) | max_completion_tokens (OpenAI's own API)
+#   timeout_s          per request, in seconds
+#   stream             true streams replies to the dashboard; false for gateways that mishandle streaming
+#   extra_body         provider knobs sent as-is, e.g. {temperature: 0.2} or {reasoning_effort: medium}
+#   effort             anthropic only: low | medium | high
+#
+# Data handling: a hosted model (Claude, ChatGPT, a gateway) receives everything the agents read: alerts, host
+# names, endpoint results. Check your rules first. CUI or classified data belongs on an accredited gateway or a
+# local model.
+#
+# Route experts to models in harness.yaml (experts.overrides), e.g. a big model for the lead and a small fast one
+# for triage.
+
+default_model: local-vllm        # per run: --model <profile>, or CA_MODEL=<profile> in config/.env
+
+models:
+  # ===========================================================================================================
+  # GenAI: government / enterprise AI gateway (GenAI.mil or your organization's), OpenAI-compatible API
+  # Get the API root, model ids and auth method from your gateway's documentation or help desk.
+  # ===========================================================================================================
+  genai-gateway:
+    label: GenAI gateway
+    group: GenAI
+    provider: openai_compat
+    base_url: ${GENAI_BASE_URL:-https://CHANGE-ME/v1}       # set GENAI_BASE_URL in config/.env
+    model: ${GENAI_MODEL:-CHANGE-ME}                        # set GENAI_MODEL in config/.env
+    api_key: ${GENAI_API_KEY:-}
+    api_key_header: ${GENAI_API_KEY_HEADER:-Authorization}  # or e.g. x-api-key
+    ca_bundle: ${DOD_CA_BUNDLE:-}                           # DoD PKI root/intermediate CAs (PEM)
+    client_cert: ${GENAI_CLIENT_CERT:-}                     # mTLS client cert if the gateway requires it
+    client_key: ${GENAI_CLIENT_KEY:-}
+    context_tokens: 128000
+    max_output_tokens: 8192
+
+  # ===========================================================================================================
+  # Claude: Anthropic API. Set ANTHROPIC_API_KEY in config/.env and install the extra:
+  #   pip install 'compensated-anarchist[anthropic]'
+  # Prompt caching is on. context_tokens stays below the models' 1M so each step stays affordable.
+  # ===========================================================================================================
+  claude-opus:
+    label: Claude Opus 5.5
+    group: Claude
+    provider: anthropic           # strongest general choice for the lead ($4 / $20 per million tokens in / out)
+    model: claude-opus-5-5
+    api_key: ${ANTHROPIC_API_KEY:-}
+    effort: high
+    context_tokens: 400000
+    max_output_tokens: 32000
+
+  claude-sonnet:
+    label: Claude Sonnet 5.5
+    group: Claude
+    provider: anthropic           # fast, about half Opus's price ($2 / $10); good for the lead and subagents
+    model: claude-sonnet-5-5
+    api_key: ${ANTHROPIC_API_KEY:-}
+    effort: high
+    context_tokens: 400000
+    max_output_tokens: 32000
+
+  claude-haiku:
+    label: Claude Haiku 5.5
+    group: Claude
+    provider: anthropic           # fastest and cheapest ($0.10 / $0.50 up to 100K-token prompts); suits narrow
+    model: claude-haiku-5-5       # subagent work such as triage lookups and enrichment
+    api_key: ${ANTHROPIC_API_KEY:-}
+    effort: medium
+    context_tokens: 400000
+    max_output_tokens: 32000
+
+  # claude-mythos:                # Claude Mythos 5.2: for organizations verified through Anthropic's Cyber
+  #   label: Claude Mythos 5.2    # Verification Program (meant for security work). Uncomment only with access.
+  #   group: Claude
+  #   provider: anthropic
+  #   model: claude-mythos-5-2
+  #   api_key: ${ANTHROPIC_API_KEY:-}
+  #   effort: high
+  #   context_tokens: 400000
+  #   max_output_tokens: 32000
+
+  # ===========================================================================================================
+  # ChatGPT: OpenAI API. Set OPENAI_API_KEY in config/.env. OpenAI renames models often: check
+  # https://developers.openai.com/api/docs/models and set OPENAI_MODEL / OPENAI_MODEL_SMALL to override the ids.
+  # ===========================================================================================================
+  chatgpt:
+    label: ChatGPT (GPT-5.6 Sol)
+    group: ChatGPT
+    provider: openai_compat       # OpenAI's frontier tier
+    base_url: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+    model: ${OPENAI_MODEL:-gpt-5.6-sol}
+    api_key: ${OPENAI_API_KEY:-}
+    max_tokens_param: max_completion_tokens
+    context_tokens: 200000        # keep under the model's context window
+    max_output_tokens: 32000
+    extra_body: {reasoning_effort: medium}
+
+  chatgpt-luna:
+    label: ChatGPT (GPT-5.6 Luna)
+    group: ChatGPT
+    provider: openai_compat       # OpenAI's efficient, high-volume tier: triage and enrichment subagents
+    base_url: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+    model: ${OPENAI_MODEL_SMALL:-gpt-5.6-luna}
+    api_key: ${OPENAI_API_KEY:-}
+    max_tokens_param: max_completion_tokens
+    context_tokens: 200000
+    max_output_tokens: 16000
+    extra_body: {reasoning_effort: low}
+
+  # ===========================================================================================================
+  # Local models: your own server, any OpenAI-compatible API. Nothing leaves your network.
+  # ===========================================================================================================
+  local-ollama:
+    label: Ollama
+    group: Local
+    provider: openai_compat       # ollama pull qwen3:32b, then: ollama serve
+    base_url: ${OLLAMA_URL:-http://127.0.0.1:11434/v1}
+    model: ${OLLAMA_MODEL:-qwen3:32b}
+    context_tokens: 32000
+    extra_body: {temperature: 0.2}
+
+  local-vllm:
+    label: vLLM
+    group: Local
+    provider: openai_compat       # vllm serve <model> --enable-auto-tool-choice --tool-call-parser hermes
+    base_url: ${VLLM_URL:-http://127.0.0.1:8000/v1}
+    model: ${VLLM_MODEL:-Qwen/Qwen3-32B}
+    api_key: ${VLLM_API_KEY:-}
+    context_tokens: 32000
+    max_output_tokens: 4096
+    extra_body: {temperature: 0.2}
+
+  local-textmode:
+    label: llama.cpp (no function calling)
+    group: Local
+    provider: openai_compat       # llama-server -m <model.gguf>; for models without native tool calling
+    base_url: ${LLAMACPP_URL:-http://127.0.0.1:8080/v1}
+    model: local
+    tool_mode: text
+    context_tokens: 16000
+
+  # -----------------------------------------------------------------------------------------------------------
+  # TEMPLATE: your local model. Fill in the three CHANGE-ME lines and it becomes a choice in the picker.
+  # Copy the whole block (with a new name) for each additional model you run.
+  #
+  #   base_url  where your server listens. Common defaults:
+  #               Ollama http://127.0.0.1:11434/v1     vLLM http://127.0.0.1:8000/v1
+  #               LM Studio http://127.0.0.1:1234/v1   llama.cpp / oMLX http://127.0.0.1:8080/v1
+  #   model     the exact id your server lists at GET <base_url>/models,
+  #               e.g. qwen3:32b (Ollama) or Qwen/Qwen3-32B (vLLM)
+  #   api_key   only if your server needs one: put MY_LLM_API_KEY=... in config/.env
+  # -----------------------------------------------------------------------------------------------------------
+  my-local-model:
+    label: My local model
+    group: Local
+    provider: openai_compat
+    base_url: http://127.0.0.1:8080/v1   # CHANGE-ME if your server is elsewhere
+    model: CHANGE-ME                     # CHANGE-ME: the model id from GET <base_url>/models
+    api_key: ${MY_LLM_API_KEY:-}
+    tool_mode: native                    # text if the model has no function calling
+    context_tokens: 32000                # CHANGE-ME: at most what your server allows for this model
+    max_output_tokens: 4096              # raise to 8192+ for reasoning models (their thinking counts)
+    timeout_s: 600                       # local models on modest hardware can be slow
+    extra_body: {temperature: 0.2}

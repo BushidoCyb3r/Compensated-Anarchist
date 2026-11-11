@@ -40,7 +40,8 @@ from .mcp_manager import McpManager
 from .memory import Memory
 from .roe import RoeGate, cli_approver, deny_all_approver
 from .skills import LEAD, SkillStore, skill_tools
-from . import casefiles, vault
+from . import attack, casefiles, huntplans, vault
+from .tools import vulnscan
 from .tools.forensics import Forensics
 from .tools.registry import Tool, ToolExecutor, ToolRegistry, schema
 
@@ -49,13 +50,13 @@ EventFn = Callable[[str, dict[str, Any]], None]
 # events that make up the conversation feed (persisted and replayed); everything else is UI-only
 PERSIST_KINDS = {"analyst_message", "text", "subagent_spawn", "subagent_message", "subagent_report", "subagent_steer",
                  "decision", "result", "approval_request", "approval_resolved", "run_end", "compact", "skill_used",
-                 "skill_proposed", "retro_start", "loop_guard"}
+                 "skill_proposed", "retro_start", "loop_guard", "plan_saved", "gate_on"}
 REPORT_STATUSES = ["completed", "blocked", "needs_input", "failed"]
 # The lead orchestrates, so it only holds overview tools; detailed connector, forensic and intel tools belong to
 # the experts. This keeps the lead's prompt small (tool schemas are most of it), which matters on local models.
 # Override with orchestration.lead_tools in harness.yaml (["*"] = every tool, the old behavior).
 DEFAULT_LEAD_TOOLS = ["subagent_*", "case_*", "memory_*", "*__alerts_summary", "*__notable_events", "*__list_clients",
-                      "local_case_evidence"]
+                      "local_case_evidence", "hunt_plan_list"]
 
 
 def _prompt(name: str) -> str:
@@ -432,6 +433,9 @@ class Harness:
                                      cfg.max_tool_result_chars, self.emit)
         self.vault_dir = vault.ensure(Path(cfg.forensics.get("vault_dir") or cfg.evidence_roots[0] / "vault"))
         self.case_evidence_dir = casefiles.ensure_case_folder(cfg.forensics_dir, case_id)  # analyst drop folder
+        self.hunt_plans_dir = huntplans.ensure(self.case.dir / "hunt_plans")  # hunt_planner writes, threat_hunter reads
+        self.vuln_dir = huntplans.ensure(self.case.dir / "vuln_assessment")  # vuln_assessor's reports and raw scans
+        self.gate_reason = ""  # set when this conversation is under the gate-everything floor (every action approved)
         for spec in cfg.mcp_servers.values():  # Velociraptor evidence lands in the vault, inside the forensic jail
             if str(spec.get("module", "")).endswith(".velociraptor"):
                 env = spec.setdefault("env", {})
@@ -443,6 +447,7 @@ class Harness:
         self.mcp = McpManager(cfg.mcp_servers, self.case.dir / "logs")
         self.experts = load_experts(cfg)
         self.backends: dict[str, LLMBackend] = {}
+        self.retired_backends: list[LLMBackend] = []  # replaced after a profile edit; closed with the harness
         self.lead: Agent | None = None
         self.subagents: dict[str, SubAgent] = {}
         self._sub_states: dict[str, dict[str, Any]] = {}
@@ -450,6 +455,7 @@ class Harness:
         self._sem: asyncio.Semaphore | None = None
         self._alias_cache: dict[str, tuple[float, list[str]]] = {}
         self.roe.target_resolver = self._resolve_target
+        self.roe.gate_hook = self._gate_hook
         self._agent_seq = 0
 
     # ---- events / conversation -------------------------------------------------------
@@ -458,6 +464,36 @@ class Harness:
         if kind in PERSIST_KINDS:
             self.history.append(self._conv()["id"], self.session, kind, data, time.time())
         self.on_event(kind, data)
+
+    # ---- gate everything (vulnerability assessment) ------------------------------------------
+    def _gate_hook(self, agent: str, tool: str, arguments: dict[str, Any]) -> str:
+        """Why this call needs an analyst's approval under the gate-everything floor ('' = it does not)."""
+        gated = self.roe.gate_all_experts
+        if agent in gated:
+            return f"the {agent} needs analyst approval for every action"
+        if self.gate_reason:
+            return self.gate_reason
+        if tool == "subagent_spawn" and str(arguments.get("expert", "")) in gated:
+            return f"starting the {arguments.get('expert')} needs analyst approval"
+        if tool == "subagent_message":
+            sa = self.subagents.get(str(arguments.get("subagent_id", "")).strip().upper())
+            if sa and sa.expert in gated:
+                return f"tasking the {sa.expert} needs analyst approval"
+        return ""
+
+    def gate_conversation(self, why: str) -> None:
+        """From now on every action in this conversation, by any agent, needs the analyst's approval. Sticky: it
+        is recorded in the conversation and restored when it is reopened. A new conversation starts ungated."""
+        if self.gate_reason:
+            return
+        self.gate_reason = f"{why}: every action in this conversation needs analyst approval"
+        self.audit.record("gate_everything_on", conversation=self._conv()["id"], reason=self.gate_reason)
+        self.emit("gate_on", {"reason": self.gate_reason})
+
+    def _plan_saved(self, path: Path, kind: str) -> None:
+        """A hunt plan, hunt results or Navigator layer was saved: the dashboard shows it with links to open it."""
+        self.emit("plan_saved", {"name": path.name, "kind": kind, "path": str(path),
+                                 "title": huntplans.title(path) if path.suffix == ".md" else ""})
 
     def _conv(self) -> dict[str, Any]:
         if self.conversation is None:  # created on first use, so `doctor` etc. leave no empty conversations
@@ -473,6 +509,8 @@ class Harness:
         if not c or c["case_id"] != self.case.id:
             raise ValueError(f"no conversation {conv_id} in case {self.case.id}")
         self.conversation = c
+        gate = self.history.first_event(conv_id, "gate_on")
+        self.gate_reason = str(gate["data"].get("reason", "")) if gate else ""
         self.lead = self._new_lead()
         self.subagents, self._sub_states = {}, {}
         states = self.history.load_agents(conv_id)
@@ -494,6 +532,7 @@ class Harness:
         if self.lead:
             self.lead.save()
         self.conversation = None
+        self.gate_reason = ""
         self.lead = self._new_lead()
         self.subagents, self._sub_states = {}, {}
 
@@ -503,6 +542,7 @@ class Harness:
             return False
         if self.conversation and self.conversation["id"] == conv_id:
             self.conversation = None
+            self.gate_reason = ""
             self.lead = self._new_lead()
             self.subagents, self._sub_states = {}, {}
         _purge(self.history, self.case.dir, c, self.audit)
@@ -511,8 +551,11 @@ class Harness:
     # ---- setup ----------------------------------------------------------------------------
     def backend(self, name: str | None) -> LLMBackend:
         key = name or self.model_name
-        if key not in self.backends:
-            self.backends[key] = make_backend(self.cfg.model(key))
+        prof = self.cfg.model(key)
+        if key not in self.backends or getattr(self.backends[key], "profile", prof) is not prof:
+            if key in self.backends:  # its profile was edited (models.yaml or config/.env): rebuild it
+                self.retired_backends.append(self.backends[key])
+            self.backends[key] = make_backend(prof)
         return self.backends[key]
 
     async def start(self, conversation_id: str | None = None, new: bool = False) -> None:
@@ -524,6 +567,17 @@ class Harness:
                            case_folder=self.case_evidence_dir, vault_dir=self.vault_dir).tools():
             self.registry.add(t)
         await self.mcp.start(self.registry)
+        self.attack = attack.AttackKB(self.cfg.attack_paths)  # loaded on first use
+        for t in attack.tools(self.attack, lambda: self.hunt_plans_dir,
+                              lambda: [k for k, v in self.mcp.status.items() if str(v).startswith("connected")],
+                              on_saved=self._plan_saved):
+            self.registry.add(t)
+        for t in huntplans.tools(lambda: self.hunt_plans_dir, on_saved=self._plan_saved):
+            self.registry.add(t)
+        vt = vulnscan.VulnTools(self.cfg.raw.get("vuln_assessment") or {}, self.vuln_dir,
+                                scope=lambda: (self.roe.allowed_targets, self.roe.protected_assets), on_saved=self._plan_saved)
+        for t in vt.tools():
+            self.registry.add(t)
         self._register_orchestration()
         self.audit.record("session_start", session=self.session, model=self.model_name, posture=self.roe.posture,
                           mcp=self.mcp.status, experts=list(self.experts))
@@ -589,6 +643,7 @@ class Harness:
                + ", ".join(f"{k}={v}" for k, v in self.mcp.status.items())
                + f"\nCase evidence folder (the analyst drops artifacts here): {self.case_evidence_dir}"
                + f"\nFiles pulled from endpoints (evidence vault): {self.vault_dir / 'velociraptor'}"
+               + f"\nHunt plans folder (hunt_planner saves plans, threat_hunter reads them): {self.hunt_plans_dir}"
                + f"\nEvidence roots: {[str(p) for p in self.cfg.evidence_roots]}")
         return _prompt("core") + "\n\n" + role_prompt + env
 
@@ -688,6 +743,8 @@ class Harness:
         if not e:
             return f"ERROR: unknown expert {expert}. Experts: {', '.join(self.experts)}"
         self._conv()
+        if e.name in self.roe.gate_all_experts:  # the analyst approved starting it; everything after is gated too
+            self.gate_conversation(f"the {e.name} is working in this conversation")
         sa = SubAgent(self._next_sid(), e.name, e.title, task, context, expected_output, created=_now(), updated=_now())
         self.subagents[sa.id] = sa
         sa.agent = self._build_subagent(sa)
@@ -799,8 +856,21 @@ class Harness:
                          for s in self.subagents.values())
 
     # ---- entry points -----------------------------------------------------------------
+    def refresh_models(self) -> None:
+        """Pick up edits to config/.env and the model files before a run: an agent whose profile changed (say, a
+        rotated API key) gets a new backend for it. Profiles that were removed keep their current backend."""
+        if not self.cfg.reload_models():
+            return
+        agents = [self.lead] + [sa.agent for sa in self.subagents.values() if sa.agent]
+        for ag in agents:
+            prof = getattr(ag.backend, "profile", None) if ag else None
+            new = self.cfg.models.get(prof.name) if prof else None
+            if new is not None and new is not prof:
+                ag.backend = self.backend(prof.name)
+
     async def mission(self, text: str, display: str | None = None, playbook: str = "") -> str:
         assert self.lead
+        self.refresh_models()
         conv = self._conv()
         shown = text if display is None else display
         if not conv.get("title"):
@@ -809,6 +879,8 @@ class Harness:
             self.history.rename(conv["id"], title)
             conv["title"] = title
         self.emit("analyst_message", {"text": shown, "playbook": playbook})
+        if playbook in self.roe.gate_all_playbooks:  # before the lead takes any step
+            self.gate_conversation(f"{playbook.replace('_', ' ')} playbook")
         if not self.case.data.get("mission"):
             self.case.data["mission"] = text
             self.case._save()
@@ -825,6 +897,7 @@ class Harness:
         """After-action review. Each subagent reflects on its own work and revises its skills, then the
         orchestrator turns the whole operation into memories and skills."""
         assert self.lead
+        self.refresh_models()
         self.emit("retro_start", {})
         for d in self.executor.denials:  # analyst-authored corrections are trusted immediately
             self.memory.add("feedback", f"Analyst denied {d['tool']}",
@@ -883,7 +956,9 @@ class Harness:
         self.audit.record("session_rating", session=self.session, rating=rating, note=note, skill_uses_settled=settled)
 
     def switch_model(self, name: str) -> None:
-        self.cfg.model(name)  # validate
+        self.cfg.reload_models()
+        if why := self.cfg.model(name).problem():  # unknown names raise here too
+            raise ValueError(f"model profile '{name}' is not usable yet: {why}")
         assert self.lead
         self.model_name = name
         self.lead.backend = self.backend(name)
@@ -896,7 +971,7 @@ class Harness:
             self.lead.save()
         self.audit.record("session_end", session=self.session)
         await self.mcp.aclose()
-        for b in self.backends.values():
+        for b in [*self.backends.values(), *self.retired_backends]:
             await b.aclose()
 
 

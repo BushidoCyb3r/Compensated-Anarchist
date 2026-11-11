@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -35,7 +36,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from .. import NAME, __version__
+from .. import NAME, __version__, editors, huntplans
 from ..agent import Harness
 from ..audit import verify
 from ..config import HarnessConfig
@@ -104,6 +105,10 @@ class Dashboard:
         except ValueError:  # a hand-edited settings file with a bad value: fall back to the config
             current = self.config_classification
         self.ui = {"classification": current, "consent_text": str(ui.get("consent_text") or "").strip()}
+        ed = ui.get("editors") or {}
+        self.editor_cfg = {"open_on_host": ed.get("open_on_host", True) is not False,
+                           "links": [k for k in (ed.get("links") or list(editors.LINKS)) if k in editors.LINKS],
+                           "vscode_remote": str(ed.get("vscode_remote") or "").strip()}
 
     # ---- event bus ----------------------------------------------------------------
     def emit(self, kind: str, data: dict[str, Any]) -> None:
@@ -170,6 +175,35 @@ class Dashboard:
         self.harness.audit.record("dashboard_setting", setting="classification", old=old, new=new, reset=value is None)
         self.emit("ui_updated", {"classification": new, "source": self.classification_source()})
         return new
+
+    # ---- opening hunt plans in an editor -----------------------------------------------
+    @staticmethod
+    def viewer_on_host(request: Request) -> bool:
+        """True when the browser runs on this host: a loopback client, or a client connecting from the very address it
+        connected to. (Behind a reverse proxy on this host every viewer looks local: set open_on_host: false.)"""
+        def ip(v: Any):
+            try:
+                a = ipaddress.ip_address(str(v).split("%")[0])
+            except ValueError:
+                return None
+            return getattr(a, "ipv4_mapped", None) or a
+        client = ip(request.client.host) if request.client else None
+        server = ip((request.scope.get("server") or ("",))[0])
+        return bool(client and (client.is_loopback or client == server))
+
+    def host_open(self, request: Request) -> dict[str, Any]:
+        """Whether this viewer can have the host open a plan in an editor, and with which editors."""
+        if not self.editor_cfg["open_on_host"]:
+            return {"available": False, "why": "turned off in harness.yaml (dashboard.editors.open_on_host)", "editors": []}
+        if not self.viewer_on_host(request):
+            return {"available": False, "why": "your browser is not on the dashboard's host; use a link or download",
+                    "editors": []}
+        eds = editors.detect()
+        if not eds:
+            return {"available": False, "why": "no text editor found on the host", "editors": []}
+        if editors.graphical_env() is None:
+            return {"available": False, "why": "nobody is logged in to the host's desktop", "editors": []}
+        return {"available": True, "why": "", "editors": [e.public() for e in eds]}
 
     # ---- approvals ----------------------------------------------------------------
     async def web_approver(self, tool: str, arguments: dict[str, Any], rationale: str, why: str) -> tuple[bool, str]:
@@ -274,17 +308,23 @@ class Dashboard:
     # ---- state ----------------------------------------------------------------------
     def state(self) -> dict[str, Any]:
         h = self.harness
+        self.cfg.reload_models()  # edits to config/models.yaml show up without a restart
         playbooks = sorted(f.name[:-3] for f in resources.files("compensated_anarchist").joinpath("playbooks").iterdir()
                            if f.name.endswith(".md"))
         return {
             "case": h.case.data,
             "evidence_folder": str(h.case_evidence_dir),
             "vault_folder": str(h.vault_dir / "velociraptor"),
+            "plans_folder": str(h.hunt_plans_dir),
+            "vuln_folder": str(h.vuln_dir),
+            "gated": h.gate_reason,
             "session": h.session,
             "operator": self.cfg.operator,
             "posture": h.roe.posture,
             "model": h.model_name,
-            "models": [{"name": n, "provider": p.provider, "model": p.model} for n, p in self.cfg.models.items()],
+            "models": [p.public() for p in self.cfg.models.values()],
+            "models_files": [str(f) for f in self.cfg.model_files],
+            "models_error": self.cfg.models_error,
             "connectors": h.mcp.status,
             "experts": [{"name": n, "title": e.title, "description": e.description, "model": e.model or h.model_name}
                         for n, e in h.experts.items()],
@@ -452,6 +492,48 @@ def create_app(dash: Dashboard) -> Starlette:
     async def report(request: Request) -> Response:
         p = dash.harness.case.dir / "report.md"
         return PlainTextResponse(p.read_text(encoding="utf-8") if p.exists() else "")
+
+    # -- hunt plans folder: list, view/download, open in an editor --
+    async def plans(request: Request) -> Response:
+        h = dash.harness
+        host = await asyncio.to_thread(dash.host_open, request)
+        files = sorted(huntplans.entries(h.hunt_plans_dir) + huntplans.entries(h.vuln_dir), key=lambda f: -f["mtime"])
+        return JSONResponse({"folder": str(h.hunt_plans_dir), "vuln_folder": str(h.vuln_dir), "files": files,
+                             "host": host, "links": dash.editor_cfg["links"], "vscode_remote": dash.editor_cfg["vscode_remote"]})
+
+    def plan_path(request: Request) -> Path | None:
+        """A file directly in the hunt plans folder or the vulnerability assessment folder (never raw/ or older/)."""
+        name = request.path_params["name"]
+        return huntplans.find(dash.harness.hunt_plans_dir, name) or huntplans.find(dash.harness.vuln_dir, name)
+
+    NO_PLAN = {"error": "no such file in this case's hunt plans or vulnerability assessment folder"}
+
+    async def plan_file(request: Request) -> Response:
+        path = plan_path(request)
+        if not path:
+            return JSONResponse(NO_PLAN, 404)
+        if path.stat().st_size > 20 * 1024 * 1024:
+            raise ValueError("file too large to show here; open it in an editor")
+        data = path.read_bytes()
+        if request.query_params.get("download"):
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", path.name)
+            media = "application/json" if path.suffix == ".json" else "text/markdown; charset=utf-8"
+            return Response(data, media_type=media, headers={"Content-Disposition": f'attachment; filename="{safe}"'})
+        return Response(data, media_type="text/plain; charset=utf-8")
+
+    async def plan_open(request: Request) -> Response:
+        d = await body(request)
+        path = plan_path(request)
+        if not path:
+            return JSONResponse(NO_PLAN, 404)
+        host = await asyncio.to_thread(dash.host_open, request)
+        if not host["available"]:
+            return JSONResponse({"error": f"can't open it on the host: {host['why']}"}, 403)
+        editor = str(d.get("editor") or "")
+        msg = await asyncio.to_thread(editors.open_file, editor, path)
+        dash.harness.audit.record("dashboard_open_file", file=str(path), editor=editor,
+                                  client=request.client.host if request.client else "?")
+        return JSONResponse({"ok": True, "message": msg})
 
     # -- write --
     async def message(request: Request) -> Response:
@@ -645,6 +727,9 @@ def create_app(dash: Dashboard) -> Starlette:
         Route("/api/audit", guard(audit)),
         Route("/api/tools", guard(tools)),
         Route("/api/report", guard(report)),
+        Route("/api/plans", guard(plans)),
+        Route("/api/plans/{name}", guard(plan_file)),
+        Route("/api/plans/{name}/open", guard(plan_open, True), methods=["POST"]),
         Route("/api/message", guard(message, True), methods=["POST"]),
         Route("/api/stop", guard(stop, True), methods=["POST"]),
         Route("/api/approvals/{aid}", guard(approval, True), methods=["POST"]),

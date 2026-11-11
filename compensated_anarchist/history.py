@@ -110,6 +110,13 @@ class ChatStore:
         return [{"id": r["id"], "session": r["session"], "ts": r["ts"], "kind": r["kind"], "data": json.loads(r["data"])}
                 for r in reversed(rows)]
 
+    def first_event(self, conv_id: str, kind: str) -> dict[str, Any] | None:
+        """The earliest event of this kind in the conversation (e.g. the one that put it under the approval gate)."""
+        with self._lock:
+            r = self.db.execute("SELECT * FROM events WHERE conversation_id=? AND kind=? ORDER BY id LIMIT 1",
+                                (conv_id, kind)).fetchone()
+        return {"id": r["id"], "ts": r["ts"], "kind": r["kind"], "data": json.loads(r["data"])} if r else None
+
     def count(self, conv_id: str) -> int:
         with self._lock:
             return int(self.db.execute("SELECT count(*) FROM events WHERE conversation_id=?", (conv_id,)).fetchone()[0])

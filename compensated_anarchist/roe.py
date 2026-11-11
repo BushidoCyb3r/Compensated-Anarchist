@@ -11,7 +11,10 @@ Tiers (least to most restrictive):
   deny     - never run
 
 Resolution order for a call:
-  1. posture: in "observe" posture anything above `notify` is denied.
+  0. built-in floors: HUMAN_GATED tools are never below `approve`; under the gate-everything floor
+     (GATE_ALL_EXPERTS / GATE_ALL_PLAYBOOKS) every call by the gated agent or in the gated conversation is `approve`.
+  1. posture: in "observe" posture anything above `notify` is denied (except rules with `observe: ask`, and
+     read-only calls that only need approval because of the gate-everything floor).
   2. first matching rule in roe.yaml (tool glob + optional argument globs).
   3. MCP tool annotations, only for servers listed in trust_annotations_from.
   4. default_tier.
@@ -42,7 +45,16 @@ HUMAN_GATED = (
     "velociraptor*__collect_artifact", "velociraptor*__create_hunt", "velociraptor*__acquire_memory",
     "velociraptor*__download_flow_uploads", "velociraptor*__label_client",
     "velociraptor*__quarantine_host", "velociraptor*__unquarantine_host", "velociraptor*__run_server_vql",
+    "vuln_*",  # vulnerability assessment: scanners and command-line tools, listing them and saving the report
 )
+
+# Built-in "gate everything" floor. Every action - reads, case notes, memory, skills, the final report - taken by
+# one of these experts, or by any agent in a conversation that ran one of these playbooks or used one of these
+# experts, needs an analyst's approval. roe.yaml (gate_everything:) can add experts and playbooks, never remove these.
+GATE_ALL_EXPERTS = ("vuln_assessor",)
+GATE_ALL_PLAYBOOKS = ("vulnerability_assessment",)
+# (agent, tool, arguments) -> why this call must be approved under the gate-everything floor, or "" if not
+GateHook = Callable[[str, str, dict[str, Any]], str]
 
 
 def human_gated(tool: str) -> bool:
@@ -87,7 +99,12 @@ def _matches_target(value: str, patterns: list[str]) -> bool:
                 if ipaddress.ip_address(value) in net:
                     return True
             except ValueError:
-                pass
+                try:  # a range target (10.0.5.0/24) is in scope only if all of it is
+                    sub = ipaddress.ip_network(value, strict=False)
+                    if sub.version == net.version and sub.subnet_of(net):
+                        return True
+                except ValueError:
+                    pass
             continue
         except ValueError:
             pass
@@ -114,7 +131,9 @@ class RoeGate:
         self.trust_annotations_from = set(cfg.get("trust_annotations_from", []))
         scope = cfg.get("scope") or {}
         self.scope_enforce = bool(scope.get("enforce", True))
-        self.target_keys = scope.get("target_arg_keys", ["host", "hostname", "ip", "client_id", "target"])
+        # "targets" is always a target key: the vulnerability tools put every host they touch there
+        self.target_keys = list(dict.fromkeys([*scope.get("target_arg_keys", ["host", "hostname", "ip", "client_id", "target"]),
+                                               "targets"]))
         self.allowed_targets = [str(x) for x in scope.get("allowed_targets", [])]
         self.protected_assets = [str(x) for x in scope.get("protected_assets", [])]
         self.rules = [
@@ -127,6 +146,10 @@ class RoeGate:
                 raise ValueError(f"ROE rule {r.match}: bad tier {r.tier}")
         self._approval_lock = asyncio.Lock()  # one approval prompt at a time across parallel experts
         self.target_resolver: TargetResolver | None = None
+        gate = cfg.get("gate_everything") or {}
+        self.gate_all_experts = set(GATE_ALL_EXPERTS) | {str(x) for x in gate.get("experts") or []}
+        self.gate_all_playbooks = set(GATE_ALL_PLAYBOOKS) | {str(x) for x in gate.get("playbooks") or []}
+        self.gate_hook: GateHook | None = None  # set by the harness (it knows conversations and subagents)
 
     # ---- classification -------------------------------------------------
     def classify(
@@ -174,7 +197,11 @@ class RoeGate:
         server: str = "",
     ) -> Decision:
         tier, why = self.classify(tool, arguments, annotations, server)
-        decision = await self._decide(tool, arguments, rationale, agent, tier, why)
+        gated = self.gate_hook(agent, tool, arguments) if self.gate_hook else ""
+        raised = bool(gated) and tier in ("auto", "notify")
+        if gated and tier != "deny":
+            tier, why = "approve", f"{why}; {gated}"
+        decision = await self._decide(tool, arguments, rationale, agent, tier, why, ask_in_observe=raised)
         self.audit.record(
             "roe_decision",
             agent=agent,
@@ -188,10 +215,10 @@ class RoeGate:
         )
         return decision
 
-    async def _decide(self, tool, arguments, rationale, agent, tier, why) -> Decision:
+    async def _decide(self, tool, arguments, rationale, agent, tier, why, ask_in_observe: bool = False) -> Decision:
         if tier == "deny":
             return Decision("deny", False, f"denied by ROE: {why}", why)
-        if self.posture == "observe" and tier == "approve":
+        if self.posture == "observe" and tier == "approve" and not ask_in_observe:  # gate-raised reads may still ask
             rule = self._rule(tool, arguments)
             if not (rule and rule.observe == "ask" and rule.tier == "approve"):
                 return Decision("deny", False, "denied: harness is in OBSERVE posture (no response actions)", why)

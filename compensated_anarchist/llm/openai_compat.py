@@ -177,7 +177,7 @@ class OpenAICompatBackend:
         body: dict[str, Any] = {
             "model": self.profile.model,
             "messages": wire,
-            "max_tokens": self.profile.max_output_tokens,
+            self.profile.max_tokens_param or "max_tokens": self.profile.max_output_tokens,
             **self.profile.extra_body,
         }
         if tools and not text_mode:

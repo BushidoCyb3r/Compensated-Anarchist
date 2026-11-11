@@ -11,6 +11,7 @@ cases/
 memory/
 evidence/
 forensics/
+data/
 training.jsonl
 
 # private working list

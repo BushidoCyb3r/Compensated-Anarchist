@@ -44,10 +44,12 @@ What the script does:
 - git ignores both, and so does `config/*.local.yaml`.
 - `harness.yaml` and `roe.yaml` only reference secrets as `${VARIABLE}`, so those files can be shared safely.
 
-**Load the settings** before every `canarchist` command, in each new shell:
-```bash
-set -a; source config/.env; set +a
-```
+**Loading the settings:** every `canarchist` command reads `config/.env` itself; there is nothing to `source`.
+A variable already set in your shell wins over the file, so you can override one for a single run (e.g.
+`CA_MODEL=claude-haiku canarchist run ...`). A running dashboard re-reads `.env` when the model picker or Settings
+opens and before each run, so a new or rotated **model** key works without a restart. **Connector** credentials
+(Security Onion, Elastic, Splunk, Velociraptor, ...) are read when the connectors start: restart the dashboard
+after changing those. `CA_ENV_FILE=/path/to/file` points the harness at a different file.
 
 **Check what is connected at any time:**
 ```bash
@@ -65,21 +67,35 @@ each port to the harness host's IP only, never to the whole network.
 
 ## 1. Model (required)
 
-The agents need one model profile. Profiles live under `models:` in `config/harness.yaml`. Pick the default
-with `CA_MODEL` in `.env`, or per run with `--model <profile>`.
+The agents need one model profile. Profiles live in **`config/models.yaml`**: every enabled profile there is a
+choice in the dashboard's model picker (and for `--model <profile>` / `/model` on the CLI). The file ships with
+profiles for GenAI, Claude, ChatGPT and common local servers, plus a **`my-local-model` template**: fill in its
+`CHANGE-ME` values (server URL, model id, context size) and it becomes a choice. Copy the block for each extra
+model. The top of the file documents every field.
+
+- **Site profiles** go in `config/models.local.yaml` (git-ignored, same layout). It is merged over
+  `models.yaml`: add your own profiles, override a field of a shipped one, set `default_model`, or hide one with
+  `enabled: false`.
+- **Secrets never go in either file.** Write `${VARIABLE}` there and put the value in `config/.env`.
+- **The default** is `default_model:` in `models.yaml`; `CA_MODEL` in `.env` or `--model` overrides it.
+- **Edits apply without a restart:** the dashboard re-reads the files, and `config/.env`, when the picker or
+  Settings opens and before each run. A new API key for a model works straight away. A
+  profile that is missing its API key or still has `CHANGE-ME` values shows as "needs setup", with the reason,
+  and cannot be picked. `canarchist doctor` lists the same.
 
 | You have | Profile | Set in `.env` |
 |---|---|---|
-| vLLM, Ollama, llama.cpp, LM Studio, TGI, LiteLLM, an MLX server, or any OpenAI-compatible endpoint | `local-vllm`, `local-ollama`, `lab-mlx`, or copy one | the URL, model id, and API key if the server needs one |
-| A government or enterprise AI gateway (OpenAI-compatible) | `genai-gateway` | `GENAI_BASE_URL`, `GENAI_MODEL`, `GENAI_API_KEY`; `GENAI_API_KEY_HEADER` if it is not `Authorization: Bearer`; `DOD_CA_BUNDLE`; `GENAI_CLIENT_CERT` / `GENAI_CLIENT_KEY` for mTLS |
+| vLLM, Ollama, llama.cpp, LM Studio, TGI, LiteLLM, an MLX server, or any OpenAI-compatible endpoint | `local-ollama`, `local-vllm`, `local-textmode`, or fill in `my-local-model` | the URL and model id (or edit them in the template); an API key only if the server needs one |
+| A government or enterprise AI gateway (GenAI.mil or your organization's, OpenAI-compatible) | `genai-gateway` | `GENAI_BASE_URL`, `GENAI_MODEL`, `GENAI_API_KEY`; `GENAI_API_KEY_HEADER` if it is not `Authorization: Bearer`; `DOD_CA_BUNDLE`; `GENAI_CLIENT_CERT` / `GENAI_CLIENT_KEY` for mTLS. Get the API root and model ids from the gateway's documentation or help desk. |
 | Claude (Anthropic API) | `claude-opus`, `claude-sonnet`, `claude-haiku` | `ANTHROPIC_API_KEY`. Everything the agents read goes to Anthropic: check your data rules first. |
+| ChatGPT (OpenAI API) | `chatgpt` (GPT-5.6 Sol), `chatgpt-luna` (GPT-5.6 Luna) | `OPENAI_API_KEY`; `OPENAI_MODEL` / `OPENAI_MODEL_SMALL` to use other ids. Everything the agents read goes to OpenAI: check your data rules first. |
 
 **Steps:**
 1. **Find the exact model id the server expects.** For OpenAI-compatible servers, `GET <base_url>/models`
    lists them.
 2. **Check tool calling.** The harness depends on native function calling. For vLLM start the server with
    `--enable-auto-tool-choice --tool-call-parser <parser for your model>`. If the server cannot do tool
-   calls, copy the `local-textmode` profile (`tool_mode: text`).
+   calls, set `tool_mode: text` in the profile (as `local-textmode` does).
 3. **Set `context_tokens`** at or below the server's real limit, minus `max_output_tokens`. History is
    compacted at 75% of it.
 4. **Streaming** is on by default (`stream: true`). If a gateway rejects or ignores it, the harness falls back
@@ -417,6 +433,74 @@ installed?"). `doctor` lists the tools and their tiers.
 
 ---
 
+## 8b. Hunt planning with MITRE ATT&CK
+
+Planning and hunting are separate jobs:
+- **hunt_planner** designs a hunt plan for the actors or techniques you name. It never runs hunt queries and
+  holds no search, collection or response tools.
+- **threat_hunter** executes hunts. It runs a plan only when you ask for that plan.
+
+**How a hunt plan is made** (the **hunt_plan** playbook):
+1. **The lead checks with you first**, before anything is planned or any system is looked at. It asks how to
+   build the plan:
+   - from your input only;
+   - by surveying the connected systems (platforms, which data sources and fields exist);
+   - or both, which is the default.
+   It also asks about actors or T-codes, platforms, which tools to write queries for, how many hunts, the hunt
+   window, and whether to include the actors' software and campaigns. Reply "default" to accept the defaults.
+2. **hunt_planner builds it your way.** It pulls each actor's ATT&CK techniques (T-codes), including those from
+   their software and attributed campaigns, and maps them to the data that would show them. If you chose a
+   survey, it checks what the connected tools can actually see. It then:
+   - prioritizes the hunts;
+   - writes queries per tool (Security Onion Lucene/ES|QL, Elastic EQL/ES|QL, Splunk SPL, Velociraptor
+     artifacts);
+   - lists telemetry gaps.
+3. **The plan and an ATT&CK Navigator layer** are saved to the case's **hunt plans folder**,
+   `cases/<case-id>/hunt_plans/`. Earlier versions are kept in `older/`.
+4. **Hunting happens only when you say so.** Ask the lead to hunt from a plan by name. The threat_hunter finds it
+   in the hunt plans folder (`hunt_plan_list` / `hunt_plan_read`), runs it over the window you approve, and saves
+   `hunt_results_<actors>.md` next to it. The threat_hunter can always read the folder, but reading a plan never
+   starts a hunt.
+
+**The ATT&CK data:** the official MITRE ATT&CK STIX bundle (`enterprise-attack.json`, about 45 MB) is kept locally,
+so it works air-gapped:
+```bash
+.venv/bin/canarchist attack fetch                 # downloads it from MITRE's attack-stix-data GitHub repository
+.venv/bin/canarchist attack fetch --from /media/usb/enterprise-attack.json   # air-gapped: import a copied file
+.venv/bin/canarchist attack status                # version and counts
+.venv/bin/canarchist attack group "APT29"         # quick look at an actor (names, aliases and G-ids all work)
+```
+- **Location:** `data/attack/` (git-ignored), set by `attack.stix` in `harness.yaml`. `ATTACK_STIX` overrides
+  it, comma-separated, e.g. to add the ICS or mobile bundles (`--domain ics|mobile`).
+- **Updating:** re-run `fetch` when MITRE releases a new version; no restart is needed.
+
+**To use it:** in the dashboard, pick the **Hunt plan** playbook and name the actors, e.g. "APT29 and Volt Typhoon,
+Windows and Linux, last 30 days". From the CLI:
+```bash
+.venv/bin/canarchist run --case HUNT-0001 --playbook hunt_plan "APT29 and Volt Typhoon"
+```
+
+## 8c. Vulnerability assessment (optional; best on a Kali VM)
+
+The `vulnerability_assessment` playbook tasks the `vuln_assessor`. It uses the connectors plus the command-line
+assessment tools on the harness host, and writes a vulnerability report with the most likely attack chains.
+
+- **Every action needs your approval:** reads, notes and tasking included, for every agent in that conversation.
+  This is built in and cannot be turned off; start a new conversation for other work.
+- **Scope is required.** Set `scope.allowed_targets` in your ROE file (section 9) first: with no scope, the
+  scanner refuses to run. Put fragile or critical hosts in `protected_assets`.
+- **Tools:** on Kali they are already installed. Elsewhere, install the ones you want (nmap at least); the
+  assessor only offers what it finds (`vuln_environment`). Without root, nmap is limited to connect scans
+  (`-sT -sV`).
+- **OBSERVE posture:** scans may still be requested and approved one by one (`observe: ask` on the `vuln_*`
+  rule in the ROE file). Set `observe: deny` there to forbid scanning in OBSERVE.
+- **Outputs:** `cases/<case>/vuln_assessment/`: the report (`vuln_report_<name>.md`) and `raw/` with every
+  command's full output. The dashboard's case panel lists the reports under "Plans & reports".
+- **Settings:** `vuln_assessment:` in `harness.yaml`: the allowlist, extra refused options per tool, read-only
+  data folders, timeouts.
+
+---
+
 ## 9. Scope (rules of engagement)
 
 Connectors give the team reach. The scope decides where response actions may land. Keep your site's scope
@@ -455,7 +539,6 @@ scope:
 ## 10. Final check
 
 ```bash
-set -a; source config/.env; set +a
 .venv/bin/canarchist doctor --case SETUP-CHECK
 .venv/bin/canarchist run --case SETUP-CHECK --posture observe --non-interactive \
     "Smoke test: summarize the alerts from the last 24 hours, the top rules and the source -> destination pairs. Read-only."
@@ -466,7 +549,7 @@ set -a; source config/.env; set +a
 
 | Symptom | Likely cause |
 |---|---|
-| A connector shows an error in `doctor` | `.env` not loaded in this shell (`set -a; source config/.env; set +a`), wrong URL or port, or the firewall |
+| A connector shows an error in `doctor` | a value missing from `config/.env` (or a stale one exported in this shell, which wins over the file), wrong URL or port, or the firewall |
 | TLS / certificate errors | `*_VERIFY` should point at the CA that signed the server certificate |
 | `401` / `403` | Wrong key, an expired token, or the key lacks `read` on the index pattern |
 | Velociraptor `User not found` | The server was not restarted after `config api_client` |

@@ -477,3 +477,29 @@ input[type=color]::-moz-color-swatch { border: 0; border-radius: 4px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* hunt plans: saved-file cards, open-in-editor split button, file links in agent text */
+.cards .file-card { grid-column: 1 / -1; }
+.file-card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.file-card.in-panel { margin-bottom: 10px; }
+.file-card .head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.file-card .head .ic { color: var(--text-3); display: inline-flex; }
+.file-card .kind { font-size: 12px; font-weight: 600; color: var(--text-2); white-space: nowrap; }
+.file-card .name { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.file-card .title { font-weight: 500; }
+.split { display: inline-flex; }
+.split > .btn:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.split > .split-caret { border-top-left-radius: 0; border-bottom-left-radius: 0; padding: 0 6px; margin-left: 1px; }
+.file-ref { display: inline-flex; align-items: center; gap: 3px; padding: 0 5px; border-radius: 5px; background: var(--elev); font-family: var(--mono, ui-monospace, monospace); font-size: .92em; color: var(--text); text-decoration: underline; text-decoration-color: var(--text-3); text-underline-offset: 2px; cursor: pointer; word-break: break-all; }
+.file-ref:hover, .file-ref:focus-visible { text-decoration-color: currentColor; }
+.plans-why { margin: 0 2px 10px; }
+.dialog.plan-view { max-width: 920px; }
+.dialog.plan-view .dialog-body { max-height: 68vh; overflow: auto; }
+.menu-head { padding: 8px 10px 3px; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--text-3); }
+.menu-head:first-child { padding-top: 4px; }
+.list .group-row td { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--text-3); background: var(--elev); }
+.warn-card { border-color: var(--warn); background: var(--warn-bg); margin-bottom: 10px; }
+/* approval mode (gate everything) and the exact command in approvals */
+.posture.gate { border-color: var(--warn); color: var(--warn); background: var(--warn-bg); }
+.posture.gate[hidden] { display: none; }
+.kv .cmd { white-space: pre-wrap; word-break: break-all; background: var(--elev); border-radius: 6px; padding: 4px 6px; }
