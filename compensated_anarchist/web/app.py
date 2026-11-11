@@ -6,8 +6,11 @@ parked as pending approvals and resolved from the browser. The case's conversati
 the open conversation is replayed when the dashboard starts or the analyst switches conversation.
 
 Security model (the GUI can approve response actions, so it is stricter than a typical local dashboard):
-  - a bearer token is ALWAYS required, even on localhost; /login?token=... exchanges it for an
-    HttpOnly, SameSite=Strict session cookie
+  - signing in takes BOTH the access token, generated fresh at every start (printed by scripts/start.sh), AND the
+    dashboard account's username and password (created once on the host: canarchist account create; stored as a
+    salted scrypt hash). Even on localhost. A sign-in gets a random server-side session in an HttpOnly,
+    SameSite=Strict cookie; it ends after `dashboard.session_idle_hours` (default 12) without analyst activity,
+    on sign-out, and when the dashboard stops
   - state-changing requests also need the X-CA-Request header (CSRF defense in depth)
   - binding to a non-loopback address requires TLS (or an explicit --allow-plaintext)
   - strict Content-Security-Policy; the frontend renders all agent/tool/log text as text, never HTML,
@@ -23,6 +26,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import time
 import uuid
 from collections import deque
@@ -36,14 +40,15 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from .. import NAME, __version__, editors, huntplans
+from .. import NAME, __version__, editors, huntplans, service
+from . import account
 from ..agent import Harness
 from ..audit import verify
 from ..config import HarnessConfig
 from ..memory import KINDS
 
 COOKIE = "ca_session"
-EPHEMERAL = {"telemetry", "delta", "ui_updated"}  # broadcast live, never kept in the replay buffer
+EPHEMERAL = {"telemetry", "delta", "ui_updated", "settings_changed"}  # broadcast live, never kept in the replay buffer
 MAX_LOGIN_FAILURES = 10    # per client address, per 5 minutes
 HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 MAX_MARKING_CHARS = 120
@@ -70,10 +75,19 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' 
 class Dashboard:
     def __init__(self, cfg: HarnessConfig, case_id: str, model: str | None = None, posture: str | None = None,
                  token: str | None = None, approval_timeout_s: int = 3600, harness: Harness | None = None,
-                 conversation_id: str | None = None, new_conversation: bool = False):
+                 conversation_id: str | None = None, new_conversation: bool = False, account_path: Path | None = None,
+                 run_dir: Path | None = None):
         self.cfg = cfg
-        self.token = token or os.environ.get("CA_DASHBOARD_TOKEN") or secrets.token_urlsafe(24)
-        self.session_secret = secrets.token_urlsafe(32)
+        # new at every start; never configured. (An address change restarts this same process and keeps it.)
+        self.token = token or self.handoff_token(run_dir) or secrets.token_urlsafe(24)
+        self.account_path = Path(account_path) if account_path else account.default_path(cfg)
+        self.sessions: dict[str, dict[str, Any]] = {}  # session id -> {user, client, created, seen}
+        self.run_dir = Path(run_dir) if run_dir else None
+        self.url = ""  # set by serve()
+        self.bind: dict[str, Any] = {}  # {"host", "port"} set by serve()
+        self.server = None  # the uvicorn server, so an address change can restart it in place
+        self.relaunch: list[str] | None = None
+        self.owner_q: asyncio.Queue = asyncio.Queue()
         self.approval_timeout_s = approval_timeout_s
         self.events: deque[dict[str, Any]] = deque(maxlen=5000)
         self.seq = 0
@@ -97,14 +111,14 @@ class Dashboard:
         except ValueError as e:
             raise ValueError(f"dashboard.classification in harness.yaml: {e}") from None
         self.classification_locked = bool(cls.get("locked"))
-        sp = Path(str(ui.get("settings_path") or cfg.cases_dir / "_dashboard_settings.json"))
-        self.settings_path = sp if sp.is_absolute() else cfg.root / sp
+        self.settings_path = service.dashboard_settings_path(cfg)
         saved = None if self.classification_locked else self._load_settings().get("classification")
         try:
             current = classification_from(saved) if saved is not None else self.config_classification
         except ValueError:  # a hand-edited settings file with a bad value: fall back to the config
             current = self.config_classification
         self.ui = {"classification": current, "consent_text": str(ui.get("consent_text") or "").strip()}
+        self.idle_s = float(ui.get("session_idle_hours", 12)) * 3600
         ed = ui.get("editors") or {}
         self.editor_cfg = {"open_on_host": ed.get("open_on_host", True) is not False,
                            "links": [k for k in (ed.get("links") or list(editors.LINKS)) if k in editors.LINKS],
@@ -204,6 +218,150 @@ class Dashboard:
         if editors.graphical_env() is None:
             return {"available": False, "why": "nobody is logged in to the host's desktop", "editors": []}
         return {"available": True, "why": "", "editors": [e.public() for e in eds]}
+
+    # ---- posture, address and case: live from the Settings page, and the next start's defaults --------
+    def address_mode(self) -> str:
+        return "127.0.0.1" if self.bind.get("host") in ("127.0.0.1", "localhost", "::1") else "auto"
+
+    def startup_info(self) -> dict[str, Any]:
+        h = self.harness
+        cases = sorted((d for d in Path(self.cfg.cases_dir).glob("*") if d.is_dir() and not d.name.startswith(("_", "."))),
+                       key=lambda d: d.stat().st_mtime, reverse=True)
+        return {"now": {"posture": h.roe.posture, "case": h.case.id, "address": self.address_mode(), "url": self.url},
+                "main_address": service.primary_address(), "port": self.bind.get("port"),
+                "defaults": {k: v for k, v in service.settings(self.cfg, {}).items() if k in ("case", "posture")}
+                | {"address": service.saved_startup(self.cfg).get("host", "auto")},
+                "cases": [d.name for d in cases[:300]], "can_move": bool(self.run_dir and self.bind),
+                "running": self.running()}
+
+    def _remember(self, **values: str) -> None:
+        service.save_startup(self.cfg, **values)  # the default scripts/start.sh offers next time
+
+    def set_posture(self, posture: str, user: str) -> None:
+        if posture not in ("observe", "respond"):
+            raise ValueError("posture: observe or respond")
+        old = self.harness.roe.posture
+        self.harness.roe.posture = posture  # applies to every decision from now on
+        self._remember(posture=posture)
+        self.harness.audit.record("posture_changed", old=old, new=posture, by=user)
+        self.emit("settings_changed", {"posture": posture})
+
+    # The harness (and its connector sessions) is started, switched and closed by ONE long-lived owner task: MCP
+    # client sessions must be closed by the task that opened them, so request handlers only hand it the work.
+    async def own_harness(self, ready: asyncio.Future) -> None:
+        try:
+            await self.harness.start(*self.start_args)
+        except BaseException as e:
+            if not ready.done():
+                ready.set_exception(e)
+            return
+        self.load_history()
+        self.emit("ready", {"connectors": self.harness.mcp.status})
+        self.write_run_state()  # scripts/start.sh waits for this, then prints the URL and the new token
+        ready.set_result(None)
+        while True:
+            cmd, arg, fut = await self.owner_q.get()
+            if cmd == "close":
+                try:
+                    self.stop()
+                    await self.harness.close()
+                    self.clear_run_state()
+                finally:
+                    fut.set_result(None)
+                return
+            try:
+                await self._switch_case(*arg)
+                fut.set_result(None)
+            except Exception as e:  # reported to the analyst who asked
+                fut.set_exception(e)
+
+    async def _ask_owner(self, cmd: str, arg: Any = None) -> None:
+        fut = asyncio.get_running_loop().create_future()
+        await self.owner_q.put((cmd, arg, fut))
+        await fut
+
+    async def switch_case(self, case_id: str, user: str) -> None:
+        """Move the dashboard to another case (an existing one, or a new one): a new harness for it; the old case's
+        files stay as they are. Connectors reconnect; signed-in browsers stay signed in."""
+        case_id = case_id.strip()
+        if not service.CASE_RE.match(case_id):
+            raise ValueError("case: letters, digits, . _ - (up to 64)")
+        if self.running():
+            raise ValueError("an operation is running - stop it first")
+        if case_id != self.harness.case.id:
+            await self._ask_owner("switch", (case_id, user))
+
+    async def _switch_case(self, case_id: str, user: str) -> None:
+        old = self.harness
+        old.audit.record("case_switch", to=case_id, by=user)
+        for p in list(self.pending.values()):
+            if not p["future"].done():
+                p["future"].set_result((False, "the dashboard moved to another case"))
+        await old.close()
+        new = Harness(self.cfg, case_id, old.model_name, old.roe.posture, interactive=True, on_event=self.emit)
+        new.on_event = self.emit
+        new.roe.approver = self.web_approver
+        await new.start()
+        self.harness, self.pending, self.live, self.telemetry = new, {}, {}, {}
+        new.audit.record("case_switch", came_from=old.case.id, by=user)
+        self._remember(case=case_id)
+        self.load_history()
+        self.write_run_state()
+        self.emit("case_switched", {"case": case_id})
+
+    def move_address(self, mode: str, user: str) -> str:
+        """Serve on the main network address ("auto") or this host only ("127.0.0.1"). The listening socket has to
+        change, so the dashboard restarts itself in place (same process and pid, same access token); browsers sign
+        in again at the new address. Returns the new URL."""
+        if mode not in ("auto", "127.0.0.1"):
+            raise ValueError("address: auto (the main network address) or 127.0.0.1 (this host only)")
+        if not self.can_move():
+            raise ValueError("this dashboard was not started with scripts/start.sh; restart it with the address you want")
+        if self.running():
+            raise ValueError("an operation is running - stop it first")
+        host = service.primary_address() if mode == "auto" else "127.0.0.1"
+        port = int(self.bind["port"])
+        argv = [sys.argv[0], "--config", str(self.cfg.config_path), "dashboard", "--case", self.harness.case.id,
+                "--posture", self.harness.roe.posture, "--model", self.harness.model_name, "--host", host,
+                "--port", str(port), "--run-dir", str(self.run_dir)]
+        if self.harness.conversation:
+            argv += ["--conversation", self.harness.conversation["id"]]
+        if mode == "auto":
+            st = service.settings(self.cfg, {})
+            service.ensure_cert(st["tls_cert"], st["tls_key"], host)
+            argv += ["--tls-cert", str(st["tls_cert"]), "--tls-key", str(st["tls_key"])]
+        self._remember(host=mode)
+        self.harness.audit.record("address_changed", old=self.url, new_host=host, by=user)
+        url = f"{'http' if mode == '127.0.0.1' else 'https'}://{host}:{port}"
+        handoff = self.run_dir / "handoff.json"  # this start's token, for the same process after it re-executes
+        fd = os.open(handoff, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"pid": os.getpid(), "token": self.token, "expires": time.time() + 120}, fh)
+        self.relaunch = argv
+        self.emit("settings_changed", {"address": mode, "url": url, "restarting": True})
+        asyncio.get_running_loop().call_later(0.8, self._shutdown_for_relaunch)
+        return url
+
+    def can_move(self) -> bool:
+        return bool(self.run_dir and self.bind and self.server is not None)
+
+    def _shutdown_for_relaunch(self) -> None:
+        if self.server is not None:
+            self.server.should_exit = True
+
+    @staticmethod
+    def handoff_token(run_dir: Path | None) -> str:
+        """The token of the start this process belongs to, when it re-executed itself to change address."""
+        if not run_dir:
+            return ""
+        f = Path(run_dir) / "handoff.json"
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        f.unlink(missing_ok=True)
+        ok = isinstance(d, dict) and d.get("pid") == os.getpid() and float(d.get("expires", 0)) > time.time()
+        return str(d.get("token") or "") if ok else ""
 
     # ---- approvals ----------------------------------------------------------------
     async def web_approver(self, tool: str, arguments: dict[str, Any], rationale: str, why: str) -> tuple[bool, str]:
@@ -346,16 +504,51 @@ class Dashboard:
             "last_seq": self.seq,
         }
 
-    # ---- auth ---------------------------------------------------------------------------
-    def _session_value(self) -> str:
-        return hmac.new(self.session_secret.encode(), self.token.encode(), "sha256").hexdigest()
+    # ---- run state (scripts/start.sh and scripts/stop.sh) ---------------------------------
+    def write_run_state(self) -> None:
+        """<run_dir>/dashboard.json (0600): pid, URL and this start's access token, for start.sh to print."""
+        if not self.run_dir or not self.url:
+            return
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.run_dir, 0o700)
+        state = {"pid": os.getpid(), "url": self.url, "token": self.token, "case": self.harness.case.id,
+                 "model": self.harness.model_name, "posture": self.harness.roe.posture,
+                 "connectors": self.harness.mcp.status, "started": time.time()}
+        tmp = self.run_dir / "dashboard.json.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, self.run_dir / "dashboard.json")
 
-    def authed(self, request: Request) -> bool:
-        cookie = request.cookies.get(COOKIE, "")
-        if cookie and hmac.compare_digest(cookie, self._session_value()):
-            return True
-        auth = request.headers.get("authorization", "")
-        return auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], self.token)
+    def clear_run_state(self) -> None:
+        if self.run_dir:
+            (self.run_dir / "dashboard.json").unlink(missing_ok=True)
+
+    # ---- auth ---------------------------------------------------------------------------
+    def new_session(self, user: str, client: str) -> str:
+        sid = secrets.token_urlsafe(32)
+        now = time.time()
+        self.sessions = {k: v for k, v in self.sessions.items() if now - v["seen"] <= self.idle_s}  # drop idle ones
+        self.sessions[sid] = {"user": user, "client": client, "created": now, "seen": now}
+        return sid
+
+    def session(self, request: Request, touch: bool = False) -> dict[str, Any] | None:
+        """The caller's live session, or None. `touch` marks analyst activity (writes, the page's activity ping);
+        background reads (polling, the event stream) do not keep a session alive."""
+        s = self.sessions.get(request.cookies.get(COOKIE, "") or "-")
+        if not s:
+            return None
+        now = time.time()
+        if now - s["seen"] > self.idle_s:
+            self.sessions.pop(request.cookies.get(COOKIE, ""), None)
+            self.harness.audit.record("dashboard_session_expired", user=s["user"], client=s["client"])
+            return None
+        if touch:
+            s["seen"] = now
+        return s
+
+    def authed(self, request: Request, touch: bool = False) -> bool:
+        return self.session(request, touch) is not None
 
 
 def create_app(dash: Dashboard) -> Starlette:
@@ -363,7 +556,7 @@ def create_app(dash: Dashboard) -> Starlette:
 
     def guard(handler, write: bool = False):
         async def wrapped(request: Request) -> Response:
-            if not dash.authed(request):
+            if not dash.authed(request, touch=write):
                 return JSONResponse({"error": "unauthorized - sign in again"}, 401)
             if write and request.headers.get("x-ca-request") != "1":
                 return JSONResponse({"error": "missing X-CA-Request header"}, 403)
@@ -391,7 +584,8 @@ def create_app(dash: Dashboard) -> Starlette:
 
     async def public_info(request: Request) -> Response:
         return JSONResponse({"name": NAME, "version": __version__, "classification": dash.ui["classification"],
-                             "consent_text": dash.ui["consent_text"], "authed": dash.authed(request)})
+                             "consent_text": dash.ui["consent_text"], "authed": dash.authed(request),
+                             "account": account.exists(dash.account_path)})
 
     async def api_login(request: Request) -> Response:
         if request.headers.get("x-ca-request") != "1":
@@ -408,21 +602,36 @@ def create_app(dash: Dashboard) -> Starlette:
             return JSONResponse({"error": str(e)}, 400)
         if dash.ui["consent_text"] and d.get("consent") is not True:
             return JSONResponse({"error": "acknowledge the notice and consent to sign in"}, 400)
-        if not hmac.compare_digest(str(d.get("token", "")), dash.token):
+        if not account.exists(dash.account_path):
+            return JSONResponse({"error": "no dashboard account yet: run `canarchist account create` on the host "
+                                          "(scripts/start.sh asks for it)"}, 403)
+        username, password = str(d.get("username", ""))[:128], str(d.get("password", ""))[:1024]
+        token_ok = hmac.compare_digest(str(d.get("token", "")).encode(), dash.token.encode())
+        account_ok = await asyncio.to_thread(account.verify, dash.account_path, username, password)  # always checked
+        if not (token_ok and account_ok):
             recent.append(now)
+            dash.harness.audit.record("dashboard_login_failed", client=client, username=username[:64],
+                                      token_ok=token_ok)
             await asyncio.sleep(0.4)
-            return JSONResponse({"error": "that token is not valid for this dashboard"}, 401)
+            return JSONResponse({"error": "Sign-in failed: check the access token (it changes at every start), "
+                                          "the username and the password"}, 401)
         dash.login_failures.pop(client, None)
-        dash.harness.audit.record("dashboard_login", client=client, consent=bool(dash.ui["consent_text"]))
-        resp = JSONResponse({"ok": True})
-        resp.set_cookie(COOKIE, dash._session_value(), httponly=True, samesite="strict",
-                        secure=request.url.scheme == "https")
+        sid = dash.new_session(username, client)
+        dash.harness.audit.record("dashboard_login", client=client, user=username, consent=bool(dash.ui["consent_text"]))
+        resp = JSONResponse({"ok": True, "user": username})
+        resp.set_cookie(COOKIE, sid, httponly=True, samesite="strict", secure=request.url.scheme == "https")
         return resp
 
     async def api_logout(request: Request) -> Response:
+        s = dash.sessions.pop(request.cookies.get(COOKIE, "") or "-", None)
+        if s:
+            dash.harness.audit.record("dashboard_logout", user=s["user"], client=s["client"])
         resp = JSONResponse({"ok": True})
         resp.delete_cookie(COOKIE)
         return resp
+
+    async def activity(request: Request) -> Response:
+        return JSONResponse({"ok": True})  # guard(write=True) already marked the analyst as active
 
     async def index(request: Request) -> Response:
         if not dash.authed(request):
@@ -455,7 +664,7 @@ def create_app(dash: Dashboard) -> Starlette:
                 for e in backlog:
                     yield f"id: {e['seq']}\ndata: {json.dumps(e, default=str)}\n\n"
                 while True:
-                    if await request.is_disconnected():
+                    if await request.is_disconnected() or not dash.authed(request):  # signed out or idled out
                         break
                     try:
                         e = await asyncio.wait_for(q.get(), 15)
@@ -606,6 +815,28 @@ def create_app(dash: Dashboard) -> Starlette:
         new = dash.set_classification(None if d.get("reset") else d)
         return JSONResponse({"ok": True, "classification": new, "source": dash.classification_source()})
 
+    def user_of(request: Request) -> str:
+        s = dash.session(request)
+        return s["user"] if s else "?"
+
+    async def setting_startup_get(request: Request) -> Response:
+        return JSONResponse(await asyncio.to_thread(dash.startup_info))
+
+    async def setting_posture(request: Request) -> Response:
+        d = await body(request)
+        dash.set_posture(str(d.get("posture", "")), user_of(request))
+        return JSONResponse({"ok": True, "posture": dash.harness.roe.posture})
+
+    async def setting_case(request: Request) -> Response:
+        d = await body(request)
+        await dash.switch_case(str(d.get("case", "")), user_of(request))
+        return JSONResponse({"ok": True, "case": dash.harness.case.id})
+
+    async def setting_address(request: Request) -> Response:
+        d = await body(request)
+        url = dash.move_address(str(d.get("address", "")), user_of(request))  # on the loop: it schedules the restart
+        return JSONResponse({"ok": True, "url": url, "restarting": True})
+
     # -- subagents --
     async def subagent_steer(request: Request) -> Response:
         d = await body(request)
@@ -704,20 +935,22 @@ def create_app(dash: Dashboard) -> Starlette:
 
     @asynccontextmanager
     async def lifespan(app):
-        await dash.harness.start(*dash.start_args)
-        dash.load_history()
-        dash.emit("ready", {"connectors": dash.harness.mcp.status})
+        dash.owner_q = asyncio.Queue()  # bound to this event loop
+        ready = asyncio.get_running_loop().create_future()
+        owner = asyncio.create_task(dash.own_harness(ready))
+        await ready
         try:
             yield
         finally:
-            dash.stop()
-            await dash.harness.close()
+            await dash._ask_owner("close")
+            await owner
 
     routes = [
         Route("/", index), Route("/login", login_page), Route("/static/{name}", asset),
         Route("/api/public", public_info),
         Route("/api/login", api_login, methods=["POST"]),
         Route("/api/logout", guard(api_logout, True), methods=["POST"]),
+        Route("/api/activity", guard(activity, True), methods=["POST"]),
         Route("/api/subagents/{sid}/steer", guard(subagent_steer, True), methods=["POST"]),
         Route("/api/subagents/{sid}/stop", guard(subagent_stop, True), methods=["POST"]),
         Route("/api/state", guard(get_state)),
@@ -740,6 +973,10 @@ def create_app(dash: Dashboard) -> Starlette:
         Route("/api/rate", guard(rate, True), methods=["POST"]),
         Route("/api/model", guard(model, True), methods=["POST"]),
         Route("/api/settings/classification", guard(setting_classification, True), methods=["POST"]),
+        Route("/api/settings/startup", guard(setting_startup_get)),
+        Route("/api/settings/posture", guard(setting_posture, True), methods=["POST"]),
+        Route("/api/settings/case", guard(setting_case, True), methods=["POST"]),
+        Route("/api/settings/address", guard(setting_address, True), methods=["POST"]),
         Route("/api/conversations", guard(conversations)),
         Route("/api/conversations/new", guard(conversation_new, True), methods=["POST"]),
         Route("/api/conversations/{cid}/open", guard(conversation_open, True), methods=["POST"]),
@@ -780,18 +1017,32 @@ class SecurityHeaders:
 
 def serve(cfg: HarnessConfig, case_id: str, model: str | None, posture: str | None, host: str, port: int,
           tls_cert: str = "", tls_key: str = "", allow_plaintext: bool = False, conversation_id: str | None = None,
-          new_conversation: bool = False) -> None:
+          new_conversation: bool = False, run_dir: str = "") -> None:
     import uvicorn
 
     loopback = host in ("127.0.0.1", "localhost", "::1")
     if not loopback and not (tls_cert and tls_key) and not allow_plaintext:
         raise SystemExit("refusing to serve the dashboard on a non-loopback address without TLS "
                          "(--tls-cert/--tls-key), or pass --allow-plaintext if you really mean it")
-    dash = Dashboard(cfg, case_id, model, posture, conversation_id=conversation_id, new_conversation=new_conversation)
+    acct = account.default_path(cfg)
+    if not account.exists(acct):
+        raise SystemExit("no dashboard account yet: run `canarchist account create` on this host first "
+                         "(scripts/start.sh asks for it)")
+    dash = Dashboard(cfg, case_id, model, posture, conversation_id=conversation_id, new_conversation=new_conversation,
+                     account_path=acct, run_dir=Path(run_dir) if run_dir else None)
     scheme = "https" if tls_cert else "http"
     shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    dash.url = f"{scheme}://{shown}:{port}"
+    dash.bind = {"host": host, "port": port}
     print(f"\n  Compensated Anarchist dashboard  case={case_id}\n"
-          f"  open: {scheme}://{shown}:{port}/login?token={dash.token}\n"
-          f"  (the token is required; keep it private. Ctrl+C to stop.)\n", flush=True)
-    uvicorn.run(create_app(dash), host=host, port=port, log_level="warning",
-                ssl_certfile=tls_cert or None, ssl_keyfile=tls_key or None)
+          f"  open: {dash.url}/login?token={dash.token}\n"
+          f"  sign in with this start's access token plus the dashboard account's username and password.\n"
+          f"  (the token is new at every start; keep it private. Ctrl+C to stop.)\n", flush=True)
+    server = uvicorn.Server(uvicorn.Config(create_app(dash), host=host, port=port, log_level="warning",
+                                          ssl_certfile=tls_cert or None, ssl_keyfile=tls_key or None,
+                                          timeout_graceful_shutdown=3))
+    dash.server = server
+    server.run()
+    if dash.relaunch:  # the Settings page moved the address: same process, same token, new socket
+        print(f"\n  moving to the new address; the access token stays the same\n", flush=True)
+        os.execv(sys.executable, [sys.executable, *dash.relaunch])

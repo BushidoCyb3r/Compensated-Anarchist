@@ -15,7 +15,7 @@
       <img src="/static/logo.svg" width="64" height="64" alt="">
       <div>
         <h1>Compensated Anarchist</h1>
-        <p>Defensive cyber operations</p>
+        <p>Agentic Defensive Cyber Operations</p>
       </div>
     </div>
     <form id="login-form" class="login-form" novalidate>
@@ -30,9 +30,18 @@
       <div id="token-row" class="thread-sec">
         <label for="token" class="label">Access token</label>
         <input id="token" type="password" autocomplete="off" spellcheck="false">
-        <p class="hint">Printed in the server console when the dashboard starts.</p>
+        <p class="hint">New at every start: scripts/start.sh prints it.</p>
       </div>
-      <p id="token-note" class="hint" hidden>Using the token from your sign-in link.</p>
+      <p id="token-note" class="hint" hidden>Using the access token from your sign-in link.</p>
+      <div id="no-account" class="form-error" role="alert" hidden>No dashboard account exists yet. On the host, run <code>canarchist account create</code> (scripts/start.sh asks for it).</div>
+      <div class="thread-sec">
+        <label for="username" class="label">Username</label>
+        <input id="username" type="text" autocomplete="username" autocapitalize="off" spellcheck="false" maxlength="64">
+      </div>
+      <div class="thread-sec">
+        <label for="password" class="label">Password</label>
+        <input id="password" type="password" autocomplete="current-password" maxlength="1024">
+      </div>
       <div id="login-error" class="form-error" role="alert" hidden></div>
       <button class="btn btn-primary btn-lg" type="submit" id="login-btn">Sign in</button>
     </form>

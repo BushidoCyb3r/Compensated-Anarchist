@@ -37,12 +37,19 @@ and the expert team **writes, scores and revises its own skills** as it works.
 (Security Onion, Elastic, Splunk, Velociraptor, MISP, OpenCTI, local tools) and the scope file.
 
 ```bash
-./scripts/install.sh                                             # venv, install, config/.env, folders, doctor
+scripts/start.sh     # first run: builds everything (install.sh) and asks you to create the dashboard account;
+                     # every run: asks posture / address / case (Enter keeps your last choice), then prints
+                     # the sign-in link with a NEW access token (your data is kept)
+scripts/stop.sh      # stops it; cases, conversations, memory, skills and audit logs stay
+```
+
+```bash
+./scripts/install.sh                                             # (start.sh runs this on the first run)
 $EDITOR config/.env                                              # models + connector credentials (SETUP.md)
 # evidence for a case goes in forensics/<case-id>/ (created per case; the forensics playbook starts there)
 .venv/bin/canarchist attack fetch                                # MITRE ATT&CK data for actor-based hunt plans (optional)
 .venv/bin/canarchist doctor    --case TEST                       # models, connectors, ROE tier per tool
-.venv/bin/canarchist dashboard --case IR-2026-0042               # web GUI -> open the printed login URL
+scripts/start.sh --case IR-2026-0042                            # web GUI -> open the printed sign-in link
 .venv/bin/canarchist chat      --case IR-2026-0042               # terminal console
 .venv/bin/canarchist run    --case HUNT-0007 --playbook hunt "Kerberoasting against service accounts, last 14 days"
 ```
@@ -54,11 +61,12 @@ Useful commands: `/playbook`, `/subagents`, `/conversations`, `/new`, `/open <id
 
 ## Dashboard (web GUI)
 
-`canarchist dashboard --case <id>` serves the operator console: a chat-first window in the spirit of Hermes
+`scripts/start.sh` (or `canarchist dashboard --case <id>` in the foreground) serves the operator console: a chat-first window in the spirit of Hermes
 Agent, built around DCO work and branded red on black with the circled-A mark. It is a self-contained
 single-page app (no CDNs, system fonts), so it works air-gapped, and nothing reloads the page.
 
-- **Sign-in.** The terminal prints a sign-in link containing a token. The sign-in page shows your notice
+- **Sign-in.** `scripts/start.sh` prints a sign-in link containing this start's access token; you also enter the
+  dashboard account's username and password. The sign-in page shows your notice
   and consent text (`dashboard.consent_text`), which must be acknowledged, and the acknowledgement is
   audited. The token is posted once and stripped from the address bar; a GET never signs anyone in.
   Repeated failures from one address are throttled.
@@ -91,11 +99,17 @@ single-page app (no CDNs, system fonts), so it works air-gapped, and nothing rel
   new conversation, Ctrl+. case panel, Ctrl+/ shortcuts, `/` to focus the message box, Esc to close.
 - **Themes.** Dark (default), light, or match the system, from Settings or the palette.
 - **Security.** Stricter than a typical local dashboard, because this one approves response actions:
-  - A token is always required, even on localhost. Sign-in turns it into an HttpOnly, SameSite=Strict
-    session cookie; you can fix the token with `CA_DASHBOARD_TOKEN`.
+  - Signing in takes both the access token, which is new at every start, and the dashboard account's username
+    and password, even on localhost. The account is created once on the host (the first `scripts/start.sh` asks;
+    `canarchist account create | passwd | reset`), and its password is stored only as a salted scrypt hash in
+    `config/secrets/` (mode 600).
+  - A sign-in becomes a random server-side session in an HttpOnly, SameSite=Strict cookie. It ends after
+    `dashboard.session_idle_hours` (12) without analyst activity, on sign-out, and whenever the dashboard
+    restarts. Failed sign-ins are throttled and audited.
   - Every state change needs a CSRF header.
   - A strict CSP: no inline script or style attributes, no framing, nothing loaded from outside.
-  - Binding beyond localhost requires `--tls-cert/--tls-key`.
+  - Binding beyond localhost requires TLS. `scripts/start.sh` makes a self-signed certificate for the host's
+    address, renews it before it expires, and prints its fingerprint to check against the browser warning.
   - Agent, log and tool text is built into the page with DOM text nodes, never HTML, because adversaries
     control that data.
 

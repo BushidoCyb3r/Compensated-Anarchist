@@ -1,5 +1,6 @@
-// Sign-in page. The token from the printed link (?token=...) is posted once and then removed from the
-// address bar; it never travels in a GET request again. All text is set with textContent.
+// Sign-in page: this start's access token (from the printed link, ?token=..., or typed) plus the dashboard
+// account's username and password. The token is removed from the address bar at once and only ever POSTed.
+// All text is set with textContent.
 "use strict";
 (function () {
   const $ = (id) => document.getElementById(id);
@@ -33,22 +34,25 @@
       $("consent-text").textContent = info.consent_text;
       $("consent").hidden = false;
     }
-    if (linkToken && !consentRequired) $("login-form").requestSubmit();
+    if (info.account === false) $("no-account").hidden = false;
+    (linkToken ? $("username") : $("token")).focus();
   }).catch(() => showError("Cannot reach the dashboard server."));
 
   $("login-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     showError("");
     const token = $("token").value.trim();
+    const username = $("username").value.trim(), password = $("password").value;
     if (consentRequired && !$("consent-check").checked) { showError("Acknowledge the notice to continue."); return; }
     if (!token) { showError("Enter the access token."); $("token-row").hidden = false; $("token").focus(); return; }
+    if (!username || !password) { showError("Enter your username and password."); (username ? $("password") : $("username")).focus(); return; }
     const btn = $("login-btn");
     btn.disabled = true; btn.textContent = "Signing in…";
     try {
       const r = await fetch("/api/login", {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json", "X-CA-Request": "1" },
-        body: JSON.stringify({ token, consent: $("consent-check").checked }),
+        body: JSON.stringify({ token, username, password, consent: $("consent-check").checked }),
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(d.error || "Sign-in failed (HTTP " + r.status + ")");
@@ -56,6 +60,7 @@
     } catch (err) {
       showError(err.message);
       $("token-row").hidden = false; $("token-note").hidden = true;
+      $("password").value = ""; $("password").focus();
       btn.disabled = false; btn.textContent = "Sign in";
     }
   });

@@ -17,6 +17,44 @@ Each connector section follows the same pattern:
 
 ---
 
+## Starting and stopping
+
+```bash
+scripts/start.sh            # start (the first run also builds everything and asks for the dashboard account)
+scripts/stop.sh             # stop
+```
+
+- **The first run** runs `scripts/install.sh` when nothing is installed yet: the Python environment, the config
+  files and every folder. Then it asks you to create the **dashboard account**, the username and password
+  you sign in with. The password is stored only as a salted scrypt hash in `config/secrets/` (mode 600).
+- **Every start** prints a sign-in link with a **new access token**; the previous token stops working. Signing in
+  takes the token plus the username and password. If it is already running, start offers to restart it with a
+  new token.
+- **Your data is never touched.** Start only creates what is missing; it never overwrites, empties or deletes
+  anything. Cases, conversations, memory, skills, audit logs, plans and reports stay across stops and starts.
+  Stop shuts down cleanly, so the audit log and chat history are closed properly.
+- **Every start asks three questions;** press Enter to keep the default shown, which is your last choice:
+  - **Posture:** OBSERVE (watch and investigate; response actions are refused) or RESPOND (response actions
+    allowed, each still approved by you).
+  - **Address:** the main address (this host's network address, over HTTPS with a self-signed certificate that
+    start makes, renews before it expires, and whose fingerprint it prints) or this host only (127.0.0.1).
+  - **Case:** an existing case, or a new case id.
+
+  An option skips its question (`--posture respond`, `--localhost`, `--case IR-0042`), and `--yes` skips them all.
+  Without a terminal (cron, systemd) it uses the saved answers. Other options: `--port`, `--model`,
+  `--foreground`.
+- **Change them while it runs** on the dashboard's Settings page, under "Posture, address and case":
+  - **Posture** applies at once (switching to RESPOND asks you to confirm).
+  - **Case** switches in place; connectors reconnect and you stay signed in.
+  - **Address** restarts the dashboard in place on the new address, with the same access token; sign in again there.
+
+  Every change is audited and becomes the default the next start offers.
+- **Sign-ins end** after 12 hours without activity (`dashboard.session_idle_hours`) and at every restart.
+- **Account:** `canarchist account status | passwd | reset` (reset replaces a forgotten account).
+- Runtime files (pid, log, the current token) are in `run/` (mode 700, git-ignored).
+
+---
+
 ## 0. Before you start
 
 **Install:** one script takes you from `git clone` to ready-to-configure. It is safe to re-run, and never
@@ -542,7 +580,7 @@ scope:
 .venv/bin/canarchist doctor --case SETUP-CHECK
 .venv/bin/canarchist run --case SETUP-CHECK --posture observe --non-interactive \
     "Smoke test: summarize the alerts from the last 24 hours, the top rules and the source -> destination pairs. Read-only."
-.venv/bin/canarchist dashboard --case IR-0001     # add --host <ip> --tls-cert <pem> --tls-key <pem> to serve beyond localhost
+scripts/start.sh --case IR-0001     # prints the sign-in link and this start's access token; scripts/stop.sh stops it
 ```
 
 ### Troubleshooting

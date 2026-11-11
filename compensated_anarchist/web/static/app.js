@@ -423,7 +423,7 @@ function renderHeader() {
   const respond = st.posture === "respond";
   clear(S.ui.posture).append(el("span", { class: "dot" + (respond ? " red" : "") }), respond ? "RESPOND" : "OBSERVE");
   S.ui.posture.className = "posture" + (respond ? " respond" : "");
-  S.ui.posture.title = respond ? "Response actions are possible (each still passes ROE and approval)" : "Observe only: response actions are denied";
+  S.ui.posture.title = (respond ? "Response actions are possible (each still passes ROE and approval)" : "Observe only: response actions are denied") + ". Change it in Settings.";
   S.ui.gate.hidden = !st.gated;
   S.ui.gate.title = st.gated ? `${st.gated}. Start a new conversation to leave approval mode.` : "";
   S.ui.inspBtn.classList.toggle("on", S.insp.open);
@@ -925,6 +925,8 @@ const H = {
     if (S.view === "settings" && !S.clsDraft) renderPage("settings");
   },
   rated() { scheduleRefresh(); },
+  settings_changed(d) { if (!d.restarting) { scheduleRefresh(); if (S.view === "settings" && !S.clsDraft) renderPage("settings"); } },
+  case_switched() { location.reload(); },
   ready() { scheduleRefresh(); },
 };
 function onEvent(ev) {
@@ -1617,6 +1619,7 @@ const PAGES = {
       el("span", { class: "label", text: "Posture" }), el("span", { text: st.posture.toUpperCase() + " (set at start with --posture)" }),
       el("span", { class: "label", text: "Session" }), el("span", { class: "mono", text: st.session }),
       el("span", { class: "label", text: "Version" }), el("span", { text: `${st.ui.name} ${st.ui.version}` })));
+    try { root.append(runSettings(await api("/api/settings/startup"))); } catch (e) { root.append(el("div", { class: "empty", text: "Could not load the posture, address and case settings: " + e.message })); }
     root.append(classificationSettings());
     root.append(modelSettings(st));
     root.append(el("h2", { css: { fontSize: "15px" }, text: "Keyboard shortcuts" }), shortcutsTable());
@@ -1645,6 +1648,76 @@ function modelSettings(st) {
   }
   box.append(el("div", { class: "table-box" }, el("table", { class: "list" }, el("thead", {}, el("tr", {}, ["", "Profile", "Provider", "Model", "Status"].map((h) => el("th", { text: h })))), tb)));
   return box;
+}
+
+/* ---------------------------------------------------------------- posture, address and case (live) */
+// Changed here while it runs; each change is audited and becomes the default scripts/start.sh offers next time.
+function runSettings(info) {
+  const now = info.now, busy = info.running;
+  const seg = (items, current, onPick, disabled) => el("div", { class: "seg", role: "group" }, items.map(([v, label]) =>
+    el("button", { type: "button", class: current === v ? "on" : "", disabled: disabled || current === v, "aria-pressed": String(current === v), onclick: () => onPick(v) }, label)));
+
+  const posture = seg([["observe", "Observe"], ["respond", "Respond"]], now.posture, (v) => {
+    const go = async () => {
+      try { await api("/api/settings/posture", { posture: v }); toast(v === "respond" ? "Posture is now RESPOND" : "Posture is now OBSERVE"); await refreshState(); renderPage("settings"); }
+      catch (e) { toast(e.message, true); }
+    };
+    if (v !== "respond") { go(); return; }
+    const dlg = openDialog({ title: "Switch to RESPOND?", iconName: "shield",
+      body: [el("p", { css: { margin: "0" }, text: "Response actions (containment, collection, quarantine and the like) become possible. Each one still needs your approval and passes the rules of engagement." })],
+      foot: [el("span", { class: "note", text: "Recorded in the audit log." }), el("button", { type: "button", class: "btn", onclick: () => dlg.close() }, "Cancel"),
+        el("button", { type: "button", class: "btn btn-primary", onclick: () => { dlg.close(); go(); } }, "Switch to RESPOND")] });
+  });
+
+  const local = now.address === "127.0.0.1";
+  const address = seg([["auto", `Main address ${info.main_address}`], ["127.0.0.1", "This host only"]], now.address, (v) => {
+    const url = v === "127.0.0.1" ? `http://127.0.0.1:${info.port}` : `https://${info.main_address}:${info.port}`;
+    const remote = !["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);
+    const dlg = openDialog({ title: "Move the dashboard?", sub: url, iconName: "globe",
+      body: [el("p", { css: { margin: "0" }, text: `It restarts in place on ${url}. That takes 10-20 seconds while the connectors reconnect; a running operation must be stopped first.` }),
+        el("p", { css: { margin: "0" }, text: "The access token from this start stays valid. Sign in again at the new address with it and your username and password." }),
+        v === "127.0.0.1" && remote ? el("p", { class: "form-error", css: { margin: "0" }, text: `You are browsing from another computer (${location.hostname}). After the move only a browser on the host itself can reach the dashboard.` }) : null],
+      foot: [el("span", { class: "note", text: "Recorded in the audit log." }), el("button", { type: "button", class: "btn", onclick: () => dlg.close() }, "Cancel"),
+        el("button", { type: "button", class: "btn btn-primary", onclick: async () => {
+          try { const r = await api("/api/settings/address", { address: v }); dlg.close(); movingTo(r.url); }
+          catch (e) { toast(e.message, true); }
+        } }, "Move it")] });
+  }, busy || !info.can_move);
+
+  const pick = el("select", { class: "field", id: "run-case", "aria-label": "Case", disabled: busy },
+    info.cases.map((c) => el("option", { value: c, text: c === now.case ? `${c} (open now)` : c })));
+  pick.value = now.case;
+  const fresh = el("input", { type: "text", id: "run-case-new", placeholder: "or a new case id", maxlength: "64", autocomplete: "off", disabled: busy });
+  const switchBtn = el("button", { type: "button", class: "btn", disabled: true }, "Switch case");
+  const target = () => (fresh.value.trim() || pick.value);
+  const sync = () => { switchBtn.disabled = busy || target() === now.case; };
+  pick.addEventListener("change", sync); fresh.addEventListener("input", sync);
+  switchBtn.addEventListener("click", async () => {
+    switchBtn.disabled = true; switchBtn.textContent = "Switching…";
+    try { await api("/api/settings/case", { case: target() }); location.reload(); }
+    catch (e) { toast(e.message, true); switchBtn.textContent = "Switch case"; sync(); }
+  });
+
+  return el("section", { class: "card settings-sec", "aria-labelledby": "run-h" },
+    el("div", { class: "sec-head" },
+      el("h2", { id: "run-h", text: "Posture, address and case" }),
+      el("p", { text: "Change them while it runs. Every change is recorded in the audit log and becomes the default scripts/start.sh offers next time." })),
+    el("div", { class: "form-grid" },
+      el("span", { class: "label", text: "Posture" }),
+      el("div", {}, posture, el("div", { class: "muted small", css: { marginTop: "6px" }, text: "Observe: watch and investigate; response actions are refused. Respond: response actions are allowed, each with your approval. Applies at once." })),
+      el("span", { class: "label", text: "Address" }),
+      el("div", {}, address, el("div", { class: "muted small", css: { marginTop: "6px" },
+        text: !info.can_move ? "Started without scripts/start.sh: restart it with the address you want." : `Now ${now.url || (local ? "this host only" : "the main address")}. Moving restarts the dashboard in place; the access token stays the same.` })),
+      el("label", { class: "label", for: "run-case", text: "Case" }),
+      el("div", {}, el("div", { class: "path-row" }, pick, fresh, switchBtn),
+        el("div", { class: "muted small", css: { marginTop: "6px" }, text: busy ? "Stop the running operation to switch case." : "The other case's files stay as they are. Connectors reconnect for a few seconds; you stay signed in." }))),
+    el("div", { class: "sec-foot" }, el("span", { class: "note", text: `Next start offers: ${info.defaults.posture.toUpperCase()} · ${info.defaults.address === "127.0.0.1" ? "this host only" : "main address"} · case ${info.defaults.case}` })));
+}
+function movingTo(url) {
+  openDialog({ title: "Moving the dashboard", sub: url, iconName: "globe",
+    body: [el("p", { css: { margin: "0" }, text: "Restarting on the new address. This page will open the sign-in page there in about 20 seconds." }),
+      el("p", { css: { margin: "0" } }, "If it does not, open ", el("a", { href: url + "/login", text: url + "/login" }), " yourself. Use this start's access token with your username and password.")] });
+  setTimeout(() => location.replace(url + "/login"), 20000);
 }
 
 /* ---------------------------------------------------------------- classification banner setting */
@@ -1987,6 +2060,17 @@ function tick() {
 window.addEventListener("hashchange", route);
 window.addEventListener("popstate", route);
 
+// Sign-ins end after hours of no analyst activity. Background polling does not count; this ping (at most once a
+// minute, only while someone uses the page) does. An expired session gets 401 and the page returns to sign-in.
+function watchActivity() {
+  let last = 0;
+  const ping = () => {
+    if (document.hidden || Date.now() - last < 60000) return;
+    last = Date.now();
+    api("/api/activity", {}).catch(() => {});
+  };
+  for (const ev of ["pointerdown", "keydown", "wheel", "touchstart"]) addEventListener(ev, ping, { passive: true, capture: true });
+}
 (async function boot() {
   applyTheme(pref("theme", "dark"));
   if (innerWidth < 1180) S.insp.open = false;
@@ -2004,6 +2088,7 @@ window.addEventListener("popstate", route);
   connect();
   refreshAudit();
   refreshPlans();
+  watchActivity();
   setInterval(tick, 1000);
   if (S.view === "ops") S.ui.input.focus();
 })();

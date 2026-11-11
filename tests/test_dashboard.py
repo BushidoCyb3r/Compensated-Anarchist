@@ -31,8 +31,10 @@ def wait_for(client, kind, after=0, timeout=15):
     raise AssertionError(f"no {kind} event")
 
 
-def login(c, token="test-token", consent=None):
-    body = {"token": token}
+def login(c, token="test-token", consent=None, username=None, password=None):
+    from test_harness import TEST_PASSWORD, TEST_USER
+    body = {"token": token, "username": TEST_USER if username is None else username,
+            "password": TEST_PASSWORD if password is None else password}
     if consent is not None:
         body["consent"] = consent
     return c.post("/api/login", json=body, headers=H)
@@ -54,7 +56,8 @@ def test_auth_csrf_and_headers(tmp_path, monkeypatch):
         page = c.get("/login?token=test-token")
         assert page.status_code == 200 and "set-cookie" not in page.headers  # a GET never signs you in
         assert c.get("/api/state").status_code == 401
-        assert c.post("/api/login", json={"token": "test-token"}).status_code == 403  # CSRF header required
+        assert c.post("/api/login", json={"token": "test-token", "username": "analyst",
+                                          "password": "correct horse battery"}).status_code == 403  # CSRF header required
         assert login(c, "nope").status_code == 401
         r = login(c)
         assert r.status_code == 200 and "httponly" in r.headers["set-cookie"].lower() and "samesite=strict" in r.headers["set-cookie"].lower()

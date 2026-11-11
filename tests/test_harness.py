@@ -44,7 +44,12 @@ def write_config(tmp: Path) -> Path:
     }
     p = tmp / "harness.yaml"
     p.write_text(yaml.safe_dump(cfg))
+    from compensated_anarchist.web import account
+    account.save(tmp / "secrets" / "dashboard_account.json", TEST_USER, TEST_PASSWORD)  # dashboard sign-in
     return p
+
+
+TEST_USER, TEST_PASSWORD = "analyst", "correct horse battery"
 
 
 class ScriptedBackend:

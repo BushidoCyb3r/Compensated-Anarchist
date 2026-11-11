@@ -115,6 +115,16 @@ chmod 600 config/.env
 
 mkdir -p config/secrets && chmod 700 config/secrets && ok "config/secrets/ (700) for API configs, CA bundles, client certs"
 
+if .venv/bin/canarchist account status >/dev/null 2>&1; then
+  ok "dashboard account exists - left unchanged (change the password: canarchist account passwd)"
+elif [ -t 0 ]; then
+  step "Dashboard sign-in account"
+  echo "  You sign in to the dashboard with this username and password plus the access token each start prints."
+  .venv/bin/canarchist account create || warn "no account yet - scripts/start.sh will ask for it"
+else
+  warn "no dashboard account yet (no terminal to ask in) - scripts/start.sh will ask for it"
+fi
+
 if [ ! -f config/models.local.yaml ]; then
   cat > config/models.local.yaml <<'MODELS'
 # Site model profiles (git-ignored). Merged over config/models.yaml, which documents every field:
@@ -228,5 +238,7 @@ cat <<EOF
        in config/secrets/ (section 5).
     3. Scope: config/roe.local.yaml - allowed_targets and protected_assets (section 9).
     4. Check:     .venv/bin/canarchist doctor --case SETUP-CHECK   (it reads config/.env itself)
-    5. Use it:    .venv/bin/canarchist dashboard --case IR-0001     (or: chat / run)
+    5. Use it:    scripts/start.sh     (prints the sign-in link and this start's access token)
+                  scripts/stop.sh      (stops it; your data stays)
+                  or on the command line: .venv/bin/canarchist chat / run
 EOF

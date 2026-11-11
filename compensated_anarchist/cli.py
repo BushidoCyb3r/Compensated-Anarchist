@@ -529,6 +529,7 @@ def main(argv: list[str] | None = None) -> None:
     d.add_argument("--tls-cert", default="")
     d.add_argument("--tls-key", default="")
     d.add_argument("--allow-plaintext", action="store_true", help="permit non-loopback binding without TLS")
+    d.add_argument("--run-dir", default="", help="write pid, URL and the access token here once ready (scripts/start.sh)")
     m = sub.add_parser("memory", help="manage institutional memory")
     m.add_argument("action", choices=["stats", "list", "search", "review", "promote", "reject", "retire"])
     m.add_argument("rest", nargs="*")
@@ -543,6 +544,20 @@ def main(argv: list[str] | None = None) -> None:
     sk.add_argument("action", choices=["list", "pending", "show", "review", "approve", "reject", "rollback", "retire",
                                        "restore", "export", "import"])
     sk.add_argument("rest", nargs="*")
+    st = sub.add_parser("start", help="start the dashboard in the background and print this start's access token "
+                                      "(scripts/start.sh)")
+    st.add_argument("--case", help="case id (default: dashboard.serve.case, else the most recently used case)")
+    st.add_argument("--model", help="model profile (default: default_model in models.yaml / CA_MODEL)")
+    st.add_argument("--posture", choices=["observe", "respond"], help="default: dashboard.serve.posture (observe)")
+    st.add_argument("--host", help="address to serve on (default: dashboard.serve.host; auto = this host's address)")
+    st.add_argument("--port", type=int)
+    st.add_argument("--localhost", action="store_true", help="only this host's browser, plain http on 127.0.0.1")
+    st.add_argument("--foreground", action="store_true", help="stay attached to this terminal (Ctrl+C stops it)")
+    st.add_argument("-y", "--yes", action="store_true", help="do not ask; use the saved posture, address and case")
+    sub.add_parser("stop", help="stop the dashboard (scripts/stop.sh); your data is untouched")
+    sub.add_parser("setup", help="create any missing folders and site config files (never overwrites anything)")
+    ac = sub.add_parser("account", help="the dashboard sign-in account: status | create | passwd | reset")
+    ac.add_argument("action", choices=["status", "create", "passwd", "reset"])
     at = sub.add_parser("attack", help="MITRE ATT&CK data for hunt planning: status, fetch, group <name>")
     at.add_argument("action", choices=["status", "fetch", "group"])
     at.add_argument("name", nargs="?", help="group name, alias or G-id (for `group`)")
@@ -583,7 +598,7 @@ def main(argv: list[str] | None = None) -> None:
         from .web.app import serve
 
         serve(_cfg(args), args.case, args.model, args.posture, args.host, args.port, args.tls_cert, args.tls_key,
-              args.allow_plaintext, args.conversation, args.new)
+              args.allow_plaintext, args.conversation, args.new, args.run_dir)
     elif args.cmd == "memory":
         cmd_memory(args)
     elif args.cmd == "history":
@@ -592,6 +607,32 @@ def main(argv: list[str] | None = None) -> None:
         cmd_skills(args)
     elif args.cmd == "attack":
         _attack_cmd(args)
+    elif args.cmd == "setup":
+        from . import service
+
+        made = service.ensure_layout(_cfg(args))
+        print("Created:\n  " + "\n  ".join(made) if made else "Everything is in place; nothing to create.")
+    elif args.cmd in ("start", "stop"):
+        from . import service
+
+        cfg_path = args.config or os.environ.get("CA_CONFIG") or "config/harness.yaml"
+        cfg = _cfg(args)
+        try:
+            if args.cmd == "stop":
+                sys.exit(service.stop(cfg))
+            sys.exit(service.start(cfg, cfg_path, {k: getattr(args, k) for k in (
+                "case", "model", "posture", "host", "port", "localhost", "foreground", "yes")}))
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            sys.exit(1)
+    elif args.cmd == "account":
+        from .web import account
+
+        try:
+            sys.exit(account.interactive(account.default_path(_cfg(args)), args.action))
+        except (KeyboardInterrupt, EOFError):
+            print("\nNothing changed.")
+            sys.exit(1)
     elif args.cmd == "audit-verify":
         ok, msg = verify(_cfg(args).cases_dir / args.case / "audit.jsonl")
         print(msg)
