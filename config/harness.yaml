@@ -227,6 +227,19 @@ mcp_servers:
       OPENCTI_TOKEN: ${OPENCTI_TOKEN:-}  # token of a read-only OpenCTI user
       OPENCTI_VERIFY: ${OPENCTI_VERIFY:-true}
 
+  # Archer: beaconing, exfiltration, lateral movement, DNS tunneling and threat-intel findings from Zeek, with
+  # per-host roll-ups. Read-only, with a Viewer account (the connector refuses any other role).
+  archer:
+    enabled: ${ARCHER_ENABLED:-false}
+    module: compensated_anarchist.servers.archer
+    env:
+      ARCHER_URL: ${ARCHER_URL:-https://localhost:8443}
+      ARCHER_EMAIL: ${ARCHER_EMAIL:-}          # the account's email, not its display name
+      ARCHER_PASSWORD: ${ARCHER_PASSWORD:-}
+      ARCHER_TLS_FINGERPRINT: ${ARCHER_TLS_FINGERPRINT:-}  # pins Archer's self-signed certificate (recommended)
+      ARCHER_VERIFY: ${ARCHER_VERIFY:-true}    # only without a fingerprint: true | /path/ca.pem | false (no check)
+      ARCHER_MAX_CHARS: ${ARCHER_MAX_CHARS:-11000}  # keep under max_tool_result_chars above
+
   # example third-party server:
   # misp:
   #   command: /opt/mcp/misp-mcp

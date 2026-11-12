@@ -3,7 +3,7 @@
 An agentic harness for **Defensive Cyber Operations**: hunt, triage, network and host analysis,
 disk/memory forensics, malware triage, containment, detection engineering and reporting. It runs a
 team of expert agents on **any model you choose** (local or gateway), connects to **Security Onion,
-Splunk, Elastic, Velociraptor, MISP and OpenCTI** over MCP, drives **local forensic tools**, enforces
+Splunk, Elastic, Velociraptor, MISP, OpenCTI and Archer** over MCP, drives **local forensic tools**, enforces
 **rules of engagement in code**, **learns from every operation**, and has a **web dashboard** for
 running operations and approving response actions. Conversations are **kept until you delete them**,
 and the expert team **writes, scores and revises its own skills** as it works.
@@ -26,7 +26,7 @@ and the expert team **writes, scores and revises its own skills** as it works.
      | MCP connectors (stdio)   | local forensics          | case file + memory         |
      | security_onion  splunk   | volatility memprocfs     | IOCs timeline findings     |
      | elastic  velociraptor    | zimmerman tools  sigma   | evidence chain of custody  |
-     | misp  opencti            | capa floss yara tshark   | memory + skills (SQLite)   |
+     | misp  opencti  archer    | capa floss yara tshark   | memory + skills (SQLite)   |
      | + any 3rd-party MCP      | zeek plaso aleapp ileapp | chat history (kept)        |
      +--------------------------+--------------------------+---------------------------+
                   model profiles: vLLM / Ollama / llama.cpp / gateway / Anthropic ...
@@ -220,10 +220,30 @@ stderr goes to `cases/<id>/logs/`.
 | `elastic` | Elasticsearch / Elastic Security, API key. **Tested against a live 9.x cluster** (Kibana detection alerts verified on mocks only) | query_string, DSL, ES\|QL, EQL sequences, alerts + summary, stacking, IOC sweep, index inventory |
 | `velociraptor` + `velociraptor_admin` | gRPC API (`config api_client`). **Tested against a live 0.77.3 server** | 19 tools split by privilege. Investigator key: clients, client flow history, artifact search and detail, collect (wait + results), flow status/logs/results/uploads, labels, cancel, hunts, memory acquisition (Windows). Admin key: **evidence download with SHA-256 and size verification**, quarantine/unquarantine (Windows/Linux/macOS), server VQL |
 | `misp` | MISP REST API, auth key | IOC lookup (events, threat level, galaxy/ATT&CK tags), **warninglist check** (known-benign), event search and detail, sightings. Events it creates are always unpublished and org-only |
+| `archer` | Archer REST API (HTTPS, session login), a **Viewer** account | Read-only: overview counts, per-host roll-up, campaigns (one destination, many sources), finding search (Lucene `q`, IP/CIDR, time, score, IOC), finding detail with beacon interval statistics, the raw Zeek records behind a finding, 30-day pair history, sensor health, analysis status. See the Archer notes below |
 | `opencti` | OpenCTI GraphQL, read-only token | IOC lookup (observables, indicators, score, kill chain, related intrusion sets/malware), entity search (actors, malware, campaigns, ATT&CK patterns, reports), relationships, read-only GraphQL escape hatch (mutations refused) |
 
 Use least-privilege accounts. For example, a read-only ES role, a Splunk role without `delete_by_keyword`,
 and a Velociraptor `investigator,api` client.
+
+**Archer notes:**
+- **Reads only.** The connector sends GET to a fixed list of read routes; the one POST is the login. Any other
+  method or path is refused before it leaves the process, there is no "call any path" tool, and redirects are
+  not followed. It refuses to work unless `/api/me` says the account is a Viewer.
+- **TLS.** Archer's certificate is self-signed: pin it with `ARCHER_TLS_FINGERPRINT` (SHA-256 of
+  `/data/tls/server.crt` on the Archer host; an Archer admin also sees it at `GET /api/sensors/info`, which a Viewer
+  cannot call). The pin is checked right after the handshake, before the login is sent. Without a pin,
+  the certificate must verify (`ARCHER_VERIFY=true` or a CA file), and the error gives the fingerprint to pin.
+  `ARCHER_VERIFY=false` turns checking off and `connection_check` says so.
+- **One login.** Archer limits logins per address, so the connector logs in once and keeps the session (24 hours).
+  A 401 logs in again once and retries once. A 429 starts a back-off. A refused login (wrong password, or not a
+  Viewer) is not retried until the dashboard restarts, so it cannot lock the account.
+- **Untrusted text.** Finding detail, notes and raw Zeek fields come from network traffic. Control and bidi
+  characters are removed, long values are cut and listed in `_truncated`, and every answer is sized to fit the
+  agent's context (whole rows are dropped, with where to continue). The `archer-beacon-review` skill makes the
+  network analyst and threat hunter verify each finding in the Zeek data before it counts.
+- **Live feed:** not used. Archer's `/events` stream has no replay; the agents poll `analysis_status` and
+  `overview` instead.
 
 **Velociraptor notes (all verified live):**
 - **Least privilege.** Two connector entries use two API keys. `velociraptor` uses an
@@ -467,7 +487,7 @@ compensated_anarchist/
   docx.py           markdown -> Word (.docx) export with the standard library
   llm/              openai_compat, anthropic, text-mode tool calling
   tools/            registry/executor, local forensics
-  servers/          MCP servers: security_onion, splunk, elastic, velociraptor, misp, opencti
+  servers/          MCP servers: security_onion, splunk, elastic, velociraptor, misp, opencti, archer
   web/              dashboard (Starlette app + self-contained single-page UI, sign-in page, logo)
   experts/ prompts/ playbooks/
 config/             harness.yaml, models.yaml, roe.yaml, env.example
@@ -483,7 +503,8 @@ Run tests: `.venv/bin/python -m pytest -q`
 - **Untested beyond its safety check:** Splunk. Only the SPL write/exec blocklist has a test; search and
   response handling have never run against Splunk or a mock of it.
 - **Tested against mock servers or stand-in tools only:** MISP and OpenCTI (mock HTTP servers built from
-  their documented APIs and the official pycti queries), Elastic Security detection alerts, plus the
+  their documented APIs and the official pycti queries), Archer (a stand-in HTTPS server built from its API
+  contract; `tests/test_archer_live.py` runs the acceptance checks against yours), Elastic Security detection alerts, plus the
   Zimmerman tools, FLOSS, MemProcFS and ALEAPP/iLEAPP stand-ins. Validate against your instances.
 - SOC-native Security Onion features (cases, PCAP jobs, OQL) need SO Pro's Connect API / official MCP server.
 - The dashboard serves one case per process. Run several on different ports for parallel cases.

@@ -13,7 +13,8 @@ examined", with what was examined.
    Map it to ATT&CK tactics: what could be seen and what could not. The gaps go in the deliverable.
 2. **Parallel sweeps,** same scope and look-back, each given the coverage map from step 1:
    - network_analyst: beaconing and rare destinations, DNS anomalies, internal lateral movement, outbound volume
-     outliers;
+     outliers. When Archer is connected, start from its host roll-up and campaigns for the look-back, and verify
+     each finding in the Zeek data;
    - threat_hunter, stacking across hosts:
      - persistence (services, tasks, Run keys, WMI);
      - credential access (lsass access, Kerberoasting);

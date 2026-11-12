@@ -2,7 +2,7 @@
 
 This guide gets Compensated Anarchist working end to end:
 - a model to run the agents;
-- the connectors that give them data and reach (Security Onion, Elastic, Splunk, Velociraptor, MISP, OpenCTI);
+- the connectors that give them data and reach (Security Onion, Elastic, Splunk, Velociraptor, MISP, OpenCTI, Archer);
 - local forensic tools;
 - the scope the rules of engagement enforce.
 
@@ -423,6 +423,36 @@ OPENCTI_VERIFY=/path/to/ca.pem
 ```
 
 **Check:** `doctor` shows `mcp opencti connected`.
+
+---
+
+## 7b. Archer
+
+**What it gives the team:** Archer's findings from Zeek (beaconing, exfiltration, lateral movement, DNS tunneling,
+threat-intel matches), per-host roll-ups, campaigns, the raw Zeek records behind a finding and its 30-day history.
+Read-only: the connector never acknowledges, escalates, annotates or re-runs anything. The network analyst, threat
+hunter and alert triage experts use it, and verify each finding in the Zeek data before it counts.
+
+**On Archer:**
+1. **Create a Viewer account** for the harness. The display name can be anything (e.g. *Compensated Anarchist*); the
+   login uses the account's **email**. The connector refuses to work with any role other than viewer.
+2. **Note Archer's certificate fingerprint** (SHA-256). On the Archer host,
+   `openssl x509 -in /data/tls/server.crt -noout -fingerprint -sha256` prints it; an Archer admin also sees it at
+   `GET /api/sensors/info` (admin-only, so the connector's Viewer account cannot read it).
+
+**On the harness host** (`config/.env`; the password goes nowhere else):
+```
+ARCHER_ENABLED=true
+ARCHER_URL=https://<archer>:8443
+ARCHER_EMAIL=<the Viewer account's email>
+ARCHER_PASSWORD=<its password>
+ARCHER_TLS_FINGERPRINT=<SHA-256, colons allowed>
+```
+Without a fingerprint, the first call fails and its message gives the fingerprint Archer presented: compare it
+with Archer's before you pin it. `ARCHER_VERIFY=false` turns certificate checking off (not recommended).
+
+**Check:** `doctor` shows `mcp archer connected` and the `archer__*` tools as `auto`. Then run the acceptance
+checks against your Archer: `CA_LIVE_ARCHER=1 .venv/bin/python -m pytest -q tests/test_archer_live.py`.
 
 ---
 

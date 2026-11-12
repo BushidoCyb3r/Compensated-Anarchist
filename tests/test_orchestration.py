@@ -314,7 +314,7 @@ def test_every_expert_has_its_method_skill_shipped():
         shipped[meta["name"]] = meta["expert"]
     experts = {f.stem: agent_mod._parse_expert(f.read_text()) for f in (ROOT / "compensated_anarchist" / "experts").glob("*.md")}
     for name, e in experts.items():
-        assert all(shipped.get(s) == name for s in e.skills), (name, e.skills)
+        assert all(shipped.get(s) in (name, "shared") for s in e.skills), (name, e.skills)  # its own, or shared
     assert {n for n, e in experts.items() if not e.skills} == {"vuln_assessor"}  # its method stays fixed with its gate
 
 

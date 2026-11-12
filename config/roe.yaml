@@ -11,7 +11,7 @@ posture: respond
 default_tier: approve           # unknown / new tools always need approval
 
 # Trust read_only / destructive annotations only from our own connector servers.
-trust_annotations_from: [security_onion, splunk, elastic, velociraptor, velociraptor_admin, misp, opencti]
+trust_annotations_from: [security_onion, splunk, elastic, velociraptor, velociraptor_admin, misp, opencti, archer]
 
 scope:
   enforce: true
@@ -116,6 +116,9 @@ rules:
   - {match: "misp__create_event",  tier: approve, note: "creates intel in MISP (unpublished, org-only)"}
   - {match: "misp__*",             tier: auto}
   - {match: "opencti__*",          tier: auto}
+
+  # --- network detection ----------------------------------------------------------
+  - {match: "archer__*",           tier: auto, note: "Archer findings, read-only (Viewer account; the connector only reads)"}
 
   # --- hard denials -----------------------------------------------------------
   - {match: "*__delete*", tier: deny}
