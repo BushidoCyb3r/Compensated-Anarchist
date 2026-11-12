@@ -41,6 +41,7 @@ def write_config(tmp: Path) -> Path:
         "memory": {"db_path": "mem.db"},
         "mcp_servers": {"velociraptor": {"command": sys.executable, "args": [str(ROOT / "tests" / "fake_velo_server.py")]}},
         "forensics": {},
+        "tool_onboarding": {"specs_dir": "tool_specs"},  # per test, not shared through the parent folder
     }
     p = tmp / "harness.yaml"
     p.write_text(yaml.safe_dump(cfg))

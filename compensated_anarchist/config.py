@@ -169,6 +169,8 @@ class HarnessConfig:
     _models_sig: tuple = ()
     skills: dict[str, Any] = field(default_factory=dict)
     orchestration: dict[str, Any] = field(default_factory=dict)
+    learning: dict[str, Any] = field(default_factory=dict)
+    tool_specs_dir: Path = Path("tool_specs")
 
     def reload_models(self) -> bool:
         """Re-read config/.env and the model files when they changed on disk (the dashboard calls this; no restart).
@@ -293,4 +295,6 @@ def load_config(path: str | Path) -> HarnessConfig:
         history_db=rel((raw.get("history") or {}).get("db_path") or str(Path(h.get("cases_dir", "../cases")) / "_history.db")),
         skills=raw.get("skills") or {},
         orchestration=raw.get("orchestration") or {},
+        learning=raw.get("learning") or {},
+        tool_specs_dir=rel((raw.get("tool_onboarding") or {}).get("specs_dir", "../tool_specs")),
     )

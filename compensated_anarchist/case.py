@@ -112,6 +112,32 @@ class Case:
                                             {"ts": _now(), "action": "registered", "by": acquired_by or "harness"}]})
         return f"registered {eid} sha256={hashes['sha256']}"
 
+    def verify_evidence(self, evidence_ids: list[str] | None = None) -> str:
+        """Re-hash registered evidence and compare the FULL SHA-256 with the register (not a prefix). Each check is
+        written to the item's chain of custody."""
+        want = {e.strip().upper() for e in evidence_ids or [] if e.strip()}
+        items = [e for e in self.data["evidence"] if not want or e["id"] in want]
+        unknown = sorted(want - {e["id"] for e in items})
+        rows, counts = [], {"match": 0, "MISMATCH": 0, "missing": 0}
+        for e in items:
+            p = Path(e["path"])
+            if not p.is_file():
+                status, now = "missing", ""
+            else:
+                now = sha256_file(p)["sha256"]
+                status = "match" if now == e["hashes"]["sha256"] else "MISMATCH"
+            counts[status] += 1
+            e.setdefault("custody", []).append({"ts": _now(), "action": f"verified: {status}", "by": "harness"})
+            rows.append({"id": e["id"], "path": e["path"], "status": status, "registered_sha256": e["hashes"]["sha256"],
+                         **({"now_sha256": now} if status == "MISMATCH" else {})})
+        self._save()
+        out = {"checked": len(rows), **counts, "full_sha256_compared": True, "evidence": rows}
+        if unknown:
+            out["unknown_ids"] = unknown
+        if counts["MISMATCH"] or counts["missing"]:
+            out["warning"] = "Evidence changed or is gone since it was registered: stop and tell the analyst."
+        return json.dumps(out, indent=1)
+
     def save_artifact(self, filename: str, content: str) -> str:
         name = re.sub(r"[^A-Za-z0-9_.-]", "_", filename).lstrip(".") or "artifact.txt"
         folder = self.artifacts / "authored"
@@ -145,6 +171,8 @@ class Case:
         lines += [f"  {e['event_time']} {e['host']} {e['description'][:100]}" for e in d["timeline"][-max_items:]]
         lines.append(f"\nEvidence ({len(d['evidence'])}):")
         lines += [f"  {e['id']} {e['path']} sha256={e['hashes']['sha256'][:16]}..." for e in d["evidence"]]
+        if d["evidence"]:
+            lines.append("  (hashes shortened here; case_verify_evidence compares the full SHA-256)")
         if d.get("statements"):
             lines.append(f"\nAnalyst statements ({len(d['statements'])}):")
             lines += [f"  {s['id']} {s['answered_at'][:16]} {s['by']}: {s['question'][:80]} -> {s['answer'][:120]}"
@@ -174,6 +202,10 @@ class Case:
                         ["title", "severity", "description"]), self.add_finding),
             Tool("case_register_evidence", "Hash (MD5/SHA1/SHA256) and register an evidence file in the chain-of-custody register.",
                  schema({"path": S, "description": S, "acquired_by": S}, ["path", "description"]), self.register_evidence),
+            Tool("case_verify_evidence", "Re-hash registered evidence and compare the FULL SHA-256 with the chain-of-custody "
+                 "register (the case summary shows only a prefix). Give evidence ids, or none for all. Use it before and "
+                 "after analysis; each check is recorded in the item's custody log.",
+                 schema({"evidence_ids": L}), self.verify_evidence),
             Tool("case_save_artifact", "Save an authored text artifact into the case (detection rule, Sigma/YARA/Suricata rule, script, brief, IOC export).",
                  schema({"filename": S, "content": S}, ["filename", "content"]), self.save_artifact),
             Tool("case_summary", "Show the current case state: findings, IOCs, timeline, evidence, notes.",

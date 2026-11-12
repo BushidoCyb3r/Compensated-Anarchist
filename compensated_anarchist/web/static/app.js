@@ -298,9 +298,11 @@ const TOOL_LABELS = {
   report_sources: "Listed mission data", report_source: "Read mission data", report_verify: "Checked a draft",
   report_save: "Saved a report draft", report_finalize: "Saved the final report", report_list: "Listed reports",
   report_read: "Read a report", report_changes: "Read your edits to a report", case_analyst_statement: "Recorded your answer",
+  onboard_list: "Listed onboarded tools", onboard_inspect: "Inspected a new tool", onboard_openapi: "Read an OpenAPI document",
+  onboard_help: "Ran a new tool's help (sandboxed)", onboard_trial: "Tried a draft tool (sandboxed)", onboard_propose: "Submitted an onboarding proposal",
 };
 const SERVER_NAMES = { security_onion: "Security Onion", elastic: "Elastic", splunk: "Splunk", velociraptor: "Velociraptor",
-  velociraptor_admin: "Velociraptor admin", misp: "MISP", opencti: "OpenCTI" };
+  velociraptor_admin: "Velociraptor admin", misp: "MISP", opencti: "OpenCTI", archer: "Archer" };
 const PB_DESC = {
   triage: "Work through open alerts across connected sensors",
   hunt: "Hypothesis-driven hunt for a technique or actor",
@@ -312,6 +314,7 @@ const PB_DESC = {
   cte_plan: "Plan a threat emulation to test detection: name the adversary and the network (plans only)",
   report: "Write a report from this mission's data only, in your format; asks you for anything missing",
   code: "Write a script, parser or VQL artifact: tested on a real sample, reviewed by a second code writer, never run",
+  onboard_tool: "Teach the team a tool you supplied: sandboxed trials, then one proposal for you to approve",
 };
 function toolLabel(name) {
   if (TOOL_LABELS[name]) return TOOL_LABELS[name];
@@ -410,6 +413,7 @@ function drawSide() {
   const total = Object.keys(st.connectors || {}).length;
   const nav = el("div", { class: "side-nav" },
     navItem("ops", "chat", "Operations", S.pending.size ? el("span", { class: "count red", css: { marginLeft: "auto" }, text: S.pending.size }) : null),
+    navItem("learning", "star", "Learning", (st.learning || {}).all ? el("span", { class: "count warn", css: { marginLeft: "auto" }, "aria-label": `(${st.learning.all} waiting for review)`, text: st.learning.all }) : null),
     navItem("skills", "book", "Skills", st.skills.pending_review ? el("span", { class: "count warn", css: { marginLeft: "auto" }, text: st.skills.pending_review }) : null),
     navItem("memory", "db", "Memory", cand ? el("span", { class: "count", css: { marginLeft: "auto" }, text: cand }) : null),
     navItem("audit", "file", "Audit log", S.audit ? el("span", { class: "end", css: { color: S.audit.verified ? "var(--ok)" : "var(--red-hi)" }, text: S.audit.verified ? "Verified" : "Broken" }) : null),
@@ -1057,6 +1061,10 @@ const H = {
     if (t) {
       if (d.ok && d.text && !t.answer.childNodes.length) mutate(() => t.answer.append(md(d.text)));
       finishTurn(t, ev.ts, d);
+      const n = (d.learning || {}).conversation;
+      if (n) mutate(() => t.answer.append(el("div", { class: "toolbar", css: { marginTop: "10px" } },
+        el("button", { type: "button", class: "btn btn-sm", onclick: () => { S.learnScope = "conversation"; go("learning"); } },
+          icon("star"), `Review what this mission learned (${n})`))));
     }
     if (!S.replaying) { refreshConvs(); scheduleRefresh(); }
   },
@@ -1091,8 +1099,17 @@ const H = {
   },
   conversation_switched() { if (!S.replaying) loadConversation(); },
   case_updated() { scheduleRefresh(); refreshConvs(); },
-  memory_updated() { scheduleRefresh(); if (S.view === "memory") renderPage("memory"); },
-  skills_updated() { scheduleRefresh(); if (S.view === "skills") renderPage("skills"); },
+  memory_updated() { scheduleRefresh(); if (S.view === "memory" || S.view === "learning") renderPage(S.view); },
+  skills_updated() { scheduleRefresh(); if (S.view === "skills" || S.view === "learning") renderPage(S.view); },
+  tool_proposed(d, ev) {
+    const st = addStep(ensureTurn(ev.ts), { icon: "star", what: `Onboarding proposal ${d.name} #${d.n} is waiting for your review`, detail: "Learning page" });
+    setEnd(st, el("span", { class: "chip warn", text: "Review" }));
+    if (!S.replaying) scheduleRefresh();
+  },
+  retro_auto(d, ev) {
+    const st = addStep(ensureTurn(ev.ts), { icon: "star", what: "After-action review next", detail: `Started by itself: ${d.why}` });
+    setEnd(st, el("span", { class: "chip", text: "Automatic" }));
+  },
   model_switched() { scheduleRefresh(); },
   ui_updated(d) {
     if (!S.st) return;
@@ -1687,7 +1704,7 @@ function threadRow(list, ic, what, detail, denied, body, note) {
 }
 
 /* ================================================================ pages */
-const VIEWS = ["ops", "skills", "memory", "audit", "roe", "connectors", "settings"];
+const VIEWS = ["ops", "learning", "skills", "memory", "audit", "roe", "connectors", "settings"];
 function route() { const m = /^#\/(\w+)/.exec(location.hash); go(m && VIEWS.includes(m[1]) ? m[1] : "ops", false); }
 function go(view, push = true) {
   if (push) { const h = view === "ops" ? "#/" : "#/" + view; if (location.hash !== h) history.pushState(null, "", h); }
@@ -1725,7 +1742,151 @@ function recordBar(s) {
   const total = s.successes + s.failures;
   return el("span", { class: "bar" + (total ? "" : " none") }, el("span", { css: { width: (total ? Math.round(100 * s.successes / total) : 0) + "%" } }));
 }
+function memoryReviewCard(m, page) {
+  const card = el("div", { class: "card" });
+  const done = () => { renderPage(page); scheduleRefresh(); };
+  const act = (a, label, cls) => el("button", { type: "button", class: "btn btn-sm " + (cls || ""), onclick: async () => {
+    try { await api("/api/memory/" + m.id, { action: a }); toast(a === "promote" ? `M${m.id} approved` : `M${m.id} rejected`); done(); } catch (e) { toast(e.message, true); } } }, label);
+  const view = () => {
+    clear(card).append(
+      el("div", { css: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" } }, el("span", { class: "mono muted", text: `M${m.id}` }), el("strong", { text: m.title }),
+        el("span", { class: "chip", css: { marginLeft: "auto" }, text: m.kind })),
+      el("div", { class: "muted small", text: `Unreviewed · from ${m.source}${m.case_id ? " in " + m.case_id + " (working memory there already)" : ""} · ${fmtRel(m.updated || m.created)}` }),
+      el("div", { css: { whiteSpace: "pre-wrap", fontSize: "13px", margin: "8px 0" }, text: m.content }),
+      el("div", { class: "toolbar" }, act("promote", "Approve", "btn-primary"),
+        el("button", { type: "button", class: "btn btn-sm", "aria-label": `Edit M${m.id}`, onclick: edit }, icon("edit"), "Edit"), act("reject", "Reject", "btn-danger")));
+  };
+  const edit = () => {
+    const title = el("input", { type: "text", value: m.title, "aria-label": `Title of M${m.id}` });
+    const content = el("textarea", { class: "field", rows: 6, "aria-label": `Content of M${m.id}` });
+    content.value = m.content;
+    const save = (approve) => async () => {
+      try { await api("/api/memory/" + m.id, { action: "edit", title: title.value, content: content.value, approve }); toast(approve ? `M${m.id} corrected and approved` : `M${m.id} saved`); done(); } catch (e) { toast(e.message, true); }
+    };
+    clear(card).append(el("div", { css: { display: "flex", flexDirection: "column", gap: "8px" } },
+      el("div", { class: "mono muted small", text: `Editing M${m.id} · ${m.kind}. The old text stays in the audit log.` }), title, content,
+      el("div", { class: "toolbar" }, el("button", { type: "button", class: "btn btn-sm btn-primary", onclick: save(true) }, "Save and approve"),
+        el("button", { type: "button", class: "btn btn-sm", onclick: save(false) }, "Save"),
+        el("button", { type: "button", class: "btn btn-sm btn-ghost", onclick: () => { view(); focusWhenReady(card.querySelector(`[aria-label="Edit M${m.id}"]`)); } }, "Cancel"))));
+    title.focus();
+  };
+  view();
+  return card;
+}
+
+// A blocked tool's binary changed: re-run its golden trials on the new binary (sandboxed), then trust exactly that hash.
+function checkBinary(name, page) {
+  const status = el("div", { class: "small", role: "status", "aria-live": "polite", text: "Running its golden trials on the new binary in the sandbox…" });
+  const results = el("div", { css: { display: "flex", flexDirection: "column", gap: "8px" } });
+  const trust = el("button", { type: "button", class: "btn btn-primary", disabled: true }, "Trust the new binary");
+  const keep = el("button", { type: "button", class: "btn" }, "Keep it blocked");
+  const d = openDialog({ title: `Check the new binary: ${name}`, sub: "Its trials ran before approval; they run again now", iconName: "shield", wide: true,
+    body: [status, results], foot: [keep, trust] });
+  keep.addEventListener("click", d.close);
+  let sha = "", armed = false, timer = null;
+  trust.addEventListener("click", async () => {
+    if (!armed) { armed = true; trust.textContent = "Confirm: trust it"; timer = setTimeout(() => { armed = false; trust.textContent = "Trust the new binary"; }, 5000); return; }
+    clearTimeout(timer);
+    try { await api(`/api/tools/onboarded/${encodeURIComponent(name)}/trust`, { sha256: sha }); toast(`${name} is active again with the new binary`); d.close(); renderPage(page); scheduleRefresh(); }
+    catch (e) { toast(e.message, true); }
+  });
+  api(`/api/tools/onboarded/${encodeURIComponent(name)}/retest`, {}).then((r) => {
+    sha = r.sha256_now;
+    status.textContent = r.all_same ? "Every golden trial gives the same result on the new binary." : "The new binary does NOT reproduce every golden trial: compare below before trusting it.";
+    status.style.color = r.all_same ? "var(--ok)" : "var(--red-hi)";
+    results.append(el("div", { class: "mono small", css: { wordBreak: "break-all", whiteSpace: "pre-wrap" }, text: `binary  approved ${r.sha256_approved}\n        now      ${r.sha256_now}` +
+      (r.pinned_paths.length ? `\npinned data (${r.pinned_paths.join(", ")})\n        approved ${r.pinned_approved}\n        now      ${r.pinned_now}` : "") }),
+      ...r.golden.map((g, i) => el("div", { class: "card", css: { padding: "10px 12px" } },
+        el("div", { css: { display: "flex", gap: "8px", alignItems: "center" } }, el("strong", { text: `Trial ${i + 1}` }),
+          el("span", { class: "chip" + (g.same ? " ok" : " red"), text: g.same ? "same" : "differs" })),
+        el("div", { class: "mono small", css: { whiteSpace: "pre-wrap" }, text: `args   ${JSON.stringify(g.args || {})}\ngolden ${JSON.stringify(g.golden)}\nnow    ${g.error || JSON.stringify(g.now)}` }))));
+    trust.disabled = false;
+  }).catch((e) => { status.textContent = "Could not re-run the trials: " + e.message; status.style.color = "var(--red-hi)"; });
+}
+
+function toolProposalCard(p, sandbox) {
+  const spec = p.spec || {};
+  const binary = p.kind === "binary";
+  const tier = binary ? (spec.roe || {}).tier : "per tool";
+  const note = el("input", { type: "text", placeholder: "Review note (optional, audited)", "aria-label": `Review note for ${p.name} #${p.n}` });
+  const decide = async (action) => {
+    try { await api(`/api/tools/proposals/${encodeURIComponent(p.name)}/${p.n}`, { action, note: note.value });
+      toast(action === "approve" ? `${p.name} approved: the experts can use it now` : `${p.name} #${p.n} rejected`); renderPage("learning"); scheduleRefresh(); }
+    catch (e) { toast(e.message, true); }
+  };
+  const approve = el("button", { type: "button", class: "btn btn-primary btn-sm" }, "Approve");
+  let armed = false, timer = null;
+  approve.addEventListener("click", () => {
+    if (!armed) { armed = true; approve.textContent = "Confirm approval"; timer = setTimeout(() => { armed = false; approve.textContent = "Approve"; }, 5000); return; }
+    clearTimeout(timer); decide("approve");
+  });
+  const block = (label, text) => el("details", {}, el("summary", { class: "small", css: { cursor: "pointer" }, text: label }),
+    el("pre", { class: "mono small", css: { whiteSpace: "pre-wrap", margin: "8px 0 0", maxHeight: "320px", overflow: "auto" }, text }));
+  const trials = (p.trial_runs || []).map((t, i) => `Trial ${i + 1}${p.run_digest && t.run_digest === p.run_digest ? " (ran this exact spec)" : " (an earlier draft)"} ${JSON.stringify(t.args || {})}: exit ${t.exit}, ` +
+    `${t.result && t.result.rows !== undefined ? t.result.rows + " rows" : (t.result || {}).chars + " chars"}` +
+    `${t.outputs && t.outputs.length ? ", " + t.outputs.length + " output file(s)" : ""}\n  ${(t.argv || []).join(" ")}\n  ${t.sandbox || ""}`).join("\n\n");
+  const grants = binary ? `tool_${p.name}: ROE tier ${tier}, for ${(spec.experts || []).join(", ")}`
+    : p.kind === "openapi" ? Object.entries(spec.operations || {}).map(([op, d]) => `api_${p.name}__${op}: ${(d.resolved || {}).method} ${spec.base_url}${(d.resolved || {}).path} · ROE tier ${d.tier}, for ${(d.experts || []).join(", ")}`).join("\n")
+    : Object.entries(spec.tools || {}).map(([t, d]) => `${spec.server}__${t}: ROE tier ${d.tier}, for ${(d.experts || []).join(", ")}`).join("\n");
+  return el("div", { class: "card", css: { display: "flex", flexDirection: "column", gap: "8px" } },
+    el("div", { css: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" } }, el("strong", { class: "mono", text: `${p.name} #${p.n}` }),
+      el("span", { class: "chip", text: binary ? "tool" : p.kind === "openapi" ? "API" : "MCP server" }), binary ? el("span", { class: "chip", text: spec.risk }) : null,
+      el("span", { class: "chip" + (tier === "approve" ? " warn" : ""), text: `tier ${tier}` }),
+      binary && spec.network === "allowed" ? el("span", { class: "chip red", text: "network allowed" }) : null),
+    el("div", { css: { fontSize: "13.5px" }, text: spec.description || "" }),
+    el("div", { class: "muted small", text: `Proposed by ${p.proposed_by} · ${fmtRel(p.created)} · ${p.trials} sandbox trial(s)` +
+      (binary ? `, ${p.exact_trials || 0} of this exact spec` : "") }),
+    el("div", { class: "small" }, el("span", { class: "label", text: "Where it came from: " }), p.provenance || "(not given)"),
+    binary ? el("div", { class: "mono small", css: { wordBreak: "break-all" }, text: `${spec.binary}  sha256 ${spec.sha256}` }) : null,
+    binary ? el("div", { class: "small" }, el("span", { class: "label", text: "Pinned with it: " }), (spec.pinned_paths || []).length
+      ? `${spec.pinned_paths.join(", ")} (${spec.pinned_files} files, manifest ${String(spec.pinned_sha256).slice(0, 16)}…): any change blocks the tool`
+      : "nothing beside the binary (its rules or config could change without a block)") : null,
+    p.notes ? el("div", { class: "small" }, el("span", { class: "label", text: "Notes: " }), p.notes) : null,
+    el("div", { class: "small", css: { whiteSpace: "pre-wrap" } }, el("span", { class: "label", text: "Approving grants: " }), grants),
+    block("Adapter spec (YAML)" + (p.approved_spec_yaml ? " · replaces the approved one" : ""), p.spec_yaml),
+    trials ? block(`Sandbox trials (${p.trials}) · ${sandbox}`, trials) : null,
+    ...(p.skills || []).map((s) => block(`Usage skill for ${s.expert}`, s.text)),
+    note,
+    el("div", { class: "toolbar" }, el("span", { class: "muted small", css: { flex: "1 1 220px" }, text: "Nothing is usable until you approve. A changed binary blocks the tool until you trust it again (canarchist tools trust-new-binary)." }),
+      el("button", { type: "button", class: "btn btn-danger btn-sm", onclick: () => decide("reject") }, "Reject"), approve));
+}
+
 const PAGES = {
+  async learning(root) {
+    S.learnScope = S.learnScope || "conversation";
+    const data = await api("/api/learning?scope=" + S.learnScope);
+    root.append(pageHead("Learning", "What the team learned and is waiting for your review. A memory an agent writes is working memory in its own case at once, labeled unreviewed; approving it makes it available to every case. A skill change applies once you approve it."));
+    const c = data.counts;
+    const tabs = [["conversation", "This conversation", c.conversation], ["case", `This case (${data.case})`, c.case], ["all", "Everything waiting", c.all]];
+    root.append(tabList("Scope", "learn", tabs.map(([id, label, n]) => [id, label, el("span", { class: "count" + (n ? " warn" : ""), "aria-label": `(${n})`, text: n })]),
+      S.learnScope, (id) => { S.learnScope = id; renderPage("learning"); }));
+    const panel = el("div", { role: "tabpanel", id: "learn-panel", "aria-labelledby": `learn-tab-${S.learnScope}`, class: "tab-panel", css: { display: "flex", flexDirection: "column", gap: "18px" } });
+    root.append(panel);
+    if (!data.memories.length && !data.pending.length && !data.tools.length && !data.blocked.length) {
+      panel.append(el("div", { class: "empty", text: S.learnScope === "conversation" ? "Nothing from this conversation is waiting for review." : "Nothing is waiting for review." }));
+      return;
+    }
+    if (data.memories.length) {
+      panel.append(el("h2", { class: "sec-title", text: `Memories (${data.memories.length})` }),
+        el("div", { css: { display: "flex", flexDirection: "column", gap: "10px" } }, data.memories.map((m) => memoryReviewCard(m, "learning"))));
+    }
+    if (data.blocked.length) {
+      panel.append(el("h2", { class: "sec-title", text: `Blocked tools (${data.blocked.length})` }),
+        el("div", { css: { display: "flex", flexDirection: "column", gap: "10px" } }, data.blocked.map((t) => el("div", { class: "card", css: { display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" } },
+          el("span", { class: "chip red", text: "blocked" }), el("strong", { class: "mono", text: "tool_" + t.name }),
+          el("span", { class: "muted small", css: { flex: "1 1 260px" }, text: "Its binary changed since you approved it; nobody can use it until you trust the new one." }),
+          el("button", { type: "button", class: "btn btn-sm btn-primary", "aria-label": `Check the new binary of ${t.name}`, onclick: () => checkBinary(t.name, "learning") }, "Check the new binary")))));
+    }
+    if (data.tools.length) {
+      panel.append(el("h2", { class: "sec-title", text: `New tools (${data.tools.length})` }),
+        el("div", { css: { display: "flex", flexDirection: "column", gap: "10px" } }, data.tools.map((p) => toolProposalCard(p, data.sandbox))));
+    }
+    if (data.pending.length) {
+      const box = el("div");
+      panel.append(el("h2", { class: "sec-title", text: `Skill changes (${data.pending.length})` }), box);
+      skillsReview(box, data, "learning");
+    }
+  },
   async skills(root) {
     const data = await api("/api/skills");
     const weak = data.skills.filter((s) => s.needs_revision);
@@ -1821,6 +1982,21 @@ const PAGES = {
             el("div", { css: { display: "flex", alignItems: "center", gap: "8px", fontSize: "12.5px" } }, el("span", { class: "tier " + t.tier, text: t.tier }), el("span", { class: "mono ellipsis", title: t.description, text: t.name.split("__")[1] || t.name }))))) : null));
     }
     root.append(grid);
+    const onb = await api("/api/tools/onboarded");
+    root.append(el("h2", { class: "sec-title", css: { marginTop: "8px" }, text: "Onboarded tools" }));
+    if (!onb.tools.length) {
+      root.append(el("div", { class: "muted small", text: "None yet. Ask for the onboard tool playbook with the path of a tool you supplied; proposals appear on the Learning page." }));
+      return;
+    }
+    root.append(el("div", { class: "table-box" }, el("table", { class: "list" },
+      el("thead", {}, el("tr", {}, ["Tool", "Status", "Uses", "Failures", "Approved by", ""].map((h) => el("th", { text: h })))),
+      el("tbody", {}, onb.tools.map((t) => el("tr", {},
+        el("td", { class: "mono", text: t.kind === "binary" ? "tool_" + t.name : t.kind === "openapi" ? `api_${t.name}__*` : t.name }),
+        el("td", {}, el("span", { class: "chip" + (t.status === "blocked" ? " red" : t.status === "retired" ? "" : " ok"), text: t.status })),
+        el("td", { text: t.uses || 0 }), el("td", { text: t.failures || 0 }), el("td", { text: t.approved_by || "" }),
+        el("td", { css: { display: "flex", gap: "6px" } }, t.status === "blocked" ? el("button", { type: "button", class: "btn btn-sm btn-primary", "aria-label": `Check the new binary of ${t.name}`, onclick: () => checkBinary(t.name, "connectors") }, "Check the new binary") : null,
+          t.status !== "retired" ? el("button", { type: "button", class: "btn btn-sm", "aria-label": `Retire ${t.name}`, onclick: async () => {
+          try { await api(`/api/tools/onboarded/${encodeURIComponent(t.name)}/retire`, {}); toast(`${t.name} retired`); renderPage("connectors"); } catch (e) { toast(e.message, true); } } }, "Retire") : null)))))));
   },
   async settings(root) {
     try { applyState(await api("/api/state")); } catch (e) { /* render what we have */ } // picks up edits to models.yaml
@@ -2044,12 +2220,12 @@ function classificationSettings() {
     el("div", { class: "sec-foot" }, el("span", { class: "note", text: source }), reset, revert, save));
 }
 
-function skillsReview(root, data) {
+function skillsReview(root, data, page = "skills") {
   if (!data.pending.length) { root.append(el("div", { class: "empty", text: "Nothing waiting for review. Proposals appear here as subagents write and revise skills." })); return; }
   if (!data.pending.some((v) => v.id === S.skillsSel)) S.skillsSel = data.pending[0].id;
   const v = data.pending.find((x) => x.id === S.skillsSel);
   const list = el("div", { class: "list-col" }, data.pending.map((p) =>
-    el("button", { type: "button", class: "prop" + (p.id === v.id ? " on" : ""), "aria-pressed": String(p.id === v.id), onclick: () => { S.skillsSel = p.id; renderPage("skills"); } },
+    el("button", { type: "button", class: "prop" + (p.id === v.id ? " on" : ""), "aria-pressed": String(p.id === v.id), onclick: () => { S.skillsSel = p.id; renderPage(page); } },
       el("span", { css: { display: "flex", alignItems: "center", gap: "8px", width: "100%" } }, el("span", { class: "mono", css: { fontWeight: "500" }, text: p.name }),
         el("span", { class: "chip", css: { marginLeft: "auto" }, text: p.active_version ? `v${p.active_version} → v${p.version}` : "new" })),
       el("span", { class: "small", css: { color: "var(--text-2)" }, text: firstLine(p.change_note, 120) }),
@@ -2061,10 +2237,10 @@ function skillsReview(root, data) {
   approve.addEventListener("click", async () => {
     if (!armed) { armed = true; approve.textContent = "Confirm approval"; timer = setTimeout(() => { armed = false; approve.textContent = "Approve"; }, 5000); return; }
     clearTimeout(timer);
-    try { await api(`/api/skills/versions/${v.id}`, { action: "approve", note: note.value }); toast(`${v.name} v${v.version} approved`); S.skillsSel = null; renderPage("skills"); scheduleRefresh(); } catch (e) { toast(e.message, true); }
+    try { await api(`/api/skills/versions/${v.id}`, { action: "approve", note: note.value }); toast(`${v.name} v${v.version} approved`); S.skillsSel = null; renderPage(page); scheduleRefresh(); } catch (e) { toast(e.message, true); }
   });
   const reject = el("button", { type: "button", class: "btn btn-danger", onclick: async () => {
-    try { await api(`/api/skills/versions/${v.id}`, { action: "reject", note: note.value }); toast("Rejected"); S.skillsSel = null; renderPage("skills"); scheduleRefresh(); } catch (e) { toast(e.message, true); }
+    try { await api(`/api/skills/versions/${v.id}`, { action: "reject", note: note.value }); toast("Rejected"); S.skillsSel = null; renderPage(page); scheduleRefresh(); } catch (e) { toast(e.message, true); }
   } }, "Reject");
   const diff = el("div", { class: "diff", role: "region", "aria-label": "Changes to the procedure" },
     parseDiff(v.diff).map(([cls, sign, text]) => el("div", { class: "dl" + (cls ? " " + cls : "") }, el("span", { class: "sg", text: sign }), el("span", { class: "tx", text: text || " " }))));
@@ -2240,7 +2416,7 @@ function paletteItems() {
   add("Actions", "sun", pref("theme", "dark") === "light" ? "Switch to dark theme" : "Switch to light theme", () => applyTheme(pref("theme", "dark") === "light" ? "dark" : "light"), "", "theme appearance");
   add("Actions", "keyboard", "Keyboard shortcuts", showShortcuts, "Ctrl /");
   add("Actions", "logout", "Sign out", signOut);
-  for (const [v, ic, label] of [["ops", "chat", "Operations"], ["skills", "book", "Skills"], ["memory", "db", "Memory"], ["audit", "file", "Audit log"],
+  for (const [v, ic, label] of [["ops", "chat", "Operations"], ["learning", "star", "Learning"], ["skills", "book", "Skills"], ["memory", "db", "Memory"], ["audit", "file", "Audit log"],
     ["roe", "shield", "Rules of engagement"], ["connectors", "plug", "Connectors"], ["settings", "sliders", "Settings"]]) add("Go to", ic, label, () => go(v));
   for (const p of st.playbooks || []) add("Playbooks", "list", `Start playbook: ${humanPb(p)}`, () => { go("ops"); setPlaybook(p); }, "", PB_DESC[p] || "");
   for (const s of S.subs.values()) if (s.expert) add("Subagents", "users", `${s.id} · ${shortTitle(s.title)}`, () => { go("ops"); openThread(s.id); }, s.status, s.task);

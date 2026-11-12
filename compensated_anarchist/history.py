@@ -185,6 +185,14 @@ class ChatStore:
                                 (conv_id,)).fetchone()
         return dict(r) if r else None
 
+    def ops_since(self, conv_id: str, kind: str) -> list[dict[str, Any]]:
+        """The conversation's operations after its latest one of `kind` (all of them if there is none), oldest first."""
+        with self._lock:
+            rows = [dict(r) for r in self.db.execute("SELECT * FROM operations WHERE conversation_id=? "
+                                                     "ORDER BY started, rowid", (conv_id,)).fetchall()]
+        last = max((i for i, r in enumerate(rows) if r["kind"] == kind), default=-1)
+        return rows[last + 1:]
+
     def op_update(self, op_id: str, **fields: Any) -> None:
         cols = [k for k in fields if k in ("status", "pid", "ended", "note", "kind", "label")]
         if not cols:

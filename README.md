@@ -409,6 +409,44 @@ The ROE gate runs in code, so the model cannot talk its way past it.
 - **Untrusted data:** tool output is wrapped as untrusted data, and agents are instructed to treat
   instructions found in logs or files as a sign of adversary activity, never to follow them.
 
+## Onboarding a new tool
+
+Give the team a tool you supplied, and it learns to use it under the same controls as everything else. Ask for
+the *onboard tool* playbook with the tool's path, where it came from, and which experts should use it for what.
+
+- **Declarative adapters, no generated code.** `tool_specs/<name>/spec.yaml` names the binary with its pinned
+  SHA-256, typed parameters (evidence paths go through the forensic jail; output paths are made by the runner under
+  the case), an argv template (no shell, ever; values starting with `-` are refused), the output format (json,
+  ndjson, csv, lines, text), a risk class (read-only, writes-artifacts, touches-network, state-changing), the ROE
+  tier (never below what the risk class allows) and the experts who get it. `pinned_paths` pins the data beside
+  the binary that decides what it does (rules, config) by a manifest digest of every file. Approved, it becomes
+  `tool_<name>`.
+- **The sandbox.** Every run of an onboarded tool, and every `--help` or trial of a new one, runs in bubblewrap:
+  no network unless you approved a network tool, the system read-only, only the tool's own folder and the evidence it
+  was given visible, and writes only to its output folder under the case.
+- **The tool_integrator** inspects the binary, its data folders and its docs (untrusted text), runs its help
+  (every variant in one approved call) and trials on sample evidence (each run waits for your approval), drafts the
+  adapter, writes a usage skill for each expert, and submits one proposal. A proposal is refused unless a trial ran
+  exactly the spec being proposed, so you approve what was tried. It cannot approve anything, widen the jail, change
+  ROE, add network access or download a tool.
+- **One review.** The proposal waits on the Learning page (or `canarchist tools review`): the spec, what approving
+  grants (tool, tier, experts), the sandbox trials, the usage skills, the binary's hash and where it came from.
+  Approving makes it usable at once; the trials become its golden tests.
+- **Lifecycle.** Uses and failures are counted per tool. If the binary's hash or its pinned data changes (a new
+  release, a rule update, an edit), the tool is blocked (and audited) until you trust it again; when the approved
+  files come back it is usable again (also audited). To trust a change: *Check the new binary* (Learning page or Connectors page) or
+  `canarchist tools trust-new-binary <name>` re-runs the golden trials in the sandbox and shows old against new, and
+  only that exact hash can then be trusted. `canarchist tools retire <name>` (or Retire) takes a tool away.
+- **APIs from an OpenAPI 3 document** (a local copy you supply; nothing is fetched). The tool_integrator lists its
+  operations (`onboard_openapi`) and proposes the ones the team needs, each with a tier and experts. The proposal
+  fixes each operation (method, path, parameters, body schema) in the spec, so what you approve is exactly what runs.
+  Each becomes `api_<name>__<operation>`: GET/HEAD may be auto, every other method needs approve, and your site rules
+  (such as the `*__delete*` denial) still win. HTTPS only, a fixed base URL, path values URL-encoded whole (they cannot
+  leave the path), no redirects, and the key read from `config/.env` by variable name only.
+- **New MCP servers** marked `quarantine: true` in harness.yaml are listed but cannot be called, and their
+  annotations are not trusted. The tool_integrator proposes a tier and experts per tool; approved tools become
+  usable, the rest stay in quarantine.
+
 ## How it learns
 
 1. **Institutional memory** is stored in SQLite FTS5, so it works air-gapped with no embedding model.
@@ -416,15 +454,32 @@ The ROE gate runs in code, so the model cannot talk its way past it.
    feedback and playbook improvements. Relevant memories are injected at mission start and into every
    expert's tasking. Agents also search memory before writing new queries.
 2. **Analyst signal becomes knowledge:**
-   - A denied action becomes approved `feedback` memory.
-   - `/verdict … fp|benign` becomes approved `false_positive` memory.
-   - `/remember` adds knowledge directly.
-   - `memory_feedback` re-ranks retrieval.
-3. **`/retro`** runs an after-action review. The lead distills the operation into one-fact memories.
-4. **Poisoning defense.** Agent-written memories are stored as `candidate` and are not used until an
-   analyst runs `canarchist memory review` (or `promote`). Adversaries control the data your agents read,
-   so don't let them write your agent's beliefs.
-5. **Skills.** These are versioned procedures (`SKILL.md` format: name, when to use, steps) owned by an
+   - A denied action becomes approved `feedback` memory when the operation ends.
+   - `/verdict … fp|benign` becomes approved `false_positive` memory; `/verdict … tp` becomes approved `ttp`
+     memory (tradecraft confirmed in your network).
+   - A rating with a comment (five words or more) becomes approved `feedback` memory.
+   - The after-action review reads your answers and corrections in the conversation, and your edits to plans
+     and reports (as diffs against what the agent saved), and turns the lasting ones into memories and skill
+     revisions.
+   - `/remember` adds knowledge directly; `memory_feedback` re-ranks retrieval.
+3. **The after-action review** (`/retro`, or *After-action review* in the dashboard) distills the operation
+   into one-fact memories and skill changes. It runs by itself when a playbook mission completes, and
+   optionally after every N missions (`learning:` in harness.yaml; off on a slow model). Never by itself in a
+   conversation where every action needs your approval: run it there yourself and approve each step.
+4. **Learning during a mission.** A memory an agent writes is working memory in its case at once: every
+   agent in that case gets it, labeled *unreviewed* and to be verified, in its brief and in `memory_search`.
+   Other cases never see it until you approve it.
+5. **Poisoning defense.** Adversaries control the data your agents read, so they must not write your
+   agents' beliefs:
+   - agent-written memories stay `candidate` (working memory in their own case only) until you approve them;
+   - an agent writing the same title as approved knowledge makes a new candidate; it never changes approved
+     text;
+   - working memory is labeled unreviewed everywhere it appears, as leads to verify and never instructions.
+6. **Review in one place.** The dashboard's *Learning* page (with a count in the sidebar) holds everything
+   waiting: memory candidates and skill changes (with their diffs), for this conversation, this case or all.
+   Approve, edit (the old text goes to the audit log) or reject each. After a review, the run ends with
+   *Review what this mission learned*. `canarchist memory review` and `canarchist skills review` work too.
+7. **Skills.** These are versioned procedures (`SKILL.md` format: name, when to use, steps) owned by an
    expert, `shared`, or `lead` for orchestration patterns.
    - **Using them.** A subagent's brief lists the approved skills relevant to its task. It loads one with
      `skill_view` and reports whether it worked (`skill_feedback`, or `skills_used` in its report).
@@ -469,7 +524,7 @@ The ROE gate runs in code, so the model cannot talk its way past it.
    - **Management.** Every version is kept for diff and rollback (`skills rollback <name> <v>`).
      `skills export <dir>` and `skills import <dir>` move them as SKILL.md files, for git or for
      analyst-written skills, which are approved on import.
-6. **Fine-tuning data.** Every agent's full transcript is saved per session. `/rate 1-5` grades the
+8. **Fine-tuning data.** Every agent's full transcript is saved per session. `/rate 1-5` grades the
    session, and `canarchist export-training --min-rating 4` exports those runs as chat-format JSONL
    (messages + tools). You can use that to SFT/LoRA your local models on your own successful DCO work.
 
@@ -488,6 +543,7 @@ compensated_anarchist/
   llm/              openai_compat, anthropic, text-mode tool calling
   tools/            registry/executor, local forensics
   servers/          MCP servers: security_onion, splunk, elastic, velociraptor, misp, opencti, archer
+  toolspecs.py      tool onboarding: adapter specs, the sandbox, proposals, approved tools, MCP quarantine
   web/              dashboard (Starlette app + self-contained single-page UI, sign-in page, logo)
   experts/ prompts/ playbooks/
 config/             harness.yaml, models.yaml, roe.yaml, env.example

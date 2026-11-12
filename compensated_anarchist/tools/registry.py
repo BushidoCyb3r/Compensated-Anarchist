@@ -57,6 +57,7 @@ class Tool:
     handler: Handler
     server: str = ""  # MCP server name, "" for local
     annotations: dict[str, Any] = field(default_factory=dict)
+    quarantined: bool = False  # from an MCP server in quarantine: listed for onboarding, never offered or called
 
     @property
     def spec(self) -> ToolSpec:
@@ -82,6 +83,8 @@ class ToolRegistry:
     def select(self, allow: list[str] | None = None, deny: list[str] | None = None) -> list[Tool]:
         out = []
         for t in self.tools.values():
+            if t.quarantined:
+                continue
             if allow is not None and not any(fnmatch.fnmatchcase(t.name, p) for p in allow):
                 continue
             if deny and any(fnmatch.fnmatchcase(t.name, p) for p in deny):
@@ -119,6 +122,10 @@ class ToolExecutor:
             CURRENT_CALL.reset(token)
 
     async def _execute(self, call: ToolCall, agent: str, aid: str, tool: Tool, rationale: str) -> tuple[str, bool]:
+        if tool.quarantined:  # before the ROE: a quarantined server's annotations and tools are not trusted at all
+            self.audit.record("tool_quarantined_call", agent=agent, agent_id=aid, tool=call.name)
+            return (f"NOT EXECUTED - {call.name} is from an MCP server in quarantine. It becomes usable only after "
+                    "the analyst approves an onboarding proposal for it."), True
         decision = await self.roe.authorize(call.name, call.arguments, rationale, agent, tool.annotations, tool.server)
         self.on_event("decision", {"agent": agent, "agent_id": aid, "tool": call.name, "args": call.arguments,
                                    "tier": decision.tier, "allowed": decision.allowed, "reason": decision.reason})

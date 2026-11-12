@@ -404,6 +404,72 @@ def cmd_history(args) -> None:
         print(f"deleted {c['id']}")
 
 
+def cmd_tools(args) -> None:
+    """Onboarded tools: list them, review proposals, approve / reject, retire, trust a changed binary."""
+    from . import toolspecs
+    from .agent import load_experts
+    from .audit import AuditLog
+    from .skills import SkillStore
+    from .tools.forensics import PathJail
+
+    cfg = _cfg(args)
+    audit = AuditLog(cfg.cases_dir / "_tools_audit.jsonl", cfg.operator)
+    cat = toolspecs.ToolCatalog(cfg.tool_specs_dir, audit)
+    a, rest, by = args.action, args.rest, cfg.operator
+    experts = set(load_experts(cfg))
+
+    def decide(name: str, n: int, approve: bool, note: str = "") -> None:
+        store = SkillStore(cfg.memory_db, cfg.skills, audit)
+        toolspecs.apply_decision(cat, store, experts, name, n, approve, by, note)
+        print(f"{name} #{n} {'approved: usable after the next dashboard start (or approve in the dashboard to use it at once)' if approve else 'rejected'}.")
+
+    if a == "list":
+        for t in cat.tools():
+            print(f"{t['name']:24s} {t.get('kind', ''):7s} {t.get('status', ''):8s} uses {t.get('uses', 0):<4} "
+                  f"failures {t.get('failures', 0):<4} approved by {t.get('approved_by', '?')}")
+        for p in cat.proposals():
+            print(f"{p['name']:24s} proposal #{p['n']} waiting for review (canarchist tools review)")
+    elif a == "review":
+        for p in cat.proposals():
+            spec = p["spec"]
+            print(f"\n=== {p['name']} #{p['n']} ({p['kind']}) proposed by {p['proposed_by']} {p['created']}")
+            print(f"provenance: {p['provenance']}\nnotes: {p['notes']}\n--- spec ---\n{p['spec_yaml']}")
+            for t in p["trial_runs"]:
+                print(f"--- trial {json.dumps(t.get('args'))}: exit {t.get('exit')}, golden {json.dumps(t.get('golden'))}")
+            for sk in p["skills"]:
+                print(f"--- usage skill for {sk['expert']} ---\n{sk['text'][:3000]}")
+            if p["kind"] == "binary":
+                print(f"binary {spec['binary']} sha256 {spec['sha256']}; risk {spec['risk']}, network {spec.get('network', 'none')}, "
+                      f"ROE tier {spec['roe']['tier']}, experts {', '.join(spec['experts'])}")
+            ans = input("[a]pprove, [r]eject, [s]kip? ").strip().lower()
+            if ans in ("a", "r"):
+                decide(p["name"], p["n"], ans == "a", input("note (optional): ").strip())
+        if not cat.proposals():
+            print("No proposals waiting.")
+    elif a in ("approve", "reject"):
+        if len(rest) < 2 or not rest[1].isdigit():
+            raise SystemExit(f"usage: canarchist tools {a} <name> <proposal number> [note]")
+        decide(rest[0], int(rest[1]), a == "approve", " ".join(rest[2:]))
+    elif a == "retire":
+        cat.retire(rest[0], by)
+        print(f"{rest[0]} retired.")
+    elif a == "trust-new-binary":
+        name = rest[0] if rest else ""
+        jail = PathJail([*cfg.evidence_roots, cfg.cases_dir])
+        sandbox = toolspecs.Sandbox(str((cfg.raw.get("tool_onboarding") or {}).get("sandbox", "bwrap")))
+        out = asyncio.run(toolspecs.retest(cat, name, jail, cfg.cases_dir / "_tool_retests", sandbox))
+        print(json.dumps(out, indent=1, default=str))
+        if out["sha256_now"] == out["sha256_approved"] and out["pinned_now"] == out["pinned_approved"]:
+            print("The binary and its pinned data are the approved ones; nothing to trust.")
+        elif input(f"{'The golden trials match.' if out['all_same'] else 'The golden trials DIFFER (see above).'} "
+                   f"Trust the binary {out['sha256_now']} and its pinned data {out['pinned_now'] or '(none)'}? [y/N] "
+                   ).strip().lower() == "y":
+            cat.trust_binary(name, out["sha256_now"], by, out["golden"], pinned=out["pinned_now"])
+            print(f"{name} is active again.")
+    else:
+        raise SystemExit("usage: canarchist tools list|review|approve|reject|retire|trust-new-binary")
+
+
 def cmd_skills(args) -> None:
     from .audit import AuditLog
     from .skills import SkillStore
@@ -555,6 +621,9 @@ def main(argv: list[str] | None = None) -> None:
     hp.add_argument("id", nargs="?")
     hp.add_argument("--case")
     hp.add_argument("--yes", action="store_true", help="delete without the confirmation prompt")
+    tl = sub.add_parser("tools", help="onboarded tools: list, review proposals, approve/reject, retire, trust a changed binary")
+    tl.add_argument("action", choices=["list", "review", "approve", "reject", "retire", "trust-new-binary"])
+    tl.add_argument("rest", nargs="*")
     sk = sub.add_parser("skills", help="expert skills: list, review proposals, approve, roll back, export/import SKILL.md")
     sk.add_argument("action", choices=["list", "pending", "show", "review", "approve", "reject", "rollback", "retire",
                                        "restore", "export", "import"])
@@ -597,7 +666,7 @@ def main(argv: list[str] | None = None) -> None:
             try:
                 say(await h.operation("mission", lambda: h.mission(text, args.mission, args.playbook or ""),
                                       args.playbook or "mission", args.playbook or ""))
-                if args.retro:
+                if args.retro and not h.retro_ran_auto:
                     say(await h.operation("retro", h.retro, "after-action review"))
             except Exception as e:  # model server or connector failure: one clear line, not a traceback
                 _end_live()
@@ -622,6 +691,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_memory(args)
     elif args.cmd == "history":
         cmd_history(args)
+    elif args.cmd == "tools":
+        cmd_tools(args)
     elif args.cmd == "skills":
         cmd_skills(args)
     elif args.cmd == "attack":

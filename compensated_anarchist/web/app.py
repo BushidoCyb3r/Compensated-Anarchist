@@ -104,6 +104,7 @@ class Dashboard:
         self.pending: dict[str, dict[str, Any]] = {}
         self.run_task: asyncio.Task | None = None
         self.run_label = ""
+        self.last_ok = False  # the last stage of the run completed (an automatic review may follow it)
         self.shutting_down = False  # the dashboard is stopping: a running operation is interrupted, not stopped
         self.interrupted: dict[str, Any] | None = None  # the open conversation's operation cut off by a restart
         self.harness = harness or Harness(cfg, case_id, model, posture, interactive=True, on_event=self.emit)
@@ -459,12 +460,25 @@ class Dashboard:
         self.run_label = label
 
         async def runner():
+            await stage(label, coro_factory, kind)
+            # a completed playbook mission is reviewed by itself (learning.auto_retro), in the same run
+            if kind in ("mission", "resume") and h.op is None and self.last_ok and (why := h.auto_retro_due(playbook)):
+                review = "after-action review (automatic)"
+                h.op_begin("retro", review)
+                self.run_label = review
+                h.emit("retro_auto", {"why": why})
+                await stage(review, h.retro, "retro")
+
+        async def stage(label: str, coro_factory, kind: str) -> None:
+            self.last_ok = False
             self.emit("run_start", {"label": label, "resumed": kind == "resume"})
             t0 = time.monotonic()
             try:
                 text = await coro_factory()
                 h.op_end("done")
-                h.emit("run_end", {"label": label, "ok": True, "text": text, "seconds": round(time.monotonic() - t0, 1)})
+                self.last_ok = True
+                h.emit("run_end", {"label": label, "ok": True, "text": text, "seconds": round(time.monotonic() - t0, 1),
+                                   **({"learning": self.learning_counts()} if kind == "retro" else {})})
             except asyncio.CancelledError:
                 if self.shutting_down:  # the agents' checkpoints and pending approvals are kept for a resume
                     h.op_end("interrupted")
@@ -508,6 +522,27 @@ class Dashboard:
             if sa.agent and sa.status in ("running", "queued"):
                 sa.status = "interrupted"
                 sa.agent.repair(reason)
+
+    def learning(self, scope: str) -> tuple[list[dict[str, Any]], ...]:
+        """What waits for review: (memory candidates, skill versions, tool proposals) from this conversation, this
+        case, or anywhere."""
+        h = self.harness
+        conv = h.conversation["id"] if h.conversation else ""
+        cat = h.onboarding.catalog if getattr(h, "onboarding", None) else None
+        skills, tools = h.skills.pending(), cat.proposals() if cat else []
+        if scope == "conversation":
+            if not conv:
+                return [], [], [], []
+            return (h.memory.pending(conversation_id=conv), [v for v in skills if v.get("conversation_id") == conv],
+                    [p for p in tools if p.get("conversation_id") == conv], [])
+        if scope == "case":
+            return (h.memory.pending(case_id=h.case.id), [v for v in skills if v.get("case_id") == h.case.id],
+                    [p for p in tools if p.get("case_id") == h.case.id], [])
+        blocked = [t for t in cat.tools() if t.get("status") == "blocked"] if cat else []  # a changed binary to decide on
+        return h.memory.pending(), skills, tools, blocked
+
+    def learning_counts(self) -> dict[str, int]:
+        return {scope: sum(map(len, self.learning(scope))) for scope in ("conversation", "case", "all")}
 
     def running(self) -> bool:
         return bool(self.run_task and not self.run_task.done())
@@ -615,6 +650,7 @@ class Dashboard:
             "ui": {"classification": self.ui["classification"], "classification_source": self.classification_source(),
                    "classification_default": self.config_classification, "name": NAME, "version": __version__},
             "skills": h.skills.stats(),
+            "learning": self.learning_counts(),
             "memory": h.memory.stats(),
             "running": bool(self.run_task and not self.run_task.done()),
             "run_label": self.run_label,
@@ -948,10 +984,64 @@ def create_app(dash: Dashboard) -> Starlette:
 
     async def memory_action(request: Request) -> Response:
         d = await body(request)
-        status = {"promote": "approved", "reject": "rejected", "retire": "retired"}[str(d["action"])]
-        ok = dash.harness.memory.set_status(int(request.path_params["mid"]), status, dash.cfg.operator)
-        dash.emit("memory_updated", {"id": request.path_params["mid"], "status": status})
+        mid, action = int(request.path_params["mid"]), str(d["action"])
+        mem = dash.harness.memory
+        if action == "edit":  # the analyst's correction; "approve": true also approves it in the same step
+            ok = mem.edit(mid, str(d.get("title", "")), str(d.get("content", "")), user_of(request))
+            status = "approved" if ok and d.get("approve") else ""
+            if status:
+                mem.set_status(mid, status, user_of(request))
+        else:
+            status = {"promote": "approved", "reject": "rejected", "retire": "retired"}[action]
+            ok = mem.set_status(mid, status, user_of(request))
+        dash.emit("memory_updated", {"id": mid, "status": status or "edited"})
         return JSONResponse({"ok": ok})
+
+    async def learning(request: Request) -> Response:
+        """The review queue: memory candidates and skill changes, from this conversation, this case or anywhere."""
+        from ..skills import needs_revision, track_record
+
+        scope = request.query_params.get("scope", "conversation")
+        if scope not in ("conversation", "case", "all"):
+            raise ValueError("scope: conversation, case or all")
+        mems, versions, proposals, blocked = dash.learning(scope)
+        st = dash.harness.skills
+        names = {v["name"] for v in versions}
+        skills = [r | {"track_record": track_record(r), "needs_revision": needs_revision(r)}
+                  for r in st.list(include_retired=True) if r["name"] in names]
+        return JSONResponse({"scope": scope, "case": dash.harness.case.id, "memories": mems,
+                             "pending": [v | {"diff": st.diff(v["id"])} for v in versions], "skills": skills,
+                             "tools": proposals, "blocked": blocked, "sandbox": dash.harness.onboarding.sandbox.describe(False),
+                             "counts": dash.learning_counts()})
+
+    async def onboarded(request: Request) -> Response:
+        cat = dash.harness.onboarding.catalog
+        return JSONResponse({"tools": cat.tools(), "proposals": len(cat.proposals())})
+
+    async def tool_decision(request: Request) -> Response:
+        d = await body(request)
+        action = str(d.get("action"))
+        if action not in ("approve", "reject"):
+            raise ValueError("action: approve or reject")
+        meta = await asyncio.to_thread(dash.harness.onboarding.decide, request.path_params["name"], int(request.path_params["n"]),
+                                       action == "approve", user_of(request), str(d.get("note", ""))[:1000])
+        dash.emit("skills_updated", {})  # the usage skills came with it; the Learning page re-reads
+        return JSONResponse({"ok": True, "status": meta["status"]})
+
+    async def tool_retest(request: Request) -> Response:
+        """Re-run a blocked tool's golden trials against its changed binary, in the sandbox, for the analyst."""
+        return JSONResponse(await dash.harness.onboarding.retest(request.path_params["name"]))
+
+    async def tool_trust(request: Request) -> Response:
+        d = await body(request)
+        dash.harness.onboarding.trust(request.path_params["name"], str(d.get("sha256", "")), user_of(request))
+        dash.emit("skills_updated", {})
+        return JSONResponse({"ok": True})
+
+    async def tool_retire(request: Request) -> Response:
+        dash.harness.onboarding.catalog.retire(request.path_params["name"], user_of(request))
+        dash.emit("skills_updated", {})
+        return JSONResponse({"ok": True})
 
     async def retro(request: Request) -> Response:
         if not dash.start_run("after-action review", dash.harness.retro, kind="retro"):
@@ -1139,6 +1229,12 @@ def create_app(dash: Dashboard) -> Starlette:
         Route("/api/verdict", guard(verdict, True), methods=["POST"]),
         Route("/api/remember", guard(remember, True), methods=["POST"]),
         Route("/api/memory/{mid:int}", guard(memory_action, True), methods=["POST"]),
+        Route("/api/learning", guard(learning)),
+        Route("/api/tools/onboarded", guard(onboarded)),
+        Route("/api/tools/onboarded/{name}/retire", guard(tool_retire, True), methods=["POST"]),
+        Route("/api/tools/onboarded/{name}/retest", guard(tool_retest, True), methods=["POST"]),
+        Route("/api/tools/onboarded/{name}/trust", guard(tool_trust, True), methods=["POST"]),
+        Route("/api/tools/proposals/{name}/{n:int}", guard(tool_decision, True), methods=["POST"]),
         Route("/api/retro", guard(retro, True), methods=["POST"]),
         Route("/api/rate", guard(rate, True), methods=["POST"]),
         Route("/api/model", guard(model, True), methods=["POST"]),

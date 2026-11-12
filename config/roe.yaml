@@ -57,6 +57,11 @@ rules:
   - {match: "local_plaso_timeline", tier: notify, note: "long-running"}
   - {match: "local_leapp", tier: notify, note: "long-running mobile parse"}
   - {match: "local_*",  tier: auto}
+  # --- tool onboarding: running a tool that is not approved yet (sandboxed) needs the analyst, every time ---
+  - {match: "onboard_help",    tier: approve, observe: ask, note: "runs a new binary's help/version in the sandbox (no network, read-only)"}
+  - {match: "onboard_trial",   tier: approve, observe: ask, note: "runs a draft tool on sample evidence in the sandbox (no network, read-only)"}
+  - {match: "onboard_propose", tier: notify, note: "submits an onboarding proposal for the analyst to review"}
+  - {match: "onboard_*",       tier: auto}
 
   # --- SIEM / NSM connectors (read-only by construction) ------------------
   - {match: "security_onion__*", tier: auto}

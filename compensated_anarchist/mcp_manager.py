@@ -83,9 +83,11 @@ class McpManager:
                 exclude = set(spec.get("exclude_tools") or [])
                 tools = [t for t in listing.tools if (not include or t.name in include) and t.name not in exclude]
                 for t in tools:
-                    registry.add(self._wrap(name, client, t))
+                    tool = self._wrap(name, client, t)
+                    tool.quarantined = bool(spec.get("quarantine"))  # listed for onboarding, not callable
+                    registry.add(tool)
                 self.clients[name] = client
-                self.status[name] = f"connected ({len(tools)} tools)"
+                self.status[name] = f"connected ({len(tools)} tools)" + (", in quarantine" if spec.get("quarantine") else "")
             except Exception as e:  # one broken connector must not take down the harness
                 self.status[name] = f"FAILED: {type(e).__name__}: {e}"
                 log.warning("MCP server %s failed to start: %s", name, e)

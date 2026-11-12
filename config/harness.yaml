@@ -84,6 +84,27 @@ orchestration:
                "local_case_evidence", "hunt_plan_list", "cte_plan_list", "report_list"]
 
 # ---------------------------------------------------------------------------
+# Learning: the after-action review turns an operation into memories and skill changes for you to review
+# (dashboard: Learning). It uses model time, so turn it off on a slow local model.
+# ---------------------------------------------------------------------------
+learning:
+  auto_retro: true           # run the after-action review by itself when a playbook mission completes
+  every_n_missions: 0        # also after every N completed missions without a playbook (0 = never)
+  # Never automatic in a conversation where every action needs your approval (the vulnerability assessment):
+  # run it yourself there, and approve each step.
+
+# ---------------------------------------------------------------------------
+# Tool onboarding: the tool_integrator turns a tool you supplied into a declarative adapter, and nothing is usable
+# until you approve the proposal (dashboard: Learning; CLI: canarchist tools). Every run of a tool that is not
+# approved yet waits for your approval, and every run of any onboarded tool happens in the sandbox.
+# ---------------------------------------------------------------------------
+tool_onboarding:
+  specs_dir: ../tool_specs   # approved adapters, proposals and trial runs (git-ignored)
+  tool_roots: [/opt, /usr/local, ~/tools]  # put tools you supply here: the integrator looks nowhere else
+  sandbox: bwrap             # bubblewrap: no network, read-only system, only the tool's folder and its evidence
+                             # visible, writes only to its output folder | none (not recommended)
+
+# ---------------------------------------------------------------------------
 # Expert skills: versioned procedures the team writes, uses, scores and revises (stored in the memory DB)
 # ---------------------------------------------------------------------------
 skills:
@@ -245,6 +266,8 @@ mcp_servers:
   #   command: /opt/mcp/misp-mcp
   #   args: []
   #   env: {MISP_URL: "${MISP_URL}", MISP_KEY: "${MISP_KEY}"}
+  #   quarantine: true   # a new server: its tools are listed but cannot be called, and its annotations are not
+  #                      # trusted, until you approve an onboarding proposal that gives each tool a tier and experts
 
 # ---------------------------------------------------------------------------
 # Local forensic tooling

@@ -41,7 +41,7 @@ from .mcp_manager import McpManager
 from .memory import Memory
 from .roe import RoeGate, cli_approver, deny_all_approver
 from .skills import BUILTIN_DIR, LEAD, SkillStore, skill_tools
-from . import attack, casefiles, cte, huntplans, reports, vault
+from . import attack, casefiles, cte, huntplans, reports, toolspecs, vault
 from .tools import vulnscan
 from .tools.forensics import Forensics
 from .tools.registry import CURRENT_CALL, Tool, ToolExecutor, ToolRegistry, schema
@@ -533,6 +533,8 @@ class Harness:
         self.audit = AuditLog(self.case.dir / "audit.jsonl", cfg.operator)
         self.memory = Memory(cfg.memory_db, cfg.memory, self.audit)
         self.memory.case_id = case_id
+        self.retro_ran_auto = False  # the CLI's --retro is not run twice
+        self.memory.conversation_of = lambda: self.conversation["id"] if self.conversation else ""
         self.skills = SkillStore(cfg.memory_db, cfg.skills, self.audit)
         self.skills.import_dir(BUILTIN_DIR, "built-in", only_new=True)  # shipped skills, e.g. ponytail for code_writer
         self.history = ChatStore(cfg.history_db)
@@ -689,6 +691,9 @@ class Harness:
                            case_folder=self.case_evidence_dir, vault_dir=self.vault_dir).tools():
             self.registry.add(t)
         await self.mcp.start(self.registry)
+        self.onboarding = toolspecs.Onboarding(self)
+        for t in self.onboarding.tools():
+            self.registry.add(t)
         self.attack = attack.AttackKB(self.cfg.attack_paths)  # loaded on first use
         for t in attack.tools(self.attack, lambda: self.hunt_plans_dir,
                               lambda: [k for k, v in self.mcp.status.items() if str(v).startswith("connected")],
@@ -712,6 +717,7 @@ class Harness:
         for t in vt.tools():
             self.registry.add(t)
         self._register_orchestration()
+        self.onboarding.activate_all()  # approved tools and MCP servers, after every other tool is registered
         self.audit.record("session_start", session=self.session, model=self.model_name, posture=self.roe.posture,
                           mcp=self.mcp.status, experts=list(self.experts))
         self.lead = self._new_lead()
@@ -1138,11 +1144,7 @@ class Harness:
         assert self.lead
         self.refresh_models()
         self.emit("retro_start", {})
-        for d in self.executor.denials:  # analyst-authored corrections are trusted immediately
-            self.memory.add("feedback", f"Analyst denied {d['tool']}",
-                            f"Agent {d['agent']} requested {d['tool']} with {json.dumps(d['args'])[:400]}. {d['reason']}",
-                            tags=[d["tool"]], source="analyst")
-        self.executor.denials.clear()
+        self._learn_denials()
         verdicts = "\n".join(f"{f['id']} {f['title']}: {f['verdict']} {f.get('verdict_note', '')}"
                              for f in self.case.data["findings"] if f["verdict"] != "unreviewed") or "(none yet)"
         conv_id = self._conv()["id"]
@@ -1167,8 +1169,25 @@ class Harness:
                          for s in self.skills.struggling()) or "(none)"
         prompt = (_prompt("retro") + f"\n\n# Analyst verdicts on findings\n{verdicts}\n\n# Skill use in this operation\n{used}"
                   f"\n\n# Skills with a poor track record (revise or replace)\n{weak}"
-                  f"\n\n# Subagent reflections\n" + ("\n".join(reflections) or "(no subagents reflected)"))
+                  f"\n\n# Subagent reflections\n" + ("\n".join(reflections) or "(no subagents reflected)")
+                  + f"\n\n# Plans and reports the analyst edited after an agent saved them\n{self._analyst_edits()}"
+                  + f"\n\n# Unreviewed memories written in this conversation\n{self._unreviewed_block(conv_id)}")
         return await self.lead.turn(prompt)
+
+    def _analyst_edits(self, budget: int = 12000) -> str:
+        """The analyst's changes to files agents saved (hunt plans, results, CTE plans, reports), as diffs."""
+        out: list[str] = []
+        for folder in self.plan_dirs:
+            for path in sorted(folder.glob("*.md")) if folder.is_dir() else []:
+                if huntplans.edited(path) and budget > 0:
+                    diff = huntplans.analyst_changes(folder, path.name, min(4000, budget))
+                    out.append(diff)
+                    budget -= len(diff)
+        return "\n\n".join(out) or "(none)"
+
+    def _unreviewed_block(self, conv_id: str) -> str:
+        rows = self.memory.pending(conversation_id=conv_id)[:40]
+        return "\n".join(f"- M{m['id']} ({m['kind']}) {m['title']}: {m['content'][:300]}" for m in rows) or "(none)"
 
     # ---- operations: recorded, so one cut off by a restart or a crash can be resumed or ended ------------
     def op_begin(self, kind: str, label: str, playbook: str = "") -> dict[str, Any]:
@@ -1179,8 +1198,31 @@ class Harness:
         self.op = self.history.op_create(self._conv()["id"], kind, label, playbook, os.getpid(), time.time())
         return self.op
 
+    def _learn_denials(self) -> None:
+        """The analyst's denials are corrections: trusted at once, as approved feedback memories."""
+        for d in self.executor.denials:
+            self.memory.add("feedback", f"Analyst denied {d['tool']}",
+                            f"Agent {d['agent']} requested {d['tool']} with {json.dumps(d['args'])[:400]}. {d['reason']}",
+                            tags=[d["tool"]], source="analyst")
+        self.executor.denials.clear()
+
+    def auto_retro_due(self, playbook: str = "") -> str:
+        """Why an after-action review should now run by itself (learning.auto_retro), or "". Never in a conversation
+        where every action needs the analyst's approval: there the analyst runs it, and approves each step."""
+        cfg = self.cfg.learning
+        if not cfg.get("auto_retro", False) or self.gate_reason or not self.conversation:
+            return ""
+        if playbook:
+            return f"the {playbook.replace('_', ' ')} playbook completed"
+        n = int(cfg.get("every_n_missions", 0) or 0)
+        done = [o for o in self.history.ops_since(self.conversation["id"], "retro")
+                if o["kind"] in ("mission", "resume") and o["status"] == "done"]
+        return f"{len(done)} missions completed since the last review" if n > 0 and len(done) >= n else ""
+
     def op_end(self, status: str, note: str = "") -> None:
         """done | stopped | failed; interrupted (a shutdown or crash cut it off: it can be resumed)."""
+        if status != "interrupted":
+            self._learn_denials()
         if not self.op:
             return
         self.history.op_update(self.op["id"], status=status, note=note[:500],
@@ -1261,6 +1303,11 @@ class Harness:
             self.op_end("failed", f"{type(e).__name__}: {e}")
             raise
         self.op_end("done")
+        if kind in ("mission", "resume") and (why := self.auto_retro_due(playbook)):
+            self.emit("retro_auto", {"why": why})
+            self.retro_ran_auto = True
+            out = f"{out}\n\n# After-action review (automatic: {why})\n\n" + \
+                await self.operation("retro", self.retro, "after-action review (automatic)")
         return out
 
     def set_verdict(self, finding_id: str, verdict: str, note: str = "") -> bool:
@@ -1274,6 +1321,9 @@ class Harness:
         if verdict in ("fp", "benign"):
             self.memory.add("false_positive", f"Benign: {f['title']}", f"{f['description'][:800]}\nAnalyst: {note}",
                             tags=f["attack_techniques"], source="analyst")
+        elif verdict == "tp":  # tradecraft confirmed in this network
+            self.memory.add("ttp", f"Confirmed: {f['title']}", f"{f['description'][:800]}\nAnalyst: {note}",
+                            tags=f["attack_techniques"], attack_techniques=f["attack_techniques"], source="analyst")
         return True
 
     def remember(self, kind: str, title: str, content: str) -> int:
@@ -1286,6 +1336,11 @@ class Harness:
         self.case._save()
         settled = self.skills.settle_conversation(self.conversation["id"], rating) if self.conversation else 0
         self.audit.record("session_rating", session=self.session, rating=rating, note=note, skill_uses_settled=settled)
+        if len(note.split()) >= 5:  # a comment on how it went (not just "good") is guidance for the next operation
+            mission = str(self.case.data.get("mission") or "")[:200]
+            self.memory.add("feedback", f"Analyst rated an operation {rating}/5: {note.strip().splitlines()[0][:80]}",
+                            f"Rating {rating}/5 for the operation \"{mission}\". The analyst said: {note.strip()}",
+                            source="analyst")
 
     def switch_model(self, name: str) -> None:
         self.cfg.reload_models()
