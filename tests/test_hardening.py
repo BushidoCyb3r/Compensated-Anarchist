@@ -55,3 +55,14 @@ def test_scope_resolution(tmp_path):
     # read-only tools are never blocked by scope (querying about anything is fine)
     d = run("velociraptor__client_info", "C.9999999999999999")
     assert d.allowed and d.tier == "auto"
+
+
+def test_local_run_tiers_for_static_parsers(tmp_path):
+    """olevba and pescan only read and print: notify. Tools that can load plugin, decoder or signature scripts, or
+    write files, stay at approve, and the approval note tells the analyst what to look for."""
+    g = gate(tmp_path, [])
+    tier = lambda binary: g.classify("local_run", {"binary": binary, "args": ["/x/sample.doc"]})  # noqa: E731
+    assert tier("olevba")[0] == "notify" and tier("pescan")[0] == "notify" and tier("fls")[0] == "notify"
+    for b in ("oledump.py", "pdfid.py", "pdf-parser.py", "diec", "densityscout"):
+        t, why = tier(b)
+        assert t == "approve" and "--plugins" in why, b

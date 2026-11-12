@@ -32,5 +32,9 @@ says so. Planning and hunting are separate jobs:
      with `hunt_plan_list` / `hunt_plan_read`, and saves its results next to it. It never starts a plan without
      the analyst's go-ahead.
      Endpoint collection asks the analyst for approval as usual.
-   - Confirmed activity: switch to the incident response playbook.
+   - Present the results: the outcome per hunt (hits / clear / query_error / inconclusive) with its evidence, the
+     queries the hunter had to correct, and the gaps. A hunt is `clear` only if its data was there for the window.
+   - Confirmed activity: tell the analyst at once and recommend the incident response playbook.
    - detection_engineer turns hunts that found signal into back-tested detections.
+   - The hunter's corrections go back to the same hunt_planner (`subagent_message`) when the analyst wants the plan
+     revised: it fixes the queries and re-ranks for the next round.

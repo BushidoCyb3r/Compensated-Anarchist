@@ -17,7 +17,7 @@ and the expert team **writes, scores and revises its own skills** as it works.
      |  subagent_spawn / subagent_message  ->  SA-001, SA-002 ... (parallel)       |
      |  <- structured reports (status, bottom line, evidence, recommended tasks)   |
      |  experts: alert_triage threat_hunter network_analyst endpoint_analyst       |
-     |  forensicator malware_analyst cti_analyst incident_responder                |
+     |  forensicator malware_analyst cti_analyst incident_responder cte_planner    |
      |  detection_engineer reporter hunt_planner vuln_assessor code_writer         |
      |                                       each with its own versioned skills    |
      +-----------------------------------------------------------------------------+
@@ -273,6 +273,64 @@ are all installed (nmap, nuclei, nikto, testssl.sh, sslscan, enum4linux-ng, what
 - **Limits:** no exploitation, password attacks or denial of service, by design. Configure the allowlist, extra
   refused options and timeouts under `vuln_assessment:` in `harness.yaml`.
 
+## Threat emulation plans (defensive, plans only)
+
+The `cte_plan` playbook and the `cte_planner` expert plan a cyber threat emulation that tests whether your sensors
+detect an adversary. You give two things: **the adversary** (a name, alias or ATT&CK G-id) and **the network** (its
+type, or a map dropped into `cases/<id>/cte_plans/maps/`: CSV asset list, nmap XML, draw.io, Visio `.vsdx` or text,
+all read with the standard library). The planner does the rest and asks only when one of the two is missing or
+ambiguous.
+
+- **Plans only, no exploitation.** It never runs anything and writes no exploit code or commands. Steps name the
+  emulation tool by reference: an Atomic Red Team test number (from a local checkout, `cte.atomics_dir`) or a Mythic
+  command. Exploitation (T1190, T1203, T1068, T1210-T1212, T1189) and destructive or disruptive impact are listed
+  as **not emulated**, each with its detection opportunity.
+- **Every step traces to ATT&CK** for that adversary, to your intel (`intel: <source>`), or to you
+  (`analyst-added`). `cte_plan_save` checks the plan against the ATT&CK data and refuses one that breaks these
+  rules. It needs the ATT&CK file (`data/attack/enterprise-attack.json`).
+- **Each step** gives the documented procedure, the target systems, prerequisites, expected artifacts, the
+  detection opportunity on the connected sensors (telemetry gaps are listed), success criteria and cleanup. The
+  plan also has scope, deconfliction and stop conditions, and an ATT&CK Navigator layer.
+- **After your operators run it**, the threat_hunter checks what was detected and the planner saves
+  `cte_results_<adversary>.md` (detected / partially / missed per step). Missed steps go to the
+  detection_engineer, and the planner remembers them for the next plan.
+
+## Reports from mission data only
+
+The `report` playbook and the `reporter` expert write reports in your format from this mission's data, and nothing
+else.
+
+- **Your format.** Drop old reports into `reports/examples/<report type>/` (`.docx`, `.md`, `.txt`; git-ignored).
+  The reporter derives a template per type (`report-template-<type>`, a skill you approve) from sections, order,
+  required fields, tables, tone and length. Old reports are format only: never a fact source.
+- **Mission data only, every fact cited.** Sources are the case record, your answers (analyst statements), the
+  conversations and tool results, and the case's files. `report_save` checks each draft before saving it: every
+  citation exists; every IP, hash, domain, path, CVE, T-code, timestamp, reference number, count and `code` value
+  is in a cited source; nothing factual is uncited; no value from the example reports leaks in; classification
+  markings appear only if you gave them. A draft that fails is not saved.
+- **Ask, don't guess.** What the data can't support goes in the draft's Questions / gaps section and comes back to
+  you as questions. Your answers are recorded as statements (`STA-nnnn`, quoted from your own messages) and cited.
+- **Versions and final.** Drafts are `cases/<id>/reports/report_<name>_v<N>.md`. You can edit them; the reporter
+  reads your edits and proposes lessons. `report_finalize` saves the final copy and needs your approval.
+
+## Code for the mission (written, reviewed, never run)
+
+The `code` playbook and the `code_writer` expert write the scripts, parsers, Velociraptor VQL artifacts and analyst
+tools a mission needs.
+
+- **Written against reality:** real field names (`field_values`), a real sample of the input from the case evidence,
+  and existing Velociraptor artifacts. Unknown platform facts become a question, not a guess.
+- **Secure and simple by design:** two always-on skills, `ponytail` (the smallest complete change) and `dco-code`:
+  - a short design before coding;
+  - evidence treated as hostile input (no eval, no shell, validated and size-capped);
+  - path, secret, output-escaping and privilege rules;
+  - read-only by default, with a dry run and an explicit flag for anything that changes a host;
+  - a test on a fixture built from the real sample.
+- **Reviewed by a second code writer**, never the author, against the requirements and a secure-coding checklist.
+  The author fixes what it finds; earlier versions stay in the case's `artifacts/authored/older/`.
+- **Never run by the harness.** You get the files, the command for each, what it changes, the review result and the
+  remaining risks.
+
 ## Rules of engagement (`config/roe.yaml`)
 
 The ROE gate runs in code, so the model cannot talk its way past it.
@@ -330,12 +388,33 @@ The ROE gate runs in code, so the model cannot talk its way past it.
      the Skills tab). Skills are instructions to the team, and agents learn from attacker-controlled
      data. `skills.require_approval: false` turns auto-approve on.
    - **Always-on and shipped skills.** An expert's `skills:` frontmatter names skills loaded in full into
-     every brief, at their current approved version. Skills shipped in `compensated_anarchist/builtin_skills/`
-     are added once, approved, on first start; they never replace a version you revised or retired. The
-     **code_writer** expert ships with the ponytail skills (`ponytail` always on; `ponytail-review`,
-     `ponytail-audit`, `ponytail-debt` on demand), from https://github.com/DietrichGebert/ponytail
-     (MIT, (c) 2026 DietrichGebert; licence in `builtin_skills/code_writer/LICENSE-ponytail`). It writes
-     code to the case and never runs it.
+     every brief, at their current approved version. Each expert's definition holds its role, hard rules and
+     deliverable, which never change; its working method is an always-on skill, so the team can improve it
+     with your approval:
+
+     | Expert | Method skill |
+     |---|---|
+     | alert_triage | `alert-triage` |
+     | network_analyst | `nsm-analysis` |
+     | endpoint_analyst | `endpoint-investigation` |
+     | forensicator | `forensic-examination` |
+     | malware_analyst | `malware-static-triage` |
+     | cti_analyst | `cti-enrichment` |
+     | detection_engineer | `detection-engineering` |
+     | incident_responder | `incident-response-actions` |
+     | threat_hunter | `threat-hunting` |
+     | hunt_planner | `hunt-plan-build` |
+     | cte_planner | `cte-plan-build` |
+     | reporter | `report-writing` |
+     | code_writer | `ponytail`, `dco-code` |
+
+     The vuln_assessor keeps its method in its definition, fixed alongside its approval gate.
+     Skills shipped in `compensated_anarchist/builtin_skills/` are added, approved, on start. A shipped
+     skill follows the shipped text until anyone else touches it: once it has been revised, rolled back or
+     retired, or has a revision waiting, it is never replaced. The **code_writer**'s ponytail skills
+     (`ponytail` always on; `ponytail-review`, `ponytail-audit`, `ponytail-debt` on demand) come from
+     https://github.com/DietrichGebert/ponytail (MIT, (c) 2026 DietrichGebert; licence in
+     `builtin_skills/code_writer/LICENSE-ponytail`).
    - **Management.** Every version is kept for diff and rollback (`skills rollback <name> <v>`).
      `skills export <dir>` and `skills import <dir>` move them as SKILL.md files, for git or for
      analyst-written skills, which are approved on import.
@@ -351,7 +430,9 @@ compensated_anarchist/
   history.py        persistent conversations (feed + agent contexts), kept until deleted
   skills.py         expert skills: versions, review, retrieval, scoring, SKILL.md import/export
   roe.py audit.py   ROE gate + approvals, hash-chained audit log (safe for several writer processes)
-  memory.py case.py learning memory, case file / chain of custody / report
+  memory.py case.py learning memory, case file / chain of custody / analyst statements
+  cte.py            threat emulation planning: network maps, plan check, CTE plans folder
+  reports.py        report writer: example library, mission data sources, citation verifier, drafts
   llm/              openai_compat, anthropic, text-mode tool calling
   tools/            registry/executor, local forensics
   servers/          MCP servers: security_onion, splunk, elastic, velociraptor, misp, opencti

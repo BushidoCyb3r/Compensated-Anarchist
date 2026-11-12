@@ -5,7 +5,7 @@ cases/<CASE_ID>/
   audit.jsonl      hash-chained audit log
   transcripts/     full agent conversations (training data for local models)
   artifacts/       spilled tool output, tool-generated files (timelines, carved files...)
-  report.md        generated report
+  reports/         report drafts and finals (reports.py; report.md in older cases)
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import huntplans
 from .tools.registry import Tool, schema
 
 SEVERITIES = ["informational", "low", "medium", "high", "critical"]
@@ -48,9 +49,10 @@ class Case:
         self._lock = threading.Lock()
         if self.path.exists():
             self.data = json.loads(self.path.read_text())
+            self.data.setdefault("statements", [])
         else:
             self.data = {"id": case_id, "opened": _now(), "status": "open", "mission": "", "notes": [], "iocs": [],
-                         "timeline": [], "findings": [], "evidence": []}
+                         "timeline": [], "findings": [], "evidence": [], "statements": []}
             self._save()
 
     @property
@@ -112,10 +114,15 @@ class Case:
 
     def save_artifact(self, filename: str, content: str) -> str:
         name = re.sub(r"[^A-Za-z0-9_.-]", "_", filename).lstrip(".") or "artifact.txt"
-        out = self.artifacts / "authored" / name
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(content, encoding="utf-8")
-        return f"saved {out} ({len(content)} chars)"
+        folder = self.artifacts / "authored"
+        kept = (folder / name).exists()
+        out = huntplans.write_versioned(folder, name, content)  # an earlier version is kept in older/
+        return f"saved {out} ({len(content)} chars)" + ("; the earlier version is kept in older/" if kept else "")
+
+    def add_statement(self, question: str, answer: str, by: str, answered_at: str, event: str, topic: str = "") -> str:
+        """An analyst's answer to an agent's question, quoted from the analyst's own message (event)."""
+        return self._append("statements", {"question": question, "answer": answer, "topic": topic, "by": by,
+                                           "answered_at": answered_at, "event": event})
 
     def set_verdict(self, finding_id: str, verdict: str, note: str = "") -> bool:
         with self._lock:
@@ -138,39 +145,13 @@ class Case:
         lines += [f"  {e['event_time']} {e['host']} {e['description'][:100]}" for e in d["timeline"][-max_items:]]
         lines.append(f"\nEvidence ({len(d['evidence'])}):")
         lines += [f"  {e['id']} {e['path']} sha256={e['hashes']['sha256'][:16]}..." for e in d["evidence"]]
+        if d.get("statements"):
+            lines.append(f"\nAnalyst statements ({len(d['statements'])}):")
+            lines += [f"  {s['id']} {s['answered_at'][:16]} {s['by']}: {s['question'][:80]} -> {s['answer'][:120]}"
+                      for s in d["statements"][-max_items:]]
         lines.append(f"\nNotes ({len(d['notes'])}, latest 10):")
         lines += [f"  {n['ts'][:19]} {n['author']}: {n['text'][:160]}" for n in d["notes"][-10:]]
         return "\n".join(lines)
-
-    def write_report(self, executive_summary: str, analysis: str = "", recommendations: str = "") -> str:
-        d = self.data
-        sev_rank = {s: i for i, s in enumerate(SEVERITIES)}
-        findings = sorted(d["findings"], key=lambda f: -sev_rank.get(f["severity"], 0))
-        md = [f"# Incident / Operation Report - {d['id']}", "",
-              f"*Generated {_now()} by Compensated Anarchist. Case opened {d['opened']}.*", "",
-              "## Executive summary", executive_summary, ""]
-        if analysis:
-            md += ["## Analysis", analysis, ""]
-        md += ["## Findings", ""]
-        for f in findings:
-            md += [f"### {f['id']} - {f['title']}",
-                   f"- **Severity:** {f['severity']}  **Confidence:** {f['confidence']}  **Analyst verdict:** {f['verdict']}",
-                   f"- **ATT&CK:** {', '.join(f['attack_techniques']) or 'n/a'}",
-                   f"- **Affected assets:** {', '.join(f['affected_assets']) or 'n/a'}", "", f["description"], ""]
-            if f["recommended_actions"]:
-                md += ["**Recommended actions:**"] + [f"- {a}" for a in f["recommended_actions"]] + [""]
-        md += ["## Indicators of compromise", "", "| ID | Type | Value | Confidence | Context |", "|---|---|---|---|---|"]
-        md += [f"| {i['id']} | {i['type']} | `{i['value']}` | {i['confidence']} | {i['context'][:120]} |" for i in d["iocs"]]
-        md += ["", "## Timeline", "", "| Time (UTC) | Host | Event | Source | ATT&CK |", "|---|---|---|---|---|"]
-        md += [f"| {e['event_time']} | {e['host']} | {e['description'][:200]} | {e['source']} | {e['attack_technique']} |"
-               for e in d["timeline"]]
-        md += ["", "## Evidence register (chain of custody)", "", "| ID | Path | SHA-256 | Description |", "|---|---|---|---|"]
-        md += [f"| {e['id']} | {e['path']} | `{e['hashes']['sha256']}` | {e['description']} |" for e in d["evidence"]]
-        if recommendations:
-            md += ["", "## Recommendations", recommendations]
-        out = self.dir / "report.md"
-        out.write_text("\n".join(md))
-        return f"report written to {out}"
 
     # ---- tool definitions ---------------------------------------------------
     def tools(self) -> list[Tool]:
@@ -197,7 +178,4 @@ class Case:
                  schema({"filename": S, "content": S}, ["filename", "content"]), self.save_artifact),
             Tool("case_summary", "Show the current case state: findings, IOCs, timeline, evidence, notes.",
                  schema({}), lambda: self.summary()),
-            Tool("case_write_report", "Generate report.md from the case data plus your narrative sections (markdown).",
-                 schema({"executive_summary": S, "analysis": S, "recommendations": S}, ["executive_summary"]),
-                 self.write_report),
         ]

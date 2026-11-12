@@ -109,7 +109,8 @@ function fmtRel(v) {
 function fmtChars(n) { return n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} chars`; }
 function plural(n, w) { return `${n} ${w}${n === 1 ? "" : "s"}`; }
 function shortTitle(t) { return String(t || "").replace(/\s*\(.*\)\s*$/, ""); }
-function humanPb(p) { const s = String(p || "").replace(/_/g, " "); return s.charAt(0).toUpperCase() + s.slice(1); }
+const ACRONYMS = /\b(cte|cti|dco|ioc|ttp)\b/gi;
+function humanPb(p) { const s = String(p || "").replace(/_/g, " ").replace(ACRONYMS, (m) => m.toUpperCase()); return s.charAt(0).toUpperCase() + s.slice(1); }
 function firstLine(s, n = 160) { const l = String(s || "").replace(/^#+\s*/gm, "").split("\n").find((x) => x.trim()) || ""; return l.length > n ? l.slice(0, n - 1) + "…" : l; }
 function isTyping(t) { return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable); }
 
@@ -146,7 +147,7 @@ async function copyText(text) {
 /* ---------------------------------------------------------------- safe markdown -> DOM */
 function inline(text) {
   const frag = document.createDocumentFragment();
-  const re = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\*[^*\s][^*\n]*\*|(?:[\w.~-]*\/)*(?:hunt_plan_|hunt_results_|attack_layer_|vuln_report_)[\w.-]+\.(?:md|json))/g;
+  const re = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\*[^*\s][^*\n]*\*|(?:[\w.~-]*\/)*(?:hunt_plan_|hunt_results_|attack_layer_|vuln_report_|cte_plan_|cte_results_|report_)[\w.-]+\.(?:md|json))/g;
   let last = 0, m;
   while ((m = re.exec(text))) {
     if (m.index > last) frag.append(document.createTextNode(text.slice(last, m.index)));
@@ -246,6 +247,13 @@ const TOOL_LABELS = {
   skill_feedback: "Scored a skill", skill_list: "Listed skills", subagent_list: "Checked subagents", submit_report: "Submitted report",
   vuln_environment: "Checked the assessment toolkit", vuln_run: "Ran an assessment tool", vuln_parse: "Parsed scan output",
   vuln_report_save: "Saved the vulnerability report",
+  cte_network_map: "Read the network map", cte_plan_save: "Saved the CTE plan", cte_plan_check: "Checked the CTE plan",
+  cte_plan_list: "Listed CTE plans", cte_plan_read: "Read a CTE plan", cte_plan_changes: "Read your edits to a CTE plan",
+  cte_navigator_layer: "Saved an ATT&CK layer", cte_atomic_tests: "Looked up Atomic Red Team tests",
+  report_examples: "Listed example reports", report_example_read: "Read an example report (format only)",
+  report_sources: "Listed mission data", report_source: "Read mission data", report_verify: "Checked a draft",
+  report_save: "Saved a report draft", report_finalize: "Saved the final report", report_list: "Listed reports",
+  report_read: "Read a report", report_changes: "Read your edits to a report", case_analyst_statement: "Recorded your answer",
 };
 const SERVER_NAMES = { security_onion: "Security Onion", elastic: "Elastic", splunk: "Splunk", velociraptor: "Velociraptor",
   velociraptor_admin: "Velociraptor admin", misp: "MISP", opencti: "OpenCTI" };
@@ -257,6 +265,9 @@ const PB_DESC = {
   forensics: "Examine disk, memory or log evidence",
   hunt_plan: "Build an ATT&CK hunt plan for named threat actors, with queries for your tools",
   vulnerability_assessment: "Scan in-scope hosts for vulnerabilities and attack chains; every action needs your approval",
+  cte_plan: "Plan a threat emulation to test detection: name the adversary and the network (plans only)",
+  report: "Write a report from this mission's data only, in your format; asks you for anything missing",
+  code: "Write a script, parser or VQL artifact: tested on a real sample, reviewed by a second code writer, never run",
 };
 function toolLabel(name) {
   if (TOOL_LABELS[name]) return TOOL_LABELS[name];
@@ -1190,7 +1201,7 @@ function inspClose() { return el("button", { type: "button", class: "btn btn-gho
 function renderCase(box) {
   const c = S.st.case;
   const tabs = [["findings", "Findings", c.findings.length], ["iocs", "IOCs", c.iocs.length], ["timeline", "Timeline", c.timeline.length],
-    ["evidence", "Evidence", c.evidence.length], ["plans", "Plans & reports", S.plans ? S.plans.files.filter((f) => f.kind === "plan" || f.kind === "vuln_report").length : null],
+    ["evidence", "Evidence", c.evidence.length], ["plans", "Plans & reports", S.plans ? S.plans.files.filter((f) => PLAN_COUNTED.has(f.kind)).length : null],
     ["report", "Report", null]];
   box.append(el("div", { class: "insp-head" },
     el("div", { class: "t" }, el("strong", { text: `Case ${c.id}` }), el("span", { class: "muted small", text: c.mission ? firstLine(c.mission, 140) : "No mission recorded yet" })),
@@ -1270,27 +1281,36 @@ function caseEvidence(body, c) {
       el("div", { class: "muted small", text: [e.description, e.size ? `${e.size} bytes` : null, e.acquired_by].filter(Boolean).join(" · ") })));
   }
 }
+function folderRow(label, path, note) {
+  return [el("div", { class: "label", css: { marginTop: "6px" }, text: label }),
+    el("div", { class: "path-row" }, el("span", { class: "mono", text: path }),
+      el("button", { type: "button", class: "btn btn-ghost icon-btn btn-sm", "aria-label": `Copy ${label.toLowerCase()} path`, title: "Copy path", onclick: () => copyText(path) }, icon("copy", 14))),
+    note ? el("div", { class: "muted small", text: note }) : null];
+}
 function casePlans(body) {
-  const P = S.plans, folder = (P && P.folder) || (S.st && S.st.plans_folder) || "";
+  const P = S.plans, st = S.st || {};
+  const f = (k, k2) => (P && P[k]) || st[k2 || k] || "";
   body.append(el("div", { class: "card drop-card" },
-    el("div", { class: "label", text: "Hunt plans folder" }),
-    el("div", { class: "path-row" }, el("span", { class: "mono", text: folder }),
-      el("button", { type: "button", class: "btn btn-ghost icon-btn btn-sm", "aria-label": "Copy folder path", title: "Copy path", onclick: () => copyText(folder) }, icon("copy", 14))),
-    el("div", { class: "muted small", text: "The hunt planner saves plans and ATT&CK Navigator layers here. The threat hunter reads them and saves its results next to them, and hunts only when you ask." }),
-    P && P.vuln_folder ? el("div", { class: "label", css: { marginTop: "6px" }, text: "Vulnerability assessment folder" }) : null,
-    P && P.vuln_folder ? el("div", { class: "path-row" }, el("span", { class: "mono", text: P.vuln_folder }),
-      el("button", { type: "button", class: "btn btn-ghost icon-btn btn-sm", "aria-label": "Copy folder path", title: "Copy path", onclick: () => copyText(P.vuln_folder) }, icon("copy", 14))) : null,
+    ...folderRow("Hunt plans folder", f("folder", "plans_folder"), "The hunt planner saves plans and ATT&CK Navigator layers here. The threat hunter reads them and saves its results next to them, and hunts only when you ask."),
+    ...folderRow("CTE plans folder", f("cte_folder"), "Emulation plans (plans only: nothing is run). Drop a network map in maps/ (CSV, nmap XML, draw.io, Visio .vsdx or text)."),
+    ...folderRow("Reports folder", f("reports_folder"), "Report drafts, checked against the mission data, and finals you approve."),
+    ...folderRow("Example reports", f("examples_folder", "report_examples_folder"), "Your old reports, one folder per type (.docx, .md, .txt). Format only: never a source of facts."),
+    f("vuln_folder") ? folderRow("Vulnerability assessment folder", f("vuln_folder"), "") : [],
     el("div", { class: "toolbar" }, el("button", { type: "button", class: "btn btn-sm", onclick: () => setPlaybook("hunt_plan") }, icon("list", 14), "Plan a hunt"),
+      el("button", { type: "button", class: "btn btn-sm", onclick: () => setPlaybook("cte_plan") }, icon("list", 14), "Plan an emulation"),
+      el("button", { type: "button", class: "btn btn-sm", onclick: () => setPlaybook("report") }, icon("file", 14), "Write a report"),
       el("button", { type: "button", class: "btn btn-sm", onclick: () => setPlaybook("vulnerability_assessment") }, icon("shield", 14), "Assess vulnerabilities"))));
   if (!P) { body.append(el("div", { class: "empty", text: "Loading…" })); return; }
   if (!P.host.available && P.host.why) body.append(el("div", { class: "muted small plans-why", text: `Opening in an editor on the host: ${P.host.why}.` }));
-  if (!P.files.length) { body.append(el("div", { class: "empty", text: "No hunt plans or vulnerability reports yet. Pick the hunt plan or vulnerability assessment playbook." })); return; }
-  for (const f of P.files) body.append(planCard(f, true));
+  if (!P.files.length) { body.append(el("div", { class: "empty", text: "No plans or reports yet. Pick the hunt plan, emulation plan, report or vulnerability assessment playbook." })); return; }
+  for (const x of P.files) body.append(planCard(x, true));
 }
 
 /* ---------------------------------------------------------------- hunt plans: view, download, open in an editor */
-const PLAN_KIND = { plan: "Hunt plan", results: "Hunt results", layer: "ATT&CK Navigator layer", vuln_report: "Vulnerability report", other: "File" };
-const PLAN_FILE_RE = /^(hunt_plan_|hunt_results_|attack_layer_|vuln_report_)[\w.-]+\.(md|json)$/i;
+const PLAN_KIND = { plan: "Hunt plan", results: "Hunt results", layer: "ATT&CK Navigator layer", vuln_report: "Vulnerability report",
+  cte_plan: "CTE plan", cte_results: "CTE results", report: "Report draft", report_final: "Final report", other: "File" };
+const PLAN_COUNTED = new Set(["plan", "vuln_report", "cte_plan", "report", "report_final"]);
+const PLAN_FILE_RE = /^(hunt_plan_|hunt_results_|attack_layer_|vuln_report_|cte_plan_|cte_results_|report_)[\w.-]+\.(md|json)$/i;
 const LINK_NAMES = { vscode: "VS Code", obsidian: "Obsidian" };
 async function refreshPlans() {
   try { S.plans = await api("/api/plans"); } catch (e) { return; }
@@ -1300,8 +1320,9 @@ async function refreshPlans() {
 function planUrl(name, download) { return `/api/plans/${encodeURIComponent(name)}${download ? "?download=1" : ""}`; }
 function planPath(name) {
   const f = S.plans && S.plans.files.find((x) => x.name.toLowerCase() === name.toLowerCase());
-  const vuln = /^vuln_report_/i.test(name);
-  const folder = vuln ? (S.plans && S.plans.vuln_folder) || (S.st && S.st.vuln_folder) || ""
+  const key = /^vuln_report_/i.test(name) ? "vuln_folder" : /^(cte_|attack_layer_cte_)/i.test(name) ? "cte_folder"
+    : /^report_/i.test(name) ? "reports_folder" : "";
+  const folder = key ? (S.plans && S.plans[key]) || (S.st && S.st[key]) || ""
     : (S.plans && S.plans.folder) || (S.st && S.st.plans_folder) || "";
   return f ? f.path : folder ? `${folder}/${name}` : name;
 }
@@ -1361,7 +1382,8 @@ function planActions(name, withView = true) {
     el("button", { type: "button", class: "btn btn-ghost icon-btn btn-sm", "aria-label": "Copy path", title: "Copy path", onclick: () => copyText(planPath(name)) }, icon("copy", 14))].filter(Boolean);
 }
 function planCard(f, inPanel) {
-  const meta = inPanel ? [f.mtime ? fmtRel(f.mtime) : null, f.kind === "plan" ? (f.hunted ? "hunted" : "not hunted yet") : null].filter(Boolean).join(" · ") : "";
+  const meta = inPanel ? [f.mtime ? fmtRel(f.mtime) : null, f.kind === "plan" ? (f.hunted ? "hunted" : "not hunted yet") : null,
+    f.edited ? "edited by you" : null].filter(Boolean).join(" · ") : "";
   return el("div", { class: "file-card" + (inPanel ? " in-panel" : "") },
     el("div", { class: "head" }, el("span", { class: "ic" }, icon("file", 16)), el("span", { class: "kind", text: PLAN_KIND[f.kind] || "File" }),
       el("span", { class: "mono name", title: f.path || f.name, text: f.name })),
@@ -1382,12 +1404,12 @@ function fileRef(text) {
 }
 
 async function caseReport(body) {
-  const ask = el("button", { type: "button", class: "btn", onclick: () => send("Task the reporter to write the incident report from the case record now.", "") }, "Ask the reporter to draft it");
+  const ask = el("button", { type: "button", class: "btn", onclick: () => setPlaybook("report") }, "Ask the reporter to draft it");
   try {
     const text = await api("/api/report");
     if (text) body.append(el("div", { class: "toolbar" }, ask, el("button", { type: "button", class: "btn", onclick: () => copyText(text) }, icon("copy", 14), "Copy")), md(text));
     else body.append(el("div", { class: "empty" }, el("div", { css: { fontWeight: "500", color: "var(--text)" }, text: "No report yet" }),
-      el("p", { text: "The reporter drafts it from the case record: findings, timeline, IOCs and actions taken." }), ask));
+      el("p", { text: "The reporter drafts it from this mission's data only, cites every fact, and asks you for anything missing." }), ask));
   } catch (e) { body.append(el("div", { class: "empty", text: e.message })); }
 }
 function renderThread(box, s) {

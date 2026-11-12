@@ -44,6 +44,23 @@ vuln_assessment:
   # read_dirs: [/usr/share, /opt]   # absolute paths the tools may read (wordlists, templates)
 
 # ---------------------------------------------------------------------------
+# Cyber threat emulation planning (cte_planner expert, cte_plan playbook). Defensive and plans only: no
+# exploitation, no exploit code, nothing destructive, and the harness never runs an emulation. Steps name the
+# emulation tools below by reference (an Atomic Red Team test number, a Mythic command), never by code.
+# ---------------------------------------------------------------------------
+cte:
+  emulation_tools: [Atomic Red Team, Mythic]
+  # atomics_dir: /opt/atomic-red-team/atomics   # a local checkout, so steps name real test numbers (never downloaded
+                                                #   automatically; the plans show test names, not their commands)
+
+# ---------------------------------------------------------------------------
+# Reports (reporter expert, report playbook). Drop old reports into examples_dir/<report type>/ (.docx, .md,
+# .txt): they teach the format only and are never a source of facts. Default: reports/examples next to cases/.
+# ---------------------------------------------------------------------------
+reports: {}
+  # examples_dir: ../reports/examples
+
+# ---------------------------------------------------------------------------
 # Expert agents (definitions in compensated_anarchist/experts/*.md; add your own in extra_dir)
 # Route experts to different models: e.g. a big model for the lead/hunter, a small fast one for triage.
 # ---------------------------------------------------------------------------
@@ -64,7 +81,7 @@ orchestration:
   # Tool schemas are most of a prompt: the full set is ~80 tools / ~10K tokens, this list ~25 tools.
   # ["*"] gives the lead every tool (slow and memory-hungry on local models).
   lead_tools: ["subagent_*", "case_*", "memory_*", "*__alerts_summary", "*__notable_events", "*__list_clients",
-               "local_case_evidence", "hunt_plan_list"]
+               "local_case_evidence", "hunt_plan_list", "cte_plan_list", "report_list"]
 
 # ---------------------------------------------------------------------------
 # Expert skills: versioned procedures the team writes, uses, scores and revises (stored in the memory DB)

@@ -27,6 +27,7 @@ HELP = """
   <text>                       talk to the DCO lead (the orchestrator; it tasks expert subagents)
   /playbook <name> <details>   run a playbook: triage | hunt | hunt_plan | incident_response | compromise_assessment
                                | forensics | vulnerability_assessment (every action needs your approval)
+                               | cte_plan | report | code
   /experts                     list expert agents and their models
   /subagents                   subagents in this conversation (id, expert, status, last bottom line)
   /conversations               this case's saved conversations
@@ -77,7 +78,8 @@ def _event_line(kind: str, d: dict[str, Any]) -> str | None:
         return f"{C['m']}  APPROVAL MODE: {d['reason']}{C['x']}"
     elif kind == "plan_saved":
         label = {"plan": "hunt plan", "results": "hunt results", "layer": "ATT&CK Navigator layer",
-                 "vuln_report": "vulnerability report"}.get(d["kind"], "file")
+                 "vuln_report": "vulnerability report", "cte_plan": "CTE plan", "cte_results": "CTE results",
+                 "report": "report draft", "report_final": "final report"}.get(d["kind"], "file")
         return f"{C['c']}  saved {label}: {_file_link(d['path'])}{C['x']}"
     return None
 

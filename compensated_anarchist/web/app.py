@@ -475,6 +475,9 @@ class Dashboard:
             "vault_folder": str(h.vault_dir / "velociraptor"),
             "plans_folder": str(h.hunt_plans_dir),
             "vuln_folder": str(h.vuln_dir),
+            "cte_folder": str(h.cte_dir),
+            "reports_folder": str(h.reports_dir),
+            "report_examples_folder": str(h.report_examples_dir),
             "gated": h.gate_reason,
             "session": h.session,
             "operator": self.cfg.operator,
@@ -699,23 +702,28 @@ def create_app(dash: Dashboard) -> Starlette:
         return JSONResponse(rows)
 
     async def report(request: Request) -> Response:
-        p = dash.harness.case.dir / "report.md"
+        """The latest final report, else the latest verified draft, else report.md from before the report writer."""
+        h = dash.harness
+        drafts = sorted(h.reports_dir.glob("report_*.md"), key=lambda q: q.stat().st_mtime) if h.reports_dir.is_dir() else []
+        finals = [q for q in drafts if q.name.endswith("_final.md")]
+        p = finals[-1] if finals else drafts[-1] if drafts else h.case.dir / "report.md"
         return PlainTextResponse(p.read_text(encoding="utf-8") if p.exists() else "")
 
     # -- hunt plans folder: list, view/download, open in an editor --
     async def plans(request: Request) -> Response:
         h = dash.harness
         host = await asyncio.to_thread(dash.host_open, request)
-        files = sorted(huntplans.entries(h.hunt_plans_dir) + huntplans.entries(h.vuln_dir), key=lambda f: -f["mtime"])
-        return JSONResponse({"folder": str(h.hunt_plans_dir), "vuln_folder": str(h.vuln_dir), "files": files,
+        files = sorted((f for d in h.plan_dirs for f in huntplans.entries(d)), key=lambda f: -f["mtime"])
+        return JSONResponse({"folder": str(h.hunt_plans_dir), "vuln_folder": str(h.vuln_dir), "cte_folder": str(h.cte_dir),
+                             "reports_folder": str(h.reports_dir), "examples_folder": str(h.report_examples_dir), "files": files,
                              "host": host, "links": dash.editor_cfg["links"], "vscode_remote": dash.editor_cfg["vscode_remote"]})
 
     def plan_path(request: Request) -> Path | None:
-        """A file directly in the hunt plans folder or the vulnerability assessment folder (never raw/ or older/)."""
+        """A file directly in one of the case's plan and report folders (never raw/, older/ or maps/)."""
         name = request.path_params["name"]
-        return huntplans.find(dash.harness.hunt_plans_dir, name) or huntplans.find(dash.harness.vuln_dir, name)
+        return next((p for d in dash.harness.plan_dirs if (p := huntplans.find(d, name))), None)
 
-    NO_PLAN = {"error": "no such file in this case's hunt plans or vulnerability assessment folder"}
+    NO_PLAN = {"error": "no such file in this case's plans and reports folders"}
 
     async def plan_file(request: Request) -> Response:
         path = plan_path(request)

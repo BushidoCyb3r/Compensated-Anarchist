@@ -5,6 +5,7 @@ when the analyst asks; being able to read the folder does not start anything.
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 from datetime import datetime, timezone
@@ -23,24 +24,64 @@ def ensure(folder: Path) -> Path:
     return folder
 
 
-def slug(name: str) -> str:
+def slug(name: str, prefixes: tuple[str, ...] = ("hunt_plan_", "hunt_results_")) -> str:
     s = re.sub(r"\.md$", "", Path(name).name, flags=re.I)
-    s = re.sub(r"^(hunt_plan_|hunt_results_)", "", s)
+    for p in prefixes:
+        if s.lower().startswith(p):
+            s = s[len(p):]
+            break
     return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")[:80] or "plan"
+
+
+AGENT_COPY = ".agent"  # what the agent last saved, to tell the analyst's later edits apart
+
+
+def write_versioned(folder: Path, filename: str, content: str) -> Path:
+    """Write a file into the folder. An earlier version is kept in older/ with its timestamp, and a copy of what the
+    agent wrote goes to .agent/ so the analyst's later edits can be shown (analyst_changes) and learned from."""
+    folder = ensure(folder)
+    path = folder / Path(filename).name
+    if path.exists():
+        older = ensure(folder / "older")
+        stamp = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        os.replace(path, older / f"{path.stem}.{stamp}{path.suffix}")
+    path.write_text(content, encoding="utf-8")
+    (ensure(folder / AGENT_COPY) / path.name).write_text(content, encoding="utf-8")
+    return path
+
+
+def edited(path: Path) -> bool:
+    """True when the file was changed after the agent saved it (by the analyst, in an editor)."""
+    copy = path.parent / AGENT_COPY / path.name
+    try:
+        return copy.is_file() and copy.read_bytes() != path.read_bytes()
+    except OSError:
+        return False
+
+
+def analyst_changes(folder: Path, name: str, max_chars: int = 30000) -> str:
+    """A unified diff from what the agent saved to the file as it is now: the analyst's edits."""
+    path = find(folder, name)
+    if not path:
+        return f"No file named '{name}' in {folder}."
+    copy = path.parent / AGENT_COPY / path.name
+    if not copy.is_file():
+        return f"{path.name}: no agent-saved copy to compare with (it was not saved by an agent)."
+    old, new = copy.read_text(encoding="utf-8", errors="replace"), path.read_text(encoding="utf-8", errors="replace")
+    if old == new:
+        return f"{path.name}: unchanged since the agent saved it."
+    diff = "".join(difflib.unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True),
+                                        f"{path.name} (as the agent saved it)", f"{path.name} (as the analyst left it)"))
+    more = f"\n[... diff cut at {max_chars} characters]" if len(diff) > max_chars else ""
+    return (f"The analyst edited {path.name} after it was saved. Their changes (- removed, + added) show what they "
+            f"want done differently; they are the analyst's decisions.\n{diff[:max_chars]}{more}")
 
 
 def save(folder: Path, name: str, content: str, kind: str = "plan") -> Path:
     """Write a plan or results file; an earlier version is kept in older/ with its timestamp."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {list(KINDS)}")
-    folder = ensure(folder)
-    path = folder / f"{KINDS[kind]}{slug(name)}.md"
-    if path.exists():
-        older = ensure(folder / "older")
-        stamp = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        os.replace(path, older / f"{path.stem}.{stamp}.md")
-    path.write_text(content, encoding="utf-8")
-    return path
+    return write_versioned(folder, f"{KINDS[kind]}{slug(name)}.md", content)
 
 
 def title(p: Path) -> str:
@@ -54,10 +95,15 @@ def title(p: Path) -> str:
     return ""
 
 
+FILE_KINDS = (("hunt_plan_", "plan"), ("hunt_results_", "results"), ("attack_layer_", "layer"),
+              ("vuln_report_", "vuln_report"), ("cte_plan_", "cte_plan"), ("cte_results_", "cte_results"),
+              ("report_", "report"))
+
+
 def kind_of(name: str) -> str:
-    return ("plan" if name.startswith("hunt_plan_") else "results" if name.startswith("hunt_results_")
-            else "layer" if name.startswith("attack_layer_") else "vuln_report" if name.startswith("vuln_report_")
-            else "other")
+    if name.startswith("report_") and name.endswith("_final.md"):
+        return "report_final"
+    return next((k for p, k in FILE_KINDS if name.startswith(p)), "other")
 
 
 def entries(folder: Path) -> list[dict]:
@@ -70,7 +116,8 @@ def entries(folder: Path) -> list[dict]:
         k = kind_of(p.name)
         out.append({"name": p.name, "kind": k, "title": title(p) if p.suffix == ".md" else "",
                     "size": p.stat().st_size, "mtime": p.stat().st_mtime, "path": str(p),
-                    "hunted": (folder / p.name.replace("hunt_plan_", "hunt_results_", 1)).exists() if k == "plan" else None})
+                    "hunted": (folder / p.name.replace("hunt_plan_", "hunt_results_", 1)).exists() if k == "plan" else None,
+                    "edited": edited(p)})
     return out
 
 
@@ -97,7 +144,7 @@ def list_plans(folder: Path) -> str:
     rows = [f"Hunt plans folder: {folder}"]
     for e in rows_:
         when = datetime.fromtimestamp(e["mtime"], timezone.utc).strftime("%Y-%m-%d %H:%MZ")
-        rows.append(f"  {e['name']:52s} {labels[e['kind']]:16s} {when}  {e['title']}")
+        rows.append(f"  {e['name']:52s} {labels.get(e['kind'], e['kind']):16s} {when}  {e['title']}")
     for e in rows_:
         if e["kind"] == "plan":
             rows.append(f"  -> {e['name']}: {'hunted (results saved)' if e['hunted'] else 'not hunted yet'}")

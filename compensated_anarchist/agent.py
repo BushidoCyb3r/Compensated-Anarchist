@@ -40,7 +40,7 @@ from .mcp_manager import McpManager
 from .memory import Memory
 from .roe import RoeGate, cli_approver, deny_all_approver
 from .skills import BUILTIN_DIR, LEAD, SkillStore, skill_tools
-from . import attack, casefiles, huntplans, vault
+from . import attack, casefiles, cte, huntplans, reports, vault
 from .tools import vulnscan
 from .tools.forensics import Forensics
 from .tools.registry import Tool, ToolExecutor, ToolRegistry, schema
@@ -56,7 +56,7 @@ REPORT_STATUSES = ["completed", "blocked", "needs_input", "failed"]
 # the experts. This keeps the lead's prompt small (tool schemas are most of it), which matters on local models.
 # Override with orchestration.lead_tools in harness.yaml (["*"] = every tool, the old behavior).
 DEFAULT_LEAD_TOOLS = ["subagent_*", "case_*", "memory_*", "*__alerts_summary", "*__notable_events", "*__list_clients",
-                      "local_case_evidence", "hunt_plan_list"]
+                      "local_case_evidence", "hunt_plan_list", "cte_plan_list", "report_list"]
 
 
 def _prompt(name: str) -> str:
@@ -437,6 +437,12 @@ class Harness:
         self.case_evidence_dir = casefiles.ensure_case_folder(cfg.forensics_dir, case_id)  # analyst drop folder
         self.hunt_plans_dir = huntplans.ensure(self.case.dir / "hunt_plans")  # hunt_planner writes, threat_hunter reads
         self.vuln_dir = huntplans.ensure(self.case.dir / "vuln_assessment")  # vuln_assessor's reports and raw scans
+        self.cte_dir = huntplans.ensure(self.case.dir / "cte_plans")  # cte_planner's plans; network maps go in maps/
+        huntplans.ensure(self.cte_dir / "maps")
+        self.reports_dir = huntplans.ensure(self.case.dir / "reports")  # reporter's versioned drafts and finals
+        rcfg = cfg.raw.get("reports") or {}
+        ex = Path(str(rcfg["examples_dir"])) if rcfg.get("examples_dir") else cfg.cases_dir.parent / "reports" / "examples"
+        self.report_examples_dir = ex if ex.is_absolute() else (cfg.root / ex).resolve()  # the analyst's old reports
         self.gate_reason = ""  # set when this conversation is under the gate-everything floor (every action approved)
         for spec in cfg.mcp_servers.values():  # Velociraptor evidence lands in the vault, inside the forensic jail
             if str(spec.get("module", "")).endswith(".velociraptor"):
@@ -492,8 +498,13 @@ class Harness:
         self.audit.record("gate_everything_on", conversation=self._conv()["id"], reason=self.gate_reason)
         self.emit("gate_on", {"reason": self.gate_reason})
 
+    @property
+    def plan_dirs(self) -> list[Path]:
+        """Folders whose files the dashboard lists under Plans & reports (and can open)."""
+        return [self.hunt_plans_dir, self.vuln_dir, self.cte_dir, self.reports_dir]
+
     def _plan_saved(self, path: Path, kind: str) -> None:
-        """A hunt plan, hunt results or Navigator layer was saved: the dashboard shows it with links to open it."""
+        """A plan, results, report draft or Navigator layer was saved: the dashboard shows it with links to open it."""
         self.emit("plan_saved", {"name": path.name, "kind": kind, "path": str(path),
                                  "title": huntplans.title(path) if path.suffix == ".md" else ""})
 
@@ -576,6 +587,20 @@ class Harness:
             self.registry.add(t)
         for t in huntplans.tools(lambda: self.hunt_plans_dir, on_saved=self._plan_saved):
             self.registry.add(t)
+        for t in cte.tools(self.attack, lambda: self.cte_dir, lambda: [self.cte_dir / "maps", self.case_evidence_dir],
+                           self.cfg.raw.get("cte") or {}, on_saved=self._plan_saved):
+            self.registry.add(t)
+        try:
+            reports.ensure_examples(self.report_examples_dir)
+        except OSError:
+            pass  # read-only location: the library is simply empty
+        mission_data = lambda: reports.MissionData(  # noqa: E731
+            self.case, self.history, {"hunt plans": self.hunt_plans_dir, "vulnerability assessment": self.vuln_dir,
+                                      "CTE plans": self.cte_dir, "authored artifacts": self.case.artifacts / "authored"})
+        for t in reports.tools(mission_data, lambda: self.reports_dir, lambda: self.report_examples_dir,
+                               self._report_template, on_saved=self._plan_saved):
+            self.registry.add(t)
+        self.registry.add(self._statement_tool())
         vt = vulnscan.VulnTools(self.cfg.raw.get("vuln_assessment") or {}, self.vuln_dir,
                                 scope=lambda: (self.roe.allowed_targets, self.roe.protected_assets), on_saved=self._plan_saved)
         for t in vt.tools():
@@ -588,6 +613,37 @@ class Harness:
             self.open_conversation(conversation_id)
         elif not new and (latest := self.history.latest(self.case.id)):
             self.open_conversation(latest["id"])
+
+    def _report_template(self, report_type: str) -> str:
+        """The approved template skill for a report type ('' if there is none)."""
+        if not report_type:
+            return ""
+        s = self.skills.get(f"report-template-{re.sub(r'[^a-z0-9]+', '-', report_type.lower()).strip('-')}")
+        return s["body"] if s and s["status"] == "active" else ""
+
+    def _statement_tool(self) -> Tool:
+        """Record the analyst's answer to an agent's question as a citable statement. The answer must be quoted from
+        one of the analyst's own messages in this case, so an agent cannot put words in the analyst's mouth."""
+        def case_analyst_statement(question: str, answer: str, topic: str = "") -> str:
+            want = " ".join(answer.split()).lower()
+            if len(want) < 1:
+                raise ValueError("empty answer")
+            for conv in self.history.list(self.case.id, 1000):
+                for e in reversed(self.history.events(conv["id"])):
+                    if e["kind"] == "analyst_message" and want in " ".join(str(e["data"].get("text", "")).split()).lower():
+                        when = datetime.fromtimestamp(e["ts"], timezone.utc).isoformat()
+                        sid = self.case.add_statement(question.strip(), answer.strip(), self.cfg.operator, when,
+                                                      f"EV-{e['id']}", topic.strip())
+                        self.audit.record("analyst_statement", id=sid, question=question[:300], answer=answer[:300],
+                                          analyst_message=f"EV-{e['id']}")
+                        return f"recorded {sid}: the analyst's answer from EV-{e['id']} ({when[:16]}). Cite it as [{sid}]."
+            return ("NOT RECORDED: that answer is not in any of the analyst's messages in this case. Quote the analyst's "
+                    "own words exactly; if they have not answered yet, ask them.")
+        S = {"type": "string"}
+        return Tool("case_analyst_statement", "Record an analyst's answer to a question (classification markings, a missing "
+                    "fact, a decision) as a citable statement STA-nnnn. The answer must be quoted exactly from the analyst's "
+                    "own message in this case.", schema({"question": S, "answer": S, "topic": S}, ["question", "answer"]),
+                    case_analyst_statement)
 
     def _register_orchestration(self) -> None:
         S = {"type": "string"}
@@ -646,6 +702,8 @@ class Harness:
                + f"\nCase evidence folder (the analyst drops artifacts here): {self.case_evidence_dir}"
                + f"\nFiles pulled from endpoints (evidence vault): {self.vault_dir / 'velociraptor'}"
                + f"\nHunt plans folder (hunt_planner saves plans, threat_hunter reads them): {self.hunt_plans_dir}"
+               + f"\nCTE plans folder (cte_planner; network maps in maps/): {self.cte_dir}"
+               + f"\nReports folder (reporter drafts): {self.reports_dir} | example reports: {self.report_examples_dir}"
                + f"\nEvidence roots: {[str(p) for p in self.cfg.evidence_roots]}")
         return _prompt("core") + "\n\n" + role_prompt + env
 

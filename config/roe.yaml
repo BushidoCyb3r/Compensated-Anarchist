@@ -47,7 +47,13 @@ rules:
   # --- local forensics (read-only, jailed to evidence roots) -------------
   - {match: "local_run", tier: notify, args: {binary: [fls, icat, ils, mmls, fsstat, istat, mactime, sha256sum, ssdeep, exiftool]},
      note: "read-only Sleuth Kit / hashing"}
-  - {match: "local_run", tier: approve}
+  - {match: "local_run", tier: notify, args: {binary: [olevba, pescan]},
+     note: "static parsers: read the file, print to the screen, load no plugins"}
+  # oledump.py, pdfid.py and pdf-parser.py can load Python plugin and decoder files (-p / --plugins, -D / --decoders),
+  # and evidence paths are allowed as arguments, so a plugin could come from attacker-controlled evidence. diec can load
+  # signature scripts from a folder; densityscout can write an output file. They stay at approve.
+  - {match: "local_run", tier: approve,
+     note: "check the arguments: no plugin or decoder options (-p, --plugins, -D, --decoders) on oledump.py, pdfid.py or pdf-parser.py"}
   - {match: "local_plaso_timeline", tier: notify, note: "long-running"}
   - {match: "local_leapp", tier: notify, note: "long-running mobile parse"}
   - {match: "local_*",  tier: auto}
@@ -58,6 +64,9 @@ rules:
   - {match: "elastic__*",        tier: auto}
   - {match: "attack_*",          tier: auto, note: "local MITRE ATT&CK knowledge (read-only)"}
   - {match: "hunt_plan_*",       tier: auto, note: "hunt plans folder in the case (plans and results)"}
+  - {match: "cte_*",             tier: auto, note: "CTE plans folder in the case: plans only, nothing is run"}
+  - {match: "report_finalize",   tier: approve, observe: ask, note: "a report becomes final only with the analyst's approval"}
+  - {match: "report_*",          tier: auto, note: "report drafts from mission data, verified before saving"}
   # Vulnerability assessment (vuln_assessor). Every vuln_* call needs approval no matter what (built-in floor);
   # observe: ask lets the analyst approve scans one by one in OBSERVE posture too. Set observe: deny to forbid that.
   - {match: "vuln_*",            tier: approve, observe: ask, note: "vulnerability assessment: scanners and their output, each approved"}

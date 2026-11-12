@@ -12,7 +12,7 @@ from starlette.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_dashboard import H, login, make, wait_for  # noqa: E402
-from test_harness import ScriptedBackend, write_config  # noqa: E402
+from test_harness import ROOT, ScriptedBackend, write_config  # noqa: E402
 
 from compensated_anarchist import agent as agent_mod  # noqa: E402
 from compensated_anarchist.audit import verify  # noqa: E402
@@ -273,6 +273,51 @@ def test_skill_store_rules(tmp_path):
     assert other.get("analyst-one")["status"] == "active" and other.import_dir(tmp_path / "out", "op") == []
 
 
+def test_shipped_skills_refresh_only_while_untouched(tmp_path):
+    """A shipped default follows the shipped text until anyone else touches it: a revision, a waiting proposal, a
+    rollback or retirement freezes it for good."""
+    src, st = tmp_path / "builtin", SkillStore(tmp_path / "m.db")
+
+    def ship(name, body):
+        d = src / "network_analyst" / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: how to {name}\nexpert: network_analyst\n---\n\n{body}\n")
+
+    for n in ("revised", "pending", "rolled", "retired", "fresh"):
+        ship(n, "v1 text")
+    assert sorted(st.import_dir(src, "built-in", only_new=True)) == [f"{n} v1" for n in ("fresh", "pending", "retired", "revised", "rolled")]
+    assert st.import_dir(src, "built-in", only_new=True) == []  # unchanged: nothing to do
+    for n in ("revised", "pending", "rolled", "retired", "fresh"):
+        ship(n, "v2 text")
+    assert sorted(st.import_dir(src, "built-in", only_new=True)) == [f"{n} v2" for n in ("fresh", "pending", "retired", "revised", "rolled")]
+    assert "updated to the shipped version" in st.versions("fresh")[0]["change_note"]
+
+    st.propose("revised", "network_analyst", "how to revised", "the analyst's own text", source="analyst", author="op")
+    st.propose("pending", "network_analyst", "how to pending", "an agent's idea")  # waits for review
+    st.rollback("rolled", 1, "op")
+    st.set_status("retired", "retired", "op")
+    for n in ("revised", "pending", "rolled", "retired", "fresh"):
+        ship(n, "v3 text")
+    assert st.import_dir(src, "built-in", only_new=True) == ["fresh v3"]
+    assert st.get("revised")["body"] == "the analyst's own text" and st.get("pending")["body"] == "v2 text"
+    assert st.get("rolled")["body"] == "v1 text" and st.get("retired")["status"] == "retired"
+
+
+def test_every_expert_has_its_method_skill_shipped():
+    """Each expert's always-on skills ship with it (a missing one would silently drop out of the brief)."""
+    import re as _re
+
+    import yaml as _yaml
+    shipped = {}
+    for f in (agent_mod.BUILTIN_DIR).rglob("SKILL.md"):
+        meta = _yaml.safe_load(_re.match(r"^---\n(.*?)\n---\n", f.read_text(), _re.S).group(1))
+        shipped[meta["name"]] = meta["expert"]
+    experts = {f.stem: agent_mod._parse_expert(f.read_text()) for f in (ROOT / "compensated_anarchist" / "experts").glob("*.md")}
+    for name, e in experts.items():
+        assert all(shipped.get(s) == name for s in e.skills), (name, e.skills)
+    assert {n for n, e in experts.items() if not e.skills} == {"vuln_assessor"}  # its method stays fixed with its gate
+
+
 def test_code_writer_has_ponytail_by_default(tmp_path, monkeypatch):
     cfg = load_config(write_config(tmp_path))
     CW = "Code Writer"
@@ -296,7 +341,8 @@ def test_code_writer_has_ponytail_by_default(tmp_path, monkeypatch):
         h = agent_mod.Harness(cfg, "CW-1")
         await h.start()
         # the shipped ponytail skills are added, approved, for the code writer
-        assert {s["name"] for s in store.list("code_writer")} == {"ponytail", "ponytail-review", "ponytail-audit", "ponytail-debt"}
+        assert {s["name"] for s in store.list("code_writer")} == {"ponytail", "ponytail-review", "ponytail-audit", "ponytail-debt",
+                                                                 "dco-code"}
         await h.mission("write a logon parser")
         b = brief(h, "SA-001")
         assert "# Skills always on for your role" in b and "## Skill ponytail v1" in b and "You are a lazy senior developer" in b
@@ -315,10 +361,10 @@ def test_code_writer_has_ponytail_by_default(tmp_path, monkeypatch):
         assert store.get("ponytail")["active_version"] == 2
         await h.mission("again")
         assert "## Skill ponytail v2" in brief(h, "SA-002") and "DCO: dry-run by default." in brief(h, "SA-002")
-        # retired: no longer always on, and not re-added at start
+        # retired: no longer always on, and not re-added at start (the other always-on skill stays)
         store.set_status("ponytail", "retired", "tester")
         await h.mission("third")
-        assert "Skills always on" not in brief(h, "SA-003")
+        assert "## Skill ponytail " not in brief(h, "SA-003") and "## Skill dco-code v1" in brief(h, "SA-003")
         await h.close()
         h = agent_mod.Harness(cfg, "CW-1")
         await h.start()

@@ -17,3 +17,6 @@ training.jsonl
 # private working list
 TODO.md
 run/
+
+# historical reports dropped in for the report writer (format examples; sensitive)
+reports/

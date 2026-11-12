@@ -346,19 +346,31 @@ class SkillStore:
             n += 1
         return n
 
+    def _only_by(self, name: str, by: str) -> bool:
+        """True when every version of an active skill was written and approved by `by` alone, with nothing
+        waiting for review: nobody has revised, rolled back, retired or proposed a change to it."""
+        s = self.get(name)
+        vs = self.versions(name)
+        return bool(s and s["status"] == "active" and vs) and all(
+            v["author"] == by and v["status"] != "candidate" and v["reviewed_by"] in (by, "") for v in vs)
+
     def import_dir(self, src: Path, by: str, only_new: bool = False) -> list[str]:
         """Import analyst-authored SKILL.md files (approved on import; unchanged files are skipped).
-        only_new: skip skills that already exist, so a shipped default never replaces a revised or retired one."""
+        only_new: for shipped defaults. A new skill is added, and one that only `by` has ever written is refreshed to
+        the shipped text; a skill anyone revised, rolled back, retired or has a change waiting on is never touched."""
         done = []
         for f in sorted(src.rglob("SKILL.md")):
             m = re.match(r"^---\n(.*?)\n---\n(.*)$", f.read_text(encoding="utf-8"), re.S)
             if not m:
                 raise ValueError(f"{f}: missing YAML frontmatter")
             meta = yaml.safe_load(m.group(1)) or {}
-            if only_new and self.get(str(meta["name"]).strip().lower()):
+            name = str(meta["name"]).strip().lower()
+            exists = self.get(name) is not None
+            if only_new and exists and not self._only_by(name, by):
                 continue
             expert = str(meta.get("expert") or f.parent.parent.name)
-            v = self.propose(str(meta["name"]), expert, str(meta["description"]), m.group(2), f"imported from {f}",
+            note = f"updated to the shipped version from {f}" if exists else f"imported from {f}"
+            v = self.propose(str(meta["name"]), expert, str(meta["description"]), m.group(2), note,
                              source="analyst", author=by)
             if not v.get("duplicate"):
                 done.append(f"{v['name']} v{v['version']}")
