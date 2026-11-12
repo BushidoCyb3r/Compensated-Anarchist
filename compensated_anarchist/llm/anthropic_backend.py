@@ -170,5 +170,15 @@ class AnthropicBackend:
             tool_calls=calls,
             assistant_message=assistant,
             stop_reason=msg.stop_reason or "",
-            usage={"input": msg.usage.input_tokens, "output": msg.usage.output_tokens},
+            usage=usage_of(msg.usage),
         )
+
+
+def usage_of(u: Any) -> dict[str, int]:
+    """Token use of one call. With prompt caching, input_tokens counts only the uncached tail of the prompt; the
+    prompt's full size is that plus the tokens read from and written to the cache. `cached` is the share read from
+    the cache (billed at a fraction of the input price)."""
+    read = int(getattr(u, "cache_read_input_tokens", 0) or 0)
+    written = int(getattr(u, "cache_creation_input_tokens", 0) or 0)
+    return {"input": int(getattr(u, "input_tokens", 0) or 0) + read + written,
+            "output": int(getattr(u, "output_tokens", 0) or 0), "cached": read}

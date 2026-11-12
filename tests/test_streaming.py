@@ -223,7 +223,7 @@ def test_anthropic_stream_forwards_text(model):
     r = asyncio.run(b.chat(MSGS, TOOLS, on_delta=pieces.append))
     assert "".join(pieces) == r.text == "Recording the C2 address."
     assert [(c.name, c.arguments) for c in r.tool_calls] == [("case_add_ioc", {"type": "ipv4", "value": "203.0.113.7"})]
-    assert r.usage == {"input": 40, "output": 30} and r.stop_reason == "tool_use"
+    assert r.usage == {"input": 40, "output": 30, "cached": 0} and r.stop_reason == "tool_use"
     body = json.loads(reqs[0].content)
     assert body["stream"] is True
     # prompt caching: system prompt (with the tools before it) and the newest message are breakpoints
@@ -319,3 +319,13 @@ def test_dashboard_keeps_live_text_for_late_joiners(tmp_path, monkeypatch):
         dash.emit("delta", {"agent": "lead", "agent_id": "lead", "reset": True})
         dash.emit("text", {"agent": "network_analyst", "agent_id": "SA-001", "text": "Beacon to 203.0.113.7", "final": False})
         assert c.get("/api/state").json()["live"] == {}
+
+
+def test_anthropic_usage_counts_cached_prompt_tokens():
+    """With prompt caching, input_tokens is only the uncached tail: the prompt's size includes cache reads and writes."""
+    from types import SimpleNamespace
+
+    from compensated_anarchist.llm.anthropic_backend import usage_of
+    u = SimpleNamespace(input_tokens=12, output_tokens=300, cache_read_input_tokens=41000, cache_creation_input_tokens=900)
+    assert usage_of(u) == {"input": 41912, "output": 300, "cached": 41000}
+    assert usage_of(SimpleNamespace(input_tokens=5, output_tokens=7)) == {"input": 5, "output": 7, "cached": 0}

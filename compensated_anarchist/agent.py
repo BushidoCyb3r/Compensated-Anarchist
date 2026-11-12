@@ -228,7 +228,7 @@ class Agent:
         self.on_save = on_save
         self.transcript_name = transcript_name or f"{self.agent_id}.json"
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
-        self.usage = {"input": 0, "output": 0}
+        self.usage = {"input": 0, "output": 0, "cached": 0}  # cached: prompt tokens read from the provider's cache
         self.terminal: dict[str, Any] | None = None  # set by a terminal tool (submit_report) to end the turn
         self.inbox: list[str] = []  # analyst guidance ("steer"), delivered before the next model call
         # results of the current step's tool calls that have finished (call id -> [content, is_error]); saved with
@@ -473,7 +473,7 @@ class Agent:
         for m in msgs:  # provider-private blocks are bound to the old prompt prefix
             m.pop("_anthropic", None)
         self.messages = [self.messages[0], *msgs]
-        self.usage = dict(state.get("usage") or self.usage)
+        self.usage = {**self.usage, **(state.get("usage") or {})}
         self.partial = {str(k): list(v) for k, v in (state.get("partial") or {}).items()}
         self.terminal = state.get("terminal")
 
