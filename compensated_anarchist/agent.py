@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import re
 import shutil
 import time
@@ -35,7 +36,7 @@ from .case import Case
 from .config import HarnessConfig
 from .history import ChatStore
 from .llm import LLMBackend, ToolSpec, make_backend
-from .llm.base import LoopDetector, RepetitionLoop, estimate_tokens
+from .llm.base import LoopDetector, RepetitionLoop, ToolCall, estimate_tokens
 from .mcp_manager import McpManager
 from .memory import Memory
 from .roe import RoeGate, cli_approver, deny_all_approver
@@ -43,14 +44,16 @@ from .skills import BUILTIN_DIR, LEAD, SkillStore, skill_tools
 from . import attack, casefiles, cte, huntplans, reports, vault
 from .tools import vulnscan
 from .tools.forensics import Forensics
-from .tools.registry import Tool, ToolExecutor, ToolRegistry, schema
+from .tools.registry import CURRENT_CALL, Tool, ToolExecutor, ToolRegistry, schema
 
 EventFn = Callable[[str, dict[str, Any]], None]
 
 # events that make up the conversation feed (persisted and replayed); everything else is UI-only
 PERSIST_KINDS = {"analyst_message", "text", "subagent_spawn", "subagent_message", "subagent_report", "subagent_steer",
                  "decision", "result", "approval_request", "approval_resolved", "run_end", "compact", "skill_used",
-                 "skill_proposed", "retro_start", "loop_guard", "plan_saved", "gate_on"}
+                 "skill_proposed", "retro_start", "loop_guard", "plan_saved", "gate_on", "operation_resumed",
+                 "subagent_resumed"}
+RESUMABLE_KINDS = {"mission", "resume"}  # an after-action review cut off by a restart is ended, not resumed
 REPORT_STATUSES = ["completed", "blocked", "needs_input", "failed"]
 # The lead orchestrates, so it only holds overview tools; detailed connector, forensic and intel tools belong to
 # the experts. This keeps the lead's prompt small (tool schemas are most of it), which matters on local models.
@@ -196,10 +199,24 @@ class _DeltaSink:
             self._emit(reset=True)
 
 
+def _tool_call(tc: dict[str, Any]) -> ToolCall:
+    """A tool call as the model made it, rebuilt from the saved assistant message."""
+    fn = tc.get("function") or {}
+    raw = fn.get("arguments")
+    try:
+        args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except json.JSONDecodeError as e:
+        return ToolCall(str(tc.get("id", "")), str(fn.get("name", "")), {}, f"invalid JSON arguments: {e}")
+    return ToolCall(str(tc.get("id", "")), str(fn.get("name", "")), args if isinstance(args, dict) else {})
+
+
+TERMINAL_TOOLS = {"submit_report"}  # a call to one of these ends the agent's turn
+
+
 class Agent:
     def __init__(self, name: str, system: str, backend: LLMBackend, executor: ToolExecutor, tools: list[ToolSpec],
-                 max_steps: int, on_event: EventFn, agent_id: str = "", on_save: Callable[["Agent"], None] | None = None,
-                 transcript_name: str = ""):
+                 max_steps: int, on_event: EventFn, agent_id: str = "",
+                 on_save: Callable[["Agent", bool], None] | None = None, transcript_name: str = ""):
         self.name = name                      # expert name (ROE / allowlists / audit)
         self.agent_id = agent_id or name      # instance id: "lead" or SA-###
         self.backend = backend
@@ -214,15 +231,99 @@ class Agent:
         self.usage = {"input": 0, "output": 0}
         self.terminal: dict[str, Any] | None = None  # set by a terminal tool (submit_report) to end the turn
         self.inbox: list[str] = []  # analyst guidance ("steer"), delivered before the next model call
+        # results of the current step's tool calls that have finished (call id -> [content, is_error]); saved with
+        # each checkpoint, so a resumed operation never runs a finished call twice
+        self.partial: dict[str, list[Any]] = {}
 
     def add_local(self, tools: list[Tool]) -> None:
         for t in tools:
             self.local[t.name] = t
             self.tools.append(t.spec)
 
-    async def turn(self, user_text: str) -> str:
-        self.messages.append({"role": "user", "content": user_text})
+    # ---- turns: start, resume, run ----------------------------------------------------------
+    # The context is checkpointed after every change (the new message, each reply, each finished tool call), so an
+    # operation cut off by a restart or a crash can carry on from where it stopped (resume).
+    def add_user(self, text: str) -> None:
+        """Start a turn: close any tool calls an interrupted earlier turn left open, add the message, checkpoint."""
+        self._close_open_calls("NOT EXECUTED - the operation was interrupted before this ran")
+        self.messages.append({"role": "user", "content": text})
         self.terminal = None
+        self.checkpoint()
+
+    async def turn(self, user_text: str) -> str:
+        self.add_user(user_text)
+        return await self.resume()
+
+    def open_calls(self) -> list[ToolCall]:
+        """Tool calls in the last reply that have no result yet (the step was interrupted)."""
+        i = len(self.messages) - 1
+        while i > 0 and self.messages[i]["role"] == "tool":
+            i -= 1
+        m = self.messages[i]
+        if i == 0 or m["role"] != "assistant" or not m.get("tool_calls"):
+            return []
+        answered = {x.get("tool_call_id") for x in self.messages[i + 1:]}
+        return [_tool_call(tc) for tc in m["tool_calls"] if tc.get("id") not in answered]
+
+    def _ended_by_terminal(self) -> bool:
+        """The last step ended the turn with a terminal tool (submit_report), and it has its result."""
+        i = len(self.messages) - 1
+        if self.messages[i]["role"] != "tool":
+            return False
+        while i > 0 and self.messages[i]["role"] == "tool":
+            i -= 1
+        m = self.messages[i]
+        return m["role"] == "assistant" and any((tc.get("function") or {}).get("name") in TERMINAL_TOOLS
+                                                for tc in m.get("tool_calls") or [])
+
+    def unfinished(self) -> bool:
+        """True when the last turn stopped part-way (a restart or a crash): resume() carries it on."""
+        if len(self.messages) <= 1:
+            return False
+        last = self.messages[-1]
+        if last["role"] == "user":
+            return True
+        if last["role"] == "assistant":
+            return bool(last.get("tool_calls"))
+        return not self._ended_by_terminal()
+
+    async def resume(self) -> str:
+        """Carry on with the current turn from where it stopped: run the tool calls that have no result yet (each is
+        decided by the ROE again), then continue. A turn that already finished returns its answer."""
+        calls = self.open_calls()
+        if not calls and self._ended_by_terminal() and self.terminal is not None:
+            return self.terminal.get("summary", "") or "(no final answer)"
+        if not calls and self.messages[-1]["role"] == "assistant":
+            return str(self.messages[-1].get("content") or "") or "(no final answer)"
+        self.terminal = None
+        if calls:
+            reply = next(m for m in reversed(self.messages) if m["role"] == "assistant")
+            await self._run_calls(calls, str(reply.get("content") or ""), resumed=True)
+            if self.terminal is not None:
+                self.save()
+                return self.terminal.get("summary", "") or "(no final answer)"
+        return await self._loop()
+
+    async def _run_calls(self, calls: list[ToolCall], rationale: str, resumed: bool = False) -> None:
+        """Run one step's tool calls in parallel and add their results. Each result is checkpointed as it arrives."""
+        async def one(c: ToolCall) -> tuple[str, bool]:
+            done = self.partial.get(c.id)
+            if done is not None:  # finished before an interruption
+                return str(done[0]), bool(done[1])
+            content, is_err = await self.executor.execute(c, self.name, rationale, self.tools, self.local,
+                                                          self.agent_id, resumed)
+            self.partial[c.id] = [content, is_err]
+            self.checkpoint()
+            return content, is_err
+
+        results = await asyncio.gather(*[one(c) for c in calls])
+        for call, (content, is_err) in zip(calls, results):
+            self.messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,
+                                  "content": content, "_is_error": is_err})
+        self.partial = {}
+        self.checkpoint()
+
+    async def _loop(self) -> str:
         final = ""
         empty = loops = 0
         for _ in range(self.max_steps):
@@ -247,11 +348,7 @@ class Agent:
                     continue
                 final = resp.text
                 break
-            results = await asyncio.gather(*[
-                self.executor.execute(c, self.name, resp.text, self.tools, self.local, self.agent_id) for c in resp.tool_calls])
-            for call, (content, is_err) in zip(resp.tool_calls, results):
-                self.messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,
-                                      "content": content, "_is_error": is_err})
+            await self._run_calls(resp.tool_calls, resp.text)
             if self.terminal is not None:
                 final = self.terminal.get("summary", "")
                 break
@@ -306,6 +403,7 @@ class Agent:
                 sink.discard()
             raise RepetitionLoop(unit, "text")
         self.messages.append(resp.assistant_message)
+        self.checkpoint()
         if resp.text.strip():
             self.on_event("text", {"agent": self.name, "agent_id": self.agent_id, "text": resp.text.strip(),
                                    "final": not resp.tool_calls})
@@ -320,19 +418,20 @@ class Agent:
             "input": self.usage["input"], "output": self.usage["output"]})
         return resp
 
+    def _close_open_calls(self, reason: str) -> bool:
+        """Give every open tool call a result, so the history stays valid: the real one when the call finished before
+        the interruption, else `reason`."""
+        calls = self.open_calls()
+        for c in calls:
+            done = self.partial.get(c.id)
+            content, err = (str(done[0]), bool(done[1])) if done is not None else (reason, True)
+            self.messages.append({"role": "tool", "tool_call_id": c.id, "name": c.name, "content": content, "_is_error": err})
+        self.partial = {}
+        return bool(calls)
+
     def repair(self, reason: str = "cancelled by analyst") -> None:
         """After an interrupted turn, close any tool calls left without results so the history stays valid."""
-        for i in range(len(self.messages) - 1, -1, -1):
-            m = self.messages[i]
-            if m["role"] == "assistant" and m.get("tool_calls"):
-                answered = {x.get("tool_call_id") for x in self.messages[i + 1:] if x["role"] == "tool"}
-                for tc in m["tool_calls"]:
-                    if tc["id"] not in answered:
-                        self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": tc["function"]["name"],
-                                              "content": f"NOT EXECUTED - {reason}", "_is_error": True})
-                break
-            if m["role"] in ("user",):
-                break
+        self._close_open_calls(f"NOT EXECUTED - {reason}")
         self.save()
 
     async def _maybe_compact(self) -> None:
@@ -366,7 +465,7 @@ class Agent:
 
     def export_state(self) -> dict[str, Any]:
         return {"name": self.name, "agent_id": self.agent_id, "model": self.backend.profile_name, "usage": self.usage,
-                "messages": self.messages[1:]}
+                "messages": self.messages[1:], "partial": self.partial, "terminal": self.terminal}
 
     def restore(self, state: dict[str, Any]) -> None:
         """Resume from a saved state under a fresh system prompt (session details change between runs)."""
@@ -375,17 +474,24 @@ class Agent:
             m.pop("_anthropic", None)
         self.messages = [self.messages[0], *msgs]
         self.usage = dict(state.get("usage") or self.usage)
+        self.partial = {str(k): list(v) for k, v in (state.get("partial") or {}).items()}
+        self.terminal = state.get("terminal")
+
+    def checkpoint(self) -> None:
+        """Save the context mid-turn (no transcript file), so an interrupted operation can resume from here."""
+        if self.on_save:
+            self.on_save(self, False)
 
     def save(self) -> None:
         if self.on_save:
-            self.on_save(self)
+            self.on_save(self, True)
 
 
 # ---------------------------------------------------------------------------
 # Subagents
 # ---------------------------------------------------------------------------
 SUB_META = ("id", "expert", "title", "task", "context", "expected", "status", "turns", "created", "updated", "last_report",
-            "started")
+            "started", "call", "answered")
 
 
 @dataclass
@@ -396,7 +502,7 @@ class SubAgent:
     task: str
     context: str = ""
     expected: str = ""
-    status: str = "idle"  # running | completed | blocked | needs_input | failed | interrupted
+    status: str = "idle"  # queued | running | completed | blocked | needs_input | failed | stopped | interrupted
     turns: int = 0
     created: str = ""
     updated: str = ""
@@ -406,6 +512,8 @@ class SubAgent:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     job: asyncio.Task | None = None  # the running agent turn, so the analyst can stop this subagent alone
     stop_requested: bool = False
+    call: str = ""      # the orchestrator's tool call that gave it its current task (CallRef.key)
+    answered: str = ""  # the call its last report answered
 
     def meta(self) -> dict[str, Any]:
         return {k: getattr(self, k) for k in SUB_META}
@@ -465,6 +573,7 @@ class Harness:
         self.roe.target_resolver = self._resolve_target
         self.roe.gate_hook = self._gate_hook
         self._agent_seq = 0
+        self.op: dict[str, Any] | None = None  # the operation running now (history.operations row)
 
     # ---- events / conversation -------------------------------------------------------
     def emit(self, kind: str, data: dict[str, Any]) -> None:
@@ -534,7 +643,7 @@ class Harness:
             if key == "lead" or not meta.get("id"):
                 continue
             sa = SubAgent(**{k: meta[k] for k in SUB_META if k in meta})
-            if sa.status == "running":
+            if sa.status in ("running", "queued"):
                 sa.status = "interrupted"
             self.subagents[sa.id] = sa
             self._sub_states[sa.id] = st  # the agent itself is rebuilt on first follow-up
@@ -594,10 +703,7 @@ class Harness:
             reports.ensure_examples(self.report_examples_dir)
         except OSError:
             pass  # read-only location: the library is simply empty
-        mission_data = lambda: reports.MissionData(  # noqa: E731
-            self.case, self.history, {"hunt plans": self.hunt_plans_dir, "vulnerability assessment": self.vuln_dir,
-                                      "CTE plans": self.cte_dir, "authored artifacts": self.case.artifacts / "authored"})
-        for t in reports.tools(mission_data, lambda: self.reports_dir, lambda: self.report_examples_dir,
+        for t in reports.tools(self.mission_data, lambda: self.reports_dir, lambda: self.report_examples_dir,
                                self._report_template, on_saved=self._plan_saved):
             self.registry.add(t)
         self.registry.add(self._statement_tool())
@@ -613,6 +719,12 @@ class Harness:
             self.open_conversation(conversation_id)
         elif not new and (latest := self.history.latest(self.case.id)):
             self.open_conversation(latest["id"])
+
+    def mission_data(self) -> reports.MissionData:
+        """Everything a report may cite: the case record, conversation events and the case's files."""
+        return reports.MissionData(self.case, self.history, {
+            "hunt plans": self.hunt_plans_dir, "vulnerability assessment": self.vuln_dir, "CTE plans": self.cte_dir,
+            "authored artifacts": self.case.artifacts / "authored"})
 
     def _report_template(self, report_type: str) -> str:
         """The approved template skill for a report type ('' if there is none)."""
@@ -720,17 +832,19 @@ class Harness:
         lead.add_local(skill_tools(self.skills, LEAD, "lead", self._skill_ctx, list(self.experts), self.emit))
         return lead
 
-    def _on_save(self, agent: Agent) -> None:
-        """Persist an agent's context to the conversation (and its transcript for training export)."""
+    def _on_save(self, agent: Agent, transcript: bool = True) -> None:
+        """Persist an agent's context to the conversation: at every checkpoint, and with its transcript (for training
+        export) at the end of each turn."""
         if self.conversation is None and len(agent.messages) <= 1:
             return
         conv = self._conv()
-        d = self.case.dir / "transcripts" / conv["id"]
-        d.mkdir(parents=True, exist_ok=True)
-        (d / agent.transcript_name).write_text(json.dumps({
-            "agent": agent.name, "agent_id": agent.agent_id, "model": agent.backend.profile_name, "usage": agent.usage,
-            "tools": [{"name": t.name, "description": t.description, "parameters": t.parameters} for t in agent.tools],
-            "messages": agent.messages}, indent=1, default=str))
+        if transcript:
+            d = self.case.dir / "transcripts" / conv["id"]
+            d.mkdir(parents=True, exist_ok=True)
+            (d / agent.transcript_name).write_text(json.dumps({
+                "agent": agent.name, "agent_id": agent.agent_id, "model": agent.backend.profile_name, "usage": agent.usage,
+                "tools": [{"name": t.name, "description": t.description, "parameters": t.parameters} for t in agent.tools],
+                "messages": agent.messages}, indent=1, default=str))
         state = agent.export_state()
         if agent.agent_id in self.subagents:
             state["meta"] = self.subagents[agent.agent_id].meta()
@@ -798,14 +912,29 @@ class Harness:
                    ["status", "summary"]),
             submit_report)
 
+    @staticmethod
+    def _call_key() -> str:
+        ref = CURRENT_CALL.get()
+        return ref.key if ref else ""
+
+    def _resumed_sub(self) -> SubAgent | None:
+        """When an interrupted operation is resumed: the subagent the call being resumed had already tasked."""
+        ref = CURRENT_CALL.get()
+        if not (ref and ref.resumed):
+            return None
+        return next((sa for sa in reversed(list(self.subagents.values())) if sa.call == ref.key), None)
+
     async def _spawn(self, expert: str, task: str, context: str = "", expected_output: str = "") -> str:
+        if sa := self._resumed_sub():
+            return await self._resume_sub(sa)
         e = self.experts.get(expert)
         if not e:
             return f"ERROR: unknown expert {expert}. Experts: {', '.join(self.experts)}"
         self._conv()
         if e.name in self.roe.gate_all_experts:  # the analyst approved starting it; everything after is gated too
             self.gate_conversation(f"the {e.name} is working in this conversation")
-        sa = SubAgent(self._next_sid(), e.name, e.title, task, context, expected_output, created=_now(), updated=_now())
+        sa = SubAgent(self._next_sid(), e.name, e.title, task, context, expected_output, created=_now(), updated=_now(),
+                      call=self._call_key())
         self.subagents[sa.id] = sa
         sa.agent = self._build_subagent(sa)
         mem = self.memory.context_block(f"{e.name} {task} {context}")
@@ -834,39 +963,70 @@ class Harness:
                 + "\n\n".join(parts) + "\n\n")
 
     async def _message(self, subagent_id: str, message: str) -> str:
+        if sa := self._resumed_sub():
+            return await self._resume_sub(sa)
         sa = self.subagents.get(subagent_id.strip().upper())
         if not sa:
             return f"ERROR: no subagent {subagent_id} in this conversation (subagent_list shows them)"
+        if sa.lock.locked():
+            return f"ERROR: {sa.id} is still working on an earlier task; wait for that report"
         if sa.agent is None:
             sa.agent = self._build_subagent(sa)
+        sa.call = self._call_key()
         self.emit("subagent_message", {"id": sa.id, "expert": sa.expert, "title": sa.title, "message": message})
         return await self._run_sub(sa, f"# Follow-up from the orchestrator\n{message}\n\nFinish with submit_report.")
+
+    async def _resume_sub(self, sa: SubAgent) -> str:
+        """A resumed operation reached a call that had tasked `sa` before the interruption: hand back the report it
+        already gave, or let it finish its task from where it stopped."""
+        if sa.answered and sa.answered == sa.call and sa.last_report:
+            return self._format_report(sa, sa.last_report)
+        if sa.lock.locked():
+            return f"ERROR: {sa.id} is still working on an earlier task; wait for that report"
+        if sa.agent is None:
+            sa.agent = self._build_subagent(sa)
+        sa.stop_requested = False
+        self.emit("subagent_resumed", {"id": sa.id, "expert": sa.expert, "title": sa.title, "task": sa.task})
+        return await self._drive_sub(sa, sa.agent.resume)
 
     async def _run_sub(self, sa: SubAgent, text: str) -> str:
         if sa.lock.locked():
             return f"ERROR: {sa.id} is still working on an earlier task; wait for that report"
         assert sa.agent
+        sa.status, sa.stop_requested = "queued", False
+        sa.agent.add_user(text)  # the task is saved before it waits for a slot, so a restart cannot lose it
+        return await self._drive_sub(sa, sa.agent.resume)
+
+    async def _drive_sub(self, sa: SubAgent, work: Callable[[], Any]) -> str:
+        """Run a subagent's turn (`work`) in a parallel slot and turn its outcome into a report for the orchestrator.
+        A subagent stopped while it waits for a slot never starts."""
+        assert sa.agent
         stopped = False
+        sa.status, sa.updated = "queued", _now()
         async with sa.lock, self._semaphore():
-            sa.status, sa.updated, sa.started, sa.stop_requested = "running", _now(), time.time(), False
-            sa.job = asyncio.ensure_future(sa.agent.turn(text))
-            try:
-                final = await sa.job
-            except asyncio.CancelledError:
-                me = asyncio.current_task()
-                if not sa.stop_requested or (me is not None and me.cancelling()):
-                    raise  # the whole operation was cancelled, not just this subagent
+            sa.status, sa.updated, sa.started = "running", _now(), time.time()
+            if sa.stop_requested:
                 sa.agent.repair("stopped by the analyst")
                 stopped, final = True, ""
-            except Exception as ex:
-                sa.status, sa.updated = "failed", _now()
-                sa.agent.repair(f"subagent failed: {type(ex).__name__}")
-                self.emit("subagent_report", {"id": sa.id, "expert": sa.expert, "title": sa.title, "status": "failed",
-                                              "summary": f"{type(ex).__name__}: {ex}", "details": "", "confidence": "",
-                                              "open_questions": [], "recommended_tasks": [], "skills_used": []})
-                raise
-            finally:
-                sa.job = None
+            else:
+                sa.job = asyncio.ensure_future(work())
+                try:
+                    final = await sa.job
+                except asyncio.CancelledError:
+                    me = asyncio.current_task()
+                    if not sa.stop_requested or (me is not None and me.cancelling()):
+                        raise  # the whole operation was cancelled, not just this subagent
+                    sa.agent.repair("stopped by the analyst")
+                    stopped, final = True, ""
+                except Exception as ex:
+                    sa.status, sa.updated = "failed", _now()
+                    sa.agent.repair(f"subagent failed: {type(ex).__name__}")
+                    self.emit("subagent_report", {"id": sa.id, "expert": sa.expert, "title": sa.title, "status": "failed",
+                                                  "summary": f"{type(ex).__name__}: {ex}", "details": "", "confidence": "",
+                                                  "open_questions": [], "recommended_tasks": [], "skills_used": []})
+                    raise
+                finally:
+                    sa.job = None
         if stopped:
             report = {"status": "stopped", "summary": "Stopped by the analyst before finishing.", "details": "",
                       "confidence": "", "open_questions": [], "recommended_tasks": [], "skills_used": []}
@@ -874,7 +1034,7 @@ class Harness:
             report = sa.agent.terminal or {"status": "completed", "summary": final, "details": "", "confidence": "unstated",
                                            "open_questions": [], "recommended_tasks": [], "skills_used": [], "unstructured": True}
         sa.turns += 1
-        sa.status, sa.last_report, sa.updated = report["status"], report, _now()
+        sa.status, sa.last_report, sa.updated, sa.answered = report["status"], report, _now(), sa.call
         sa.agent.save()
         self.audit.record("subagent_report", id=sa.id, expert=sa.expert, status=sa.status, task=sa.task[:500],
                           chars=len(report["summary"]) + len(report["details"]))
@@ -887,7 +1047,7 @@ class Harness:
         sa = self.subagents.get(subagent_id)
         if not sa:
             raise KeyError(f"no subagent {subagent_id}")
-        if sa.status != "running" or not sa.agent:
+        if sa.status not in ("running", "queued") or not sa.agent:
             raise ValueError(f"{subagent_id} is not running; ask the lead to follow up with it instead")
         msg = message.strip()[:2000]
         if not msg:
@@ -901,10 +1061,13 @@ class Harness:
         sa = self.subagents.get(subagent_id)
         if not sa:
             raise KeyError(f"no subagent {subagent_id}")
-        if not sa.job or sa.job.done():
+        if sa.status == "queued" and not sa.stop_requested:  # waiting for a slot: it will not start
+            sa.stop_requested = True
+        elif not sa.job or sa.job.done():
             raise ValueError(f"{subagent_id} is not running")
-        sa.stop_requested = True
-        sa.job.cancel()
+        else:
+            sa.stop_requested = True
+            sa.job.cancel()
         self.audit.record("subagent_stopped", id=sa.id, expert=sa.expert, by=by)
 
     @staticmethod
@@ -1007,6 +1170,99 @@ class Harness:
                   f"\n\n# Subagent reflections\n" + ("\n".join(reflections) or "(no subagents reflected)"))
         return await self.lead.turn(prompt)
 
+    # ---- operations: recorded, so one cut off by a restart or a crash can be resumed or ended ------------
+    def op_begin(self, kind: str, label: str, playbook: str = "") -> dict[str, Any]:
+        """Record a new operation (mission, after-action review). An interrupted one in this conversation is ended
+        first: the analyst chose to do something else."""
+        if self.interrupted_operation():
+            self.end_interrupted("a new request was started instead")
+        self.op = self.history.op_create(self._conv()["id"], kind, label, playbook, os.getpid(), time.time())
+        return self.op
+
+    def op_end(self, status: str, note: str = "") -> None:
+        """done | stopped | failed; interrupted (a shutdown or crash cut it off: it can be resumed)."""
+        if not self.op:
+            return
+        self.history.op_update(self.op["id"], status=status, note=note[:500],
+                               ended=None if status == "interrupted" else time.time())
+        self.op = None
+
+    def interrupted_operation(self) -> dict[str, Any] | None:
+        """The operation in this conversation that a restart or a crash cut off, with whether it can be resumed and
+        the approvals it was waiting for. None when there is none (or it is running now, here or in another process)."""
+        if not self.conversation:
+            return None
+        op = self.history.op_latest(self.conversation["id"])
+        if not op or op["status"] not in ("running", "interrupted") or (self.op and self.op["id"] == op["id"]):
+            return None
+        if op["status"] == "running":
+            if op["pid"] != os.getpid() and _pid_alive(int(op["pid"] or 0)):
+                return None  # another process (the CLI) is running it
+            self.history.op_update(op["id"], status="interrupted")
+            op["status"] = "interrupted"
+        waiting = self.history.approvals(op["conversation_id"], ("pending", "approved_later", "denied_later"), op["id"])
+        resumable = op["kind"] in RESUMABLE_KINDS and bool(self.lead and self.lead.unfinished())
+        if op["kind"] in RESUMABLE_KINDS and not resumable and not waiting:
+            self.history.op_update(op["id"], status="done", ended=time.time(), note="had finished before the interruption")
+            return None
+        return {**op, "resumable": resumable, "approvals": waiting}
+
+    async def resume(self) -> str:
+        """Carry on with the operation a restart cut off: every agent continues from its last checkpoint. Tool calls
+        that had no result are decided by the ROE again; a finished subagent hands back its report."""
+        op = self.interrupted_operation()
+        if not op or not op["resumable"]:
+            raise ValueError("there is no interrupted operation to resume in this conversation")
+        assert self.lead
+        self.refresh_models()
+        self.history.op_update(op["id"], status="running", pid=os.getpid(), kind="resume" if op["kind"] == "mission" else op["kind"])
+        self.op = {**op, "status": "running"}
+        self.audit.record("operation_resumed", operation=op["id"], label=op["label"])
+        self.emit("operation_resumed", {"id": op["id"], "label": op["label"], "playbook": op["playbook"]})
+        return await self.lead.resume()
+
+    def end_interrupted(self, reason: str) -> dict[str, Any] | None:
+        """End an interrupted operation without resuming it: open tool calls get a 'not executed' result, the
+        approvals it was waiting for expire. The conversation carries on from there."""
+        op = self.interrupted_operation()
+        if not op:
+            return None
+        why = f"the operation was interrupted and then ended ({reason})"
+        if self.lead and self.lead.unfinished():
+            self.lead.repair(why)
+        for sa in self.subagents.values():
+            if sa.agent is None and sa.id in self._sub_states:
+                try:
+                    sa.agent = self._build_subagent(sa)
+                except ValueError:
+                    continue
+            if sa.agent and sa.agent.unfinished():
+                sa.status = "interrupted"
+                sa.agent.repair(why)
+        self.history.op_update(op["id"], status="ended", ended=time.time(), note=reason[:500])
+        for r in op["approvals"]:
+            self.history.approval_update(r["id"], status="expired", note=why[:500])
+        self.audit.record("operation_ended", operation=op["id"], label=op["label"], reason=reason)
+        self.emit("run_end", {"label": op["label"], "ok": False, "stopped": True, "ended": True,
+                              "text": f"The interrupted operation was ended: {reason}."})
+        return op
+
+    async def operation(self, kind: str, work: Callable[[], Any], label: str = "", playbook: str = "") -> str:
+        """Run a mission, a resume or an after-action review as a recorded operation (the CLI; the dashboard records
+        its own runs). Interrupted (Ctrl+C, a crash) it stays resumable."""
+        if kind != "resume":
+            self.op_begin(kind, label or kind, playbook)
+        try:
+            out = await work()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            self.op_end("interrupted")
+            raise
+        except BaseException as e:
+            self.op_end("failed", f"{type(e).__name__}: {e}")
+            raise
+        self.op_end("done")
+        return out
+
     def set_verdict(self, finding_id: str, verdict: str, note: str = "") -> bool:
         """Analyst adjudication of a finding. Benign/false-positive verdicts become approved memory."""
         if verdict not in ("tp", "fp", "benign", "inconclusive"):
@@ -1049,6 +1305,18 @@ class Harness:
         await self.mcp.aclose()
         for b in [*self.backends.values(), *self.retired_backends]:
             await b.aclose()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _purge(store: ChatStore, case_dir: Path, conv: dict[str, Any], audit: AuditLog) -> None:

@@ -320,29 +320,35 @@ class MissionData:
         for conv in self.history.list(self.case.id, 1000):
             title = (conv.get("title") or "")[:40]
             for e in self.history.events(conv["id"]):
-                if e["kind"] not in EVENT_KINDS:
-                    continue
-                d = e["data"]
-                when = datetime.fromtimestamp(e["ts"], timezone.utc).strftime("%Y-%m-%d %H:%MZ")
-                if e["kind"] == "analyst_message":
-                    who, text = "analyst", str(d.get("text", ""))
-                elif e["kind"] == "subagent_report":
-                    who = f"{d.get('id', '')} {d.get('expert', '')} report ({d.get('status', '')})"
-                    text = "\n".join([str(d.get("summary", "")), str(d.get("details", "")),
-                                      *[f"open question: {q}" for q in d.get("open_questions") or []]])
-                elif e["kind"] == "text":
-                    who, text = str(d.get("agent_id") or d.get("agent", "agent")), str(d.get("text", ""))
-                else:
-                    who, text = f"{d.get('agent_id', '')} tool {d.get('tool', '')} (result, first 800 chars)", str(d.get("preview", ""))
-                if not text.strip():
-                    continue
-                first = re.sub(r"\s+", " ", text)[:100]
-                out.append(Source(f"EV-{e['id']}", e["kind"], f"EV-{e['id']} {when} [{title}] {who}: {first}",
-                                  f"{when}\n{who}\n{text}"))
+                if src := _event_source(e, title):
+                    out.append(src)
         return out
 
     def all(self) -> dict[str, Source]:
         return {s.id.upper(): s for s in self._case_items() + self._files() + self._events()}
+
+    def get(self, source_id: str) -> Source | None:
+        """One source by its id: what a report's citation points at (None if this case's mission data lacks it)."""
+        sid = source_id.strip()
+        if not SOURCE_ID.match(sid):
+            return None
+        up = sid.upper()
+        if up.startswith("EV-"):
+            e = self.history.event(int(up[3:])) if self.history else None
+            conv = self.history.get(e["conversation_id"]) if e else None
+            if not conv or conv["case_id"] != self.case.id:
+                return None
+            return _event_source(e, (conv.get("title") or "")[:40])
+        if up.startswith("FILE:"):
+            name = sid[5:]
+            for label, folder in self.folders.items():
+                p = folder / name
+                if p.parent == folder and p.is_file() and not p.is_symlink() and p.stat().st_size <= MAX_SOURCE_FILE:
+                    return Source(f"FILE:{p.name}", "file", f"FILE:{p.name} ({label}, {p.stat().st_size} bytes) "
+                                  f"{huntplans.title(p) if p.suffix == '.md' else ''}",
+                                  p.read_bytes().decode("utf-8", errors="replace"))
+            return None
+        return next((s for s in self._case_items() if s.id.upper() == up), None)
 
     def analyst_words(self) -> str:
         """Everything the analyst said in this case (messages and recorded statements): the only source of markings."""
@@ -351,6 +357,27 @@ class MissionData:
             for conv in self.history.list(self.case.id, 1000):
                 parts += [str(e["data"].get("text", "")) for e in self.history.events(conv["id"]) if e["kind"] == "analyst_message"]
         return "\n".join(parts)
+
+
+def _event_source(e: dict[str, Any], title: str) -> Source | None:
+    if e["kind"] not in EVENT_KINDS:
+        return None
+    d = e["data"]
+    when = datetime.fromtimestamp(e["ts"], timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+    if e["kind"] == "analyst_message":
+        who, text = "analyst", str(d.get("text", ""))
+    elif e["kind"] == "subagent_report":
+        who = f"{d.get('id', '')} {d.get('expert', '')} report ({d.get('status', '')})"
+        text = "\n".join([str(d.get("summary", "")), str(d.get("details", "")),
+                          *[f"open question: {q}" for q in d.get("open_questions") or []]])
+    elif e["kind"] == "text":
+        who, text = str(d.get("agent_id") or d.get("agent", "agent")), str(d.get("text", ""))
+    else:
+        who, text = f"{d.get('agent_id', '')} tool {d.get('tool', '')} (result, first 800 chars)", str(d.get("preview", ""))
+    if not text.strip():
+        return None
+    first = re.sub(r"\s+", " ", text)[:100]
+    return Source(f"EV-{e['id']}", e["kind"], f"EV-{e['id']} {when} [{title}] {who}: {first}", f"{when}\n{who}\n{text}")
 
 
 def _render(item: dict[str, Any]) -> str:

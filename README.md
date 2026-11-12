@@ -58,7 +58,9 @@ scripts/start.sh --case IR-2026-0042                            # web GUI -> ope
 In `chat` you type to the **lead**, which plans and tasks expert subagents. `chat` and `dashboard` resume the
 case's most recent conversation; pass `--new` for a fresh one or `--conversation <id>` for a specific one.
 Useful commands: `/playbook`, `/subagents`, `/conversations`, `/new`, `/open <id>`, `/delete <id>`, `/skills`,
-`/experts`, `/tools`, `/model <profile>`, `/case`, `/verdict FIN-0001 fp <why>`, `/remember`, `/retro`, `/rate`.
+`/experts`, `/tools`, `/model <profile>`, `/case`, `/verdict FIN-0001 fp <why>`, `/remember`, `/retro`, `/rate`,
+and `/resume` or `/end` for an operation that a crash or Ctrl+C cut off. `canarchist export-docx <file.md>` writes a
+report or plan as a Word document.
 
 ## Dashboard (web GUI)
 
@@ -82,22 +84,42 @@ single-page app (no CDNs, system fonts), so it works air-gapped, and nothing rel
   anything waiting on you.
 - **Transcript.** Grouped by turn. The lead's work folds into a "Worked for 2 m 14 s" section of one-line
   steps (each expandable to its arguments and result); its answer is rendered markdown. Subagent reports
-  appear as cards that open the subagent's own thread.
+  appear as cards that open the subagent's own thread. Long conversations stay fast: the newest 40 turns are in
+  the page, and earlier ones come back as you scroll up (or press **Show earlier turns**). Turns off screen are
+  not laid out until you reach them.
 - **Streaming.** Replies appear word by word as the model writes them: the lead's in the transcript, each
   subagent's in its row of the subagents panel and in its open thread. When a reply is complete it is
   replaced by the rendered text in the same place. A browser that reloads or reconnects mid-reply picks up
   the text written so far. Streamed text is display-only; the saved conversation keeps the finished reply.
 - **Subagents panel.** Above the message box: every subagent with live status, elapsed time and latest
   activity. **Steer** queues guidance that the subagent receives before its next step; **Stop** cancels
-  that one subagent (the lead gets a "stopped" report and carries on).
+  that one subagent, also while it waits for a free slot (the lead gets a "stopped" report and carries on). The
+  composer's Stop ends the whole operation: the lead, every subagent, and any process their tools started
+  (a plaso run or a scan, with its worker processes).
 - **Approvals.** A banner, an inline card and a review dialog with the action, target, ROE rule, the
   agent's action brief and the arguments. Approve takes a confirming second click; every decision and
-  note goes into the hash-chained audit log.
-- **Case panel.** Findings with verdicts, IOCs, timeline, evidence and the report, beside the transcript.
+  note goes into the hash-chained audit log, with the signed-in user who made it.
+- **Restarts don't lose work.** Every agent saves its place after each step, and every approval request is
+  saved. If the dashboard stops (or crashes) mid-operation, the next start shows the operation as **interrupted by
+  a restart**, with the approvals it was waiting for. Deciding one of them carries the operation on, and the
+  decision is applied when the agent gets back to that action. **Resume** carries it on without one: each agent
+  continues from where it stopped, a subagent that had finished hands back its report instead of running again,
+  and tool calls that had no result are decided by the ROE again. **End it** closes the operation instead, and so
+  does sending a new task. Stop is different: it ends an operation for good.
+- **Case panel.** Findings with verdicts, IOCs, timeline, evidence and the report, beside the transcript. In the
+  report, every citation (`[FIN-0001]`, `[EV-12]`, `[FILE:hunt_plan_x.md]`) opens the mission data it points at,
+  with a link to the item in the case panel. **Word (.docx)** exports the report; every markdown plan and report
+  in Plans & reports has the same button.
 - **Status bar.** Posture, the lead's context use, tokens per second (generation speed, excluding the wait
   for the first token, which is shown on hover), connector health, approvals waiting, audit-chain state.
 - **Keyboard.** Ctrl+K command palette (conversations, subagents, playbooks, pages, models), Ctrl+Shift+O
-  new conversation, Ctrl+. case panel, Ctrl+/ shortcuts, `/` to focus the message box, Esc to close.
+  new conversation, Ctrl+. case panel, Ctrl+/ shortcuts, `/` to focus the message box, Esc to close. The first
+  Tab stop skips to the message box; arrow keys move between tabs and menu items.
+- **Accessibility.** Text meets WCAG AA contrast in both themes, and every control can be reached and used from
+  the keyboard with a visible focus ring. Redraws keep your focus where it was, dialogs return it when they close,
+  and a new approval is announced once to screen readers. `tests/test_accessibility.py` checks the colors, and
+  drives headless Chrome through a keyboard-only walk-through and a rendered-page audit (names, ARIA references,
+  contrast in both themes) whenever Chrome is installed.
 - **Themes.** Dark (default), light, or match the system, from Settings or the palette.
 - **Security.** Stricter than a typical local dashboard, because this one approves response actions:
   - Signing in takes both the access token, which is new at every start, and the dashboard account's username
@@ -178,6 +200,10 @@ context. Nothing expires; a conversation stays until you delete it.
 - **What deletion keeps.** The case record (findings, IOCs, timeline, evidence), the hash-chained audit
   log, and the memories and skills learned from the conversation. Those are the case file and the
   accountability record. The deletion itself is audited.
+- **Operations and approvals.** Each operation run in a conversation is recorded with how it ended (done,
+  stopped, failed, interrupted, ended), and so is every approval request with its outcome and who decided it.
+  An operation a restart cut off can be resumed from the agents' last checkpoints (dashboard **Resume**, or
+  `/resume` in `chat`).
 
 The store is `history.db_path` (default `cases/_history.db`).
 
@@ -312,6 +338,11 @@ else.
   you as questions. Your answers are recorded as statements (`STA-nnnn`, quoted from your own messages) and cited.
 - **Versions and final.** Drafts are `cases/<id>/reports/report_<name>_v<N>.md`. You can edit them; the reporter
   reads your edits and proposes lessons. `report_finalize` saves the final copy and needs your approval.
+- **Citations you can follow.** In the dashboard every citation opens the cited mission data.
+- **Word.** The dashboard's **Word (.docx)** button, or `canarchist export-docx <report.md>`, writes the report as a
+  Word document (standard library, no extra package). The Sources section goes with it; the internal Verification
+  section does not. A draft says at the top that it is not yet approved. A classification marking on the report's
+  first line, which is only there if you gave it, goes into the page header and footer. Exports are audited.
 
 ## Code for the mission (written, reviewed, never run)
 
@@ -433,6 +464,7 @@ compensated_anarchist/
   memory.py case.py learning memory, case file / chain of custody / analyst statements
   cte.py            threat emulation planning: network maps, plan check, CTE plans folder
   reports.py        report writer: example library, mission data sources, citation verifier, drafts
+  docx.py           markdown -> Word (.docx) export with the standard library
   llm/              openai_compat, anthropic, text-mode tool calling
   tools/            registry/executor, local forensics
   servers/          MCP servers: security_onion, splunk, elastic, velociraptor, misp, opencti
@@ -455,8 +487,12 @@ Run tests: `.venv/bin/python -m pytest -q`
   Zimmerman tools, FLOSS, MemProcFS and ALEAPP/iLEAPP stand-ins. Validate against your instances.
 - SOC-native Security Onion features (cases, PCAP jobs, OQL) need SO Pro's Connect API / official MCP server.
 - The dashboard serves one case per process. Run several on different ports for parallel cases.
-- **Approvals and reviews are attributed to the configured operator, not to whoever clicked.** That covers
-  response-action approvals, skill and memory reviews, and conversation deletions. Per-analyst identity
-  (CAC / client-certificate login) is the next hardening step for multi-analyst use.
+- **Most decisions are attributed to the configured operator, not to whoever clicked.** Approval records, steer and
+  stop name the signed-in dashboard user, but the ROE audit entries, skill and memory reviews and conversation
+  deletions name the operator. There is one dashboard account; per-analyst identity (CAC / client-certificate
+  login) is the next hardening step for multi-analyst use.
+- **Resuming re-runs a tool call that was in flight.** Results that came back before the interruption are kept, but
+  a call that was still running when the dashboard stopped runs again on Resume (the ROE decides it again, so an
+  approval-tier action asks you again).
 - The orchestration and skill loop is tested with a scripted model. How well a given local model uses
   `submit_report` and writes useful skills has not been measured yet.

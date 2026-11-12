@@ -4,7 +4,12 @@ A conversation belongs to a case and holds:
   events        the operation feed the analyst saw (messages, lead reports, subagent tasking/reports, tool
                 decisions, approvals), replayed by the dashboard and the CLI when a conversation is resumed
   agent_states  the model context of the orchestrator and of every subagent, so a resumed conversation picks
-                up where it left off and the orchestrator can still follow up with an earlier subagent
+                up where it left off and the orchestrator can still follow up with an earlier subagent. They are
+                checkpointed after every step, so an operation cut off by a restart can be resumed
+  operations    each operation run in the conversation (a mission, a resume, an after-action review) and how it
+                ended: done, stopped, failed, or interrupted by a restart (then it can be resumed or ended)
+  approvals     every approval an agent asked for, and its outcome. One still waiting when the dashboard stopped
+                is offered again after the restart; deciding it then applies when the operation resumes
 
 Nothing expires. Deleting a conversation removes its events, agent states and transcripts. The case record
 (findings, IOCs, timeline, evidence), the hash-chained audit log, and the memories/skills learned from it are
@@ -36,7 +41,25 @@ CREATE TABLE IF NOT EXISTS agent_states (
   conversation_id TEXT NOT NULL, agent_key TEXT NOT NULL, state TEXT NOT NULL, updated TEXT NOT NULL,
   PRIMARY KEY (conversation_id, agent_key)
 );
+CREATE TABLE IF NOT EXISTS operations (
+  id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',
+  playbook TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, pid INTEGER NOT NULL DEFAULT 0, started REAL NOT NULL,
+  ended REAL, note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS op_conv ON operations(conversation_id, started);
+CREATE TABLE IF NOT EXISTS approvals (
+  id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, operation_id TEXT NOT NULL DEFAULT '',
+  agent_id TEXT NOT NULL DEFAULT '', call_key TEXT NOT NULL DEFAULT '', tool TEXT NOT NULL, arguments TEXT NOT NULL,
+  rationale TEXT NOT NULL DEFAULT '', why TEXT NOT NULL DEFAULT '', requested REAL NOT NULL, status TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '', decided_by TEXT NOT NULL DEFAULT '', decided REAL
+);
+CREATE INDEX IF NOT EXISTS ap_conv ON approvals(conversation_id, status);
 """
+
+# approvals.status: pending (waiting) -> approved | denied | timeout | cancelled, decided live; or, for one still
+# pending when the dashboard stopped: approved_later | denied_later (decided after the restart, applied when the
+# operation resumes, then approved | denied) | expired (the operation was ended instead)
+LATER = {"approved_later": True, "denied_later": False}
 
 
 def _now() -> str:
@@ -90,6 +113,8 @@ class ChatStore:
             n = self.db.execute("DELETE FROM conversations WHERE id=?", (conv_id,)).rowcount
             self.db.execute("DELETE FROM events WHERE conversation_id=?", (conv_id,))
             self.db.execute("DELETE FROM agent_states WHERE conversation_id=?", (conv_id,))
+            self.db.execute("DELETE FROM operations WHERE conversation_id=?", (conv_id,))
+            self.db.execute("DELETE FROM approvals WHERE conversation_id=?", (conv_id,))
             self.db.commit()
         return bool(n)
 
@@ -109,6 +134,12 @@ class ChatStore:
             rows = self.db.execute(sql, (conv_id, limit) if limit else (conv_id,)).fetchall()
         return [{"id": r["id"], "session": r["session"], "ts": r["ts"], "kind": r["kind"], "data": json.loads(r["data"])}
                 for r in reversed(rows)]
+
+    def event(self, event_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            r = self.db.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+        return {"id": r["id"], "conversation_id": r["conversation_id"], "ts": r["ts"], "kind": r["kind"],
+                "data": json.loads(r["data"])} if r else None
 
     def first_event(self, conv_id: str, kind: str) -> dict[str, Any] | None:
         """The earliest event of this kind in the conversation (e.g. the one that put it under the approval gate)."""
@@ -133,3 +164,76 @@ class ChatStore:
         with self._lock:
             rows = self.db.execute("SELECT agent_key, state FROM agent_states WHERE conversation_id=?", (conv_id,)).fetchall()
         return {r["agent_key"]: json.loads(r["state"]) for r in rows}
+
+    # ---- operations ---------------------------------------------------------------------
+    def op_create(self, conv_id: str, kind: str, label: str, playbook: str, pid: int, started: float) -> dict[str, Any]:
+        oid = "op-" + uuid.uuid4().hex[:12]
+        with self._lock:
+            self.db.execute("INSERT INTO operations(id, conversation_id, kind, label, playbook, status, pid, started) "
+                            "VALUES (?,?,?,?,?,?,?,?)", (oid, conv_id, kind, label[:200], playbook[:80], "running", pid, started))
+            self.db.commit()
+        return self.op_get(oid)  # type: ignore[return-value]
+
+    def op_get(self, op_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            r = self.db.execute("SELECT * FROM operations WHERE id=?", (op_id,)).fetchone()
+        return dict(r) if r else None
+
+    def op_latest(self, conv_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            r = self.db.execute("SELECT * FROM operations WHERE conversation_id=? ORDER BY started DESC, rowid DESC LIMIT 1",
+                                (conv_id,)).fetchone()
+        return dict(r) if r else None
+
+    def op_update(self, op_id: str, **fields: Any) -> None:
+        cols = [k for k in fields if k in ("status", "pid", "ended", "note", "kind", "label")]
+        if not cols:
+            return
+        with self._lock:
+            self.db.execute(f"UPDATE operations SET {', '.join(f'{k}=?' for k in cols)} WHERE id=?",
+                            (*[fields[k] for k in cols], op_id))
+            self.db.commit()
+
+    # ---- approvals -------------------------------------------------------------------------
+    def approval_add(self, row: dict[str, Any]) -> None:
+        with self._lock:
+            self.db.execute("INSERT INTO approvals(id, conversation_id, operation_id, agent_id, call_key, tool, arguments, "
+                            "rationale, why, requested, status) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                            (row["id"], row["conversation_id"], row.get("operation_id", ""), row.get("agent_id", ""),
+                             row.get("call_key", ""), row["tool"], json.dumps(row.get("arguments") or {}, default=str),
+                             str(row.get("rationale") or "")[:20000], str(row.get("why") or "")[:2000], row["requested"],
+                             row.get("status", "pending")))
+            self.db.commit()
+
+    def approval_update(self, aid: str, **fields: Any) -> None:
+        cols = [k for k in fields if k in ("status", "note", "decided_by", "decided", "operation_id")]
+        if not cols:
+            return
+        with self._lock:
+            self.db.execute(f"UPDATE approvals SET {', '.join(f'{k}=?' for k in cols)} WHERE id=?",
+                            (*[fields[k] for k in cols], aid))
+            self.db.commit()
+
+    def approvals(self, conv_id: str, statuses: tuple[str, ...], operation_id: str | None = None) -> list[dict[str, Any]]:
+        sql = (f"SELECT * FROM approvals WHERE conversation_id=? AND status IN ({','.join('?' * len(statuses))})"
+               + (" AND operation_id=?" if operation_id is not None else "") + " ORDER BY requested")
+        args = (conv_id, *statuses) + ((operation_id,) if operation_id is not None else ())
+        with self._lock:
+            rows = self.db.execute(sql, args).fetchall()
+        return [_approval(r) for r in rows]
+
+    def approval_for_call(self, conv_id: str, call_key: str) -> dict[str, Any] | None:
+        """The approval still open for this exact tool call (same agent, call id, tool and arguments), if any."""
+        if not call_key:
+            return None
+        with self._lock:
+            r = self.db.execute("SELECT * FROM approvals WHERE conversation_id=? AND call_key=? AND status IN "
+                                "('pending','approved_later','denied_later') ORDER BY requested DESC LIMIT 1",
+                                (conv_id, call_key)).fetchone()
+        return _approval(r) if r else None
+
+
+def _approval(r: sqlite3.Row) -> dict[str, Any]:
+    d = dict(r)
+    d["arguments"] = json.loads(d["arguments"] or "{}")
+    return d

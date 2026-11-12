@@ -8,6 +8,7 @@ influenced and may contain prompt-injection text.
 
 from __future__ import annotations
 
+import contextvars
 import fnmatch
 import hashlib
 import inspect
@@ -23,6 +24,29 @@ from ..llm.base import ToolCall, ToolSpec
 from ..roe import RoeGate
 
 Handler = Callable[..., Awaitable[str] | str]
+
+
+@dataclass(frozen=True)
+class CallRef:
+    """The tool call being executed: which agent made it, its id, and a digest of its name and arguments. `resumed`
+    is set when an interrupted operation runs a call that had no result yet when it stopped."""
+    agent_id: str
+    call_id: str
+    digest: str
+    resumed: bool = False
+
+    @property
+    def key(self) -> str:
+        return f"{self.agent_id}:{self.call_id}:{self.digest}"
+
+
+# Set while a tool runs, so the approver and the orchestration tools know which call they serve (contextvars
+# follow each asyncio task, so parallel calls never see each other's).
+CURRENT_CALL: contextvars.ContextVar[CallRef | None] = contextvars.ContextVar("ca_current_call", default=None)
+
+
+def call_digest(name: str, arguments: Any) -> str:
+    return hashlib.sha256(json.dumps([name, arguments], sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
 @dataclass
@@ -78,16 +102,23 @@ class ToolExecutor:
         self.denials: list[dict[str, Any]] = []  # analyst denials -> learning signal
 
     async def execute(self, call: ToolCall, agent: str, rationale: str, allowed: list[ToolSpec],
-                      local: dict[str, Tool] | None = None, agent_id: str = "") -> tuple[str, bool]:
+                      local: dict[str, Tool] | None = None, agent_id: str = "", resumed: bool = False) -> tuple[str, bool]:
         """Returns (content_for_model, is_error). `local` holds tools bound to this agent (skills, report
-        submission); they go through the same ROE gate and audit as registry tools."""
+        submission); they go through the same ROE gate and audit as registry tools. `resumed`: the call is run by
+        an operation resumed after an interruption (the ROE decides it again)."""
         if call.parse_error:
             return f"ERROR: {call.parse_error}. Re-issue the call with valid JSON arguments.", True
         if call.name not in {s.name for s in allowed}:
             return f"ERROR: tool '{call.name}' is not available to agent '{agent}'.", True
         tool = (local or {}).get(call.name) or self.registry.tools[call.name]
         aid = agent_id or agent
+        token = CURRENT_CALL.set(CallRef(aid, call.id, call_digest(call.name, call.arguments), resumed))
+        try:
+            return await self._execute(call, agent, aid, tool, rationale)
+        finally:
+            CURRENT_CALL.reset(token)
 
+    async def _execute(self, call: ToolCall, agent: str, aid: str, tool: Tool, rationale: str) -> tuple[str, bool]:
         decision = await self.roe.authorize(call.name, call.arguments, rationale, agent, tool.annotations, tool.server)
         self.on_event("decision", {"agent": agent, "agent_id": aid, "tool": call.name, "args": call.arguments,
                                    "tier": decision.tier, "allowed": decision.allowed, "reason": decision.reason})

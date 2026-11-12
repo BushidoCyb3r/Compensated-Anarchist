@@ -29,8 +29,8 @@
       </section>
       <div id="token-row" class="thread-sec">
         <label for="token" class="label">Access token</label>
-        <input id="token" type="password" autocomplete="off" spellcheck="false">
-        <p class="hint">New at every start: scripts/start.sh prints it.</p>
+        <input id="token" type="password" autocomplete="off" spellcheck="false" aria-describedby="token-hint">
+        <p class="hint" id="token-hint">New at every start: scripts/start.sh prints it.</p>
       </div>
       <p id="token-note" class="hint" hidden>Using the access token from your sign-in link.</p>
       <div id="no-account" class="form-error" role="alert" hidden>No dashboard account exists yet. On the host, run <code>canarchist account create</code> (scripts/start.sh asks for it).</div>

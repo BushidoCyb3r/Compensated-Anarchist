@@ -41,6 +41,8 @@ HELP = """
   /verdict <FIN-id> <tp|fp|benign|inconclusive> [note]   adjudicate a finding (feeds learning)
   /remember <kind> <title> :: <content>                  add analyst knowledge (approved immediately)
   /retro                       after-action review -> lessons into memory
+  /resume  |  /end             carry on with an operation a crash or Ctrl+C cut off, from where each agent stopped
+                               (tool calls with no result are decided again) | end it instead
   /rate <1-5> [note]           rate this session (rated sessions become fine-tuning data)
   /quit
 """
@@ -213,6 +215,11 @@ def _print_conversation(h, tail: int = 12) -> None:
             print(f"{C['dim']}    << {d['id']} {d['expert']} [{d['status']}] {str(d.get('summary', ''))[:160]}{C['x']}")
         else:
             print(f"{C['dim']}  lead: {d['text'][:300]}{C['x']}")
+    op = h.interrupted_operation()
+    if op:
+        what = (f"{C['y']}  interrupted operation: {op['label'] or op['kind']} (a crash or Ctrl+C cut it off)"
+                + (f", {len(op['approvals'])} approval(s) were waiting" if op["approvals"] else ""))
+        print(what + (" - /resume carries it on, /end closes it" if op["resumable"] else " - /end closes it") + C["x"])
 
 
 def _print_skills(store, pending: bool = False) -> None:
@@ -299,7 +306,12 @@ async def chat(h) -> None:
                 mid = h.remember(kind, title, content)
                 print(f"saved M{mid}")
             elif line == "/retro":
-                say(await h.retro())
+                say(await h.operation("retro", h.retro, "after-action review"))
+            elif line == "/resume":
+                say(await h.operation("resume", h.resume))
+            elif line == "/end":
+                print("ended the interrupted operation" if h.end_interrupted("ended by the analyst")
+                      else "no interrupted operation in this conversation")
             elif line.startswith("/rate "):
                 parts = line.split(maxsplit=2)
                 h.rate(int(parts[1]), parts[2] if len(parts) > 2 else "")
@@ -307,11 +319,12 @@ async def chat(h) -> None:
             elif line.startswith("/playbook "):
                 parts = line.split(maxsplit=2)
                 text = _playbook(parts[1]) + "\n\n# Details from analyst\n" + (parts[2] if len(parts) > 2 else "(none)")
-                say(await h.mission(text, parts[2] if len(parts) > 2 else '', parts[1]))
+                say(await h.operation("mission", lambda: h.mission(text, parts[2] if len(parts) > 2 else '', parts[1]),
+                                      parts[1], parts[1]))
             elif line.startswith("/"):
                 print("unknown command; /help")
             else:
-                say(await h.mission(line))
+                say(await h.operation("mission", lambda: h.mission(line), "mission"))
         except KeyboardInterrupt:
             print("\n(interrupted)")
         except Exception as e:
@@ -567,6 +580,9 @@ def main(argv: list[str] | None = None) -> None:
     at.add_argument("--from", dest="from_file", help="import a copied STIX bundle instead of downloading (air-gapped)")
     a = sub.add_parser("audit-verify", help="verify a case audit chain")
     a.add_argument("--case", required=True)
+    xd = sub.add_parser("export-docx", help="export a report or plan (markdown) to Word .docx")
+    xd.add_argument("file", help="a .md file, e.g. cases/<case>/reports/report_<name>_final.md")
+    xd.add_argument("--out", help="the .docx to write (default: next to the file; never overwrites)")
     e = sub.add_parser("export-training", help="export rated transcripts as fine-tuning JSONL")
     e.add_argument("--out", default="training.jsonl")
     e.add_argument("--min-rating", type=int, default=4)
@@ -579,9 +595,10 @@ def main(argv: list[str] | None = None) -> None:
         async def go(h):
             text = (_playbook(args.playbook) + "\n\n# Details from analyst\n" + args.mission) if args.playbook else args.mission
             try:
-                say(await h.mission(text, args.mission, args.playbook or ""))
+                say(await h.operation("mission", lambda: h.mission(text, args.mission, args.playbook or ""),
+                                      args.playbook or "mission", args.playbook or ""))
                 if args.retro:
-                    say(await h.retro())
+                    say(await h.operation("retro", h.retro, "after-action review"))
             except Exception as e:  # model server or connector failure: one clear line, not a traceback
                 _end_live()
                 print(f"{C['r']}error: {e}{C['x']}", file=sys.stderr, flush=True)
@@ -639,6 +656,23 @@ def main(argv: list[str] | None = None) -> None:
         ok, msg = verify(_cfg(args).cases_dir / args.case / "audit.jsonl")
         print(msg)
         sys.exit(0 if ok else 1)
+    elif args.cmd == "export-docx":
+        import re as _re
+        from . import docx, huntplans
+
+        src = Path(args.file)
+        if src.suffix != ".md" or not src.is_file():
+            raise SystemExit(f"{src}: not a markdown file")
+        out = Path(args.out) if args.out else src.with_suffix(".docx")
+        if out.exists():
+            raise SystemExit(f"{out} exists; pass --out with another name")
+        draft = _re.match(r"report_.+_v\d+\.md$", src.name) is not None
+        data = docx.to_docx(src.read_text(encoding="utf-8", errors="replace"), huntplans.title(src) or src.stem,
+                            "DRAFT - not yet approved by the analyst as the final report" if draft else "")
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        print(f"wrote {out} ({len(data)} bytes){' - marked DRAFT' if draft else ''}")
     elif args.cmd == "export-training":
         from .memory import export_training
 

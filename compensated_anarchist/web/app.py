@@ -5,6 +5,11 @@ are broadcast to every connected browser over Server-Sent Events. Response actio
 parked as pending approvals and resolved from the browser. The case's conversations are persisted; the feed of
 the open conversation is replayed when the dashboard starts or the analyst switches conversation.
 
+Durable operations: every agent checkpoints its context after each step, and every approval request is saved. When
+the dashboard stops (or crashes) mid-operation, the next start offers the operation as interrupted: the approvals it
+was waiting for are shown again, and deciding one, or pressing Resume, carries the operation on from where each agent
+stopped. End closes it instead. Stop (the analyst's) is different: it ends the operation for good.
+
 Security model (the GUI can approve response actions, so it is stricter than a typical local dashboard):
   - signing in takes BOTH the access token, generated fresh at every start (printed by scripts/start.sh), AND the
     dashboard account's username and password (created once on the host: canarchist account create; stored as a
@@ -40,10 +45,12 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from .. import NAME, __version__, editors, huntplans, service
+from .. import NAME, __version__, docx, editors, huntplans, reports, service
 from . import account
 from ..agent import Harness
 from ..audit import verify
+from ..history import LATER
+from ..tools.registry import CURRENT_CALL
 from ..config import HarnessConfig
 from ..memory import KINDS
 
@@ -95,6 +102,8 @@ class Dashboard:
         self.pending: dict[str, dict[str, Any]] = {}
         self.run_task: asyncio.Task | None = None
         self.run_label = ""
+        self.shutting_down = False  # the dashboard is stopping: a running operation is interrupted, not stopped
+        self.interrupted: dict[str, Any] | None = None  # the open conversation's operation cut off by a restart
         self.harness = harness or Harness(cfg, case_id, model, posture, interactive=True, on_event=self.emit)
         self.harness.on_event = self.emit  # harness.emit persists feed events, then forwards them here
         self.harness.roe.approver = self.web_approver
@@ -263,7 +272,7 @@ class Dashboard:
             cmd, arg, fut = await self.owner_q.get()
             if cmd == "close":
                 try:
-                    self.stop()
+                    await self.halt()
                     await self.harness.close()
                     self.clear_run_state()
                 finally:
@@ -295,7 +304,7 @@ class Dashboard:
         old = self.harness
         old.audit.record("case_switch", to=case_id, by=user)
         for p in list(self.pending.values()):
-            if not p["future"].done():
+            if p.get("future") and not p["future"].done():
                 p["future"].set_result((False, "the dashboard moved to another case"))
         await old.close()
         new = Harness(self.cfg, case_id, old.model_name, old.roe.posture, interactive=True, on_event=self.emit)
@@ -364,70 +373,151 @@ class Dashboard:
         return str(d.get("token") or "") if ok else ""
 
     # ---- approvals ----------------------------------------------------------------
+    # Every request is saved (history.approvals). One still waiting when the dashboard stops is shown again after the
+    # restart ("restored": no future); the analyst's decision on it is stored and applied when the operation resumes.
     async def web_approver(self, tool: str, arguments: dict[str, Any], rationale: str, why: str) -> tuple[bool, str]:
-        aid = uuid.uuid4().hex[:12]
+        h = self.harness
+        ref = CURRENT_CALL.get()
+        conv = h._conv()["id"]
+        key = ref.key if ref else ""
+        row = h.history.approval_for_call(conv, key) if ref and ref.resumed else None
+        if row and row["status"] in LATER and row["tool"] == tool:  # decided after the restart: apply it now
+            ok = LATER[row["status"]]
+            h.history.approval_update(row["id"], status="approved" if ok else "denied")
+            self.pending.pop(row["id"], None)
+            h.emit("approval_resolved", {"id": row["id"], "approved": ok, "note": row["note"], "by": row["decided_by"],
+                                         "applied": True})
+            return ok, f"{row['note']} (decided while the operation was interrupted)".strip()
+        aid = row["id"] if row else uuid.uuid4().hex[:12]
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self.pending[aid] = {"id": aid, "tool": tool, "arguments": arguments, "rationale": rationale, "why": why,
-                             "requested": time.time(), "future": fut}
-        self.harness.emit("approval_request", self._public(self.pending[aid]))
+        entry = {"id": aid, "tool": tool, "arguments": arguments, "rationale": rationale, "why": why,
+                 "requested": row["requested"] if row else time.time(), "agent_id": ref.agent_id if ref else "",
+                 "asked_before_restart": bool(row), "future": fut}
+        if not row:
+            h.history.approval_add({"id": aid, "conversation_id": conv, "operation_id": (h.op or {}).get("id", ""),
+                                    "agent_id": entry["agent_id"], "call_key": key, "tool": tool, "arguments": arguments,
+                                    "rationale": rationale, "why": why, "requested": entry["requested"]})
+        self.pending[aid] = entry
+        h.emit("approval_request", self._public(entry))
         try:
             ok, note = await asyncio.wait_for(fut, self.approval_timeout_s)
+            status = "approved" if ok else "denied"
         except asyncio.TimeoutError:
-            ok, note = False, f"no analyst decision within {self.approval_timeout_s}s"
+            ok, note, status = False, f"no analyst decision within {self.approval_timeout_s}s", "timeout"
         except asyncio.CancelledError:
-            ok, note = False, "operation stopped by analyst"
             self.pending.pop(aid, None)
-            self.harness.emit("approval_resolved", {"id": aid, "approved": False, "note": note})
+            if not self.shutting_down:  # stopping the dashboard keeps it pending for after the restart
+                note = "operation stopped by analyst"
+                h.history.approval_update(aid, status="cancelled", note=note, decided=time.time())
+                h.emit("approval_resolved", {"id": aid, "approved": False, "note": note})
             raise
         self.pending.pop(aid, None)
-        self.harness.emit("approval_resolved", {"id": aid, "approved": ok, "note": note, "by": self.cfg.operator})
+        by = entry.get("by") or self.cfg.operator
+        h.history.approval_update(aid, status=status, note=note[:2000], decided_by=by, decided=time.time())
+        h.emit("approval_resolved", {"id": aid, "approved": ok, "note": note, "by": by})
         return ok, note
 
     @staticmethod
     def _public(p: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in p.items() if k != "future"}
 
-    def resolve(self, aid: str, approve: bool, note: str) -> bool:
+    def resolve(self, aid: str, approve: bool, note: str, user: str = "") -> bool:
         p = self.pending.get(aid)
-        if not p or p["future"].done():
+        if not p:
             return False
+        by = user or self.cfg.operator
+        if "future" not in p:  # asked before the dashboard restarted: decided now, applied as the operation resumes
+            h = self.harness
+            h.history.approval_update(aid, status="approved_later" if approve else "denied_later", note=note[:2000],
+                                      decided_by=by, decided=time.time())
+            self.pending.pop(aid)
+            h.audit.record("approval_decided_after_restart", id=aid, tool=p["tool"], arguments=p["arguments"],
+                           approved=approve, note=note[:500], by=by)
+            h.emit("approval_resolved", {"id": aid, "approved": approve, "note": note, "by": by, "later": True})
+            if self.interrupted and self.interrupted.get("resumable") and not self.running():
+                self.resume_run(by)  # the decision is the analyst's go-ahead: carry the operation on
+            return True
+        if p["future"].done():
+            return False
+        p["by"] = by
         p["future"].set_result((approve, note))
         return True
 
     # ---- runs -------------------------------------------------------------------------
-    def start_run(self, label: str, coro_factory) -> bool:
-        if self.run_task and not self.run_task.done():
+    def start_run(self, label: str, coro_factory, kind: str = "mission", playbook: str = "") -> bool:
+        """Run an operation in the background. kind: mission | retro | resume (the harness records a resume itself).
+        Starting anything else ends an interrupted operation in this conversation."""
+        if self.running():
             return False
+        h = self.harness
+        if kind != "resume":
+            h.op_begin(kind, label, playbook)
+        self.interrupted = None
+        self.pending = {k: v for k, v in self.pending.items() if "future" in v}
         self.run_label = label
 
         async def runner():
-            self.emit("run_start", {"label": label})
+            self.emit("run_start", {"label": label, "resumed": kind == "resume"})
             t0 = time.monotonic()
-            h = self.harness
             try:
                 text = await coro_factory()
+                h.op_end("done")
                 h.emit("run_end", {"label": label, "ok": True, "text": text, "seconds": round(time.monotonic() - t0, 1)})
             except asyncio.CancelledError:
-                self._repair_all("operation stopped by analyst")
-                h.emit("run_end", {"label": label, "ok": False, "text": "Stopped by analyst.", "stopped": True})
+                if self.shutting_down:  # the agents' checkpoints and pending approvals are kept for a resume
+                    h.op_end("interrupted")
+                    h.emit("run_end", {"label": label, "ok": False, "interrupted": True,
+                                       "text": "After the dashboard starts again, resume the operation from where it "
+                                               "stopped, or end it."})
+                else:
+                    self._repair_all("operation stopped by analyst")
+                    h.op_end("stopped")
+                    h.emit("run_end", {"label": label, "ok": False, "text": "Stopped by analyst.", "stopped": True})
             except Exception as e:  # surface backend/model failures to the GUI
                 self._repair_all(f"run failed: {type(e).__name__}")
+                h.op_end("failed", f"{type(e).__name__}: {e}")
                 h.emit("run_end", {"label": label, "ok": False, "text": f"{type(e).__name__}: {e}"})
 
         self.run_task = asyncio.create_task(runner())
         return True
+
+    def resume_run(self, user: str) -> bool:
+        """Carry on with the interrupted operation (Resume, or deciding an approval it was waiting for)."""
+        op = self.interrupted
+        if not op or not op.get("resumable"):
+            raise ValueError("there is no interrupted operation to resume in this conversation")
+        if self.running():
+            raise ValueError("an operation is running - stop it first")
+        self.harness.audit.record("operation_resume_requested", operation=op["id"], by=user)
+        return self.start_run(op["label"] or "mission", self.harness.resume, kind="resume", playbook=op["playbook"])
+
+    def end_interrupted(self, user: str) -> bool:
+        if self.running():
+            raise ValueError("an operation is running - stop it first")
+        op = self.harness.end_interrupted(f"ended by {user}")
+        self._load_interrupted()
+        return bool(op)
 
     def _repair_all(self, reason: str) -> None:
         h = self.harness
         if h.lead:
             h.lead.repair(reason)
         for sa in h.subagents.values():  # subagents cancelled mid-task keep a valid history for follow-ups
-            if sa.agent and sa.status == "running":
+            if sa.agent and sa.status in ("running", "queued"):
                 sa.status = "interrupted"
                 sa.agent.repair(reason)
 
     def running(self) -> bool:
         return bool(self.run_task and not self.run_task.done())
+
+    async def halt(self) -> None:
+        """The dashboard is stopping: cut the running operation off where it is, without denying its approvals or
+        closing its agents' open tool calls, so it can be resumed after the next start. (Stop ends it for good.)"""
+        if not self.running():
+            return
+        self.shutting_down = True
+        self.run_task.cancel()
+        await asyncio.wait({self.run_task}, timeout=15)
 
     # ---- conversations ------------------------------------------------------------------
     def load_history(self) -> None:
@@ -445,6 +535,26 @@ class Dashboard:
         for r in h.history.events(cid, keep):
             self.seq += 1
             self.events.append({"seq": self.seq, "ts": r["ts"], "kind": r["kind"], "data": r["data"], "replay": True})
+        self._load_interrupted()
+
+    def _load_interrupted(self) -> None:
+        """Offer the open conversation's interrupted operation, and the approvals it was waiting for."""
+        self.pending = {k: v for k, v in self.pending.items() if "future" in v}
+        op = self.harness.interrupted_operation() if self.harness.conversation else None
+        self.interrupted = op
+        for r in (op or {}).get("approvals", []):
+            if r["status"] == "pending":
+                self.pending[r["id"]] = {"id": r["id"], "tool": r["tool"], "arguments": r["arguments"],
+                                         "rationale": r["rationale"], "why": r["why"], "requested": r["requested"],
+                                         "agent_id": r["agent_id"], "restored": True}
+
+    def interrupted_public(self) -> dict[str, Any] | None:
+        op = self.interrupted
+        if not op or self.running():
+            return None
+        return {"id": op["id"], "label": op["label"], "playbook": op["playbook"], "kind": op["kind"],
+                "started": op["started"], "resumable": bool(op.get("resumable")),
+                "waiting": sum(1 for p in self.pending.values() if p.get("restored"))}
 
     def switch(self, action) -> None:
         if self.running():
@@ -455,12 +565,17 @@ class Dashboard:
         self.emit("conversation_switched", {"id": conv["id"] if conv else None})
 
     def stop(self) -> bool:
-        if not self.run_task or self.run_task.done():
+        """The analyst's Stop: deny what is waiting, cancel the operation and every subagent working for it."""
+        if not self.running():
             return False
         for p in list(self.pending.values()):
-            if not p["future"].done():
-                p["future"].set_result((False, "operation stopped by analyst"))
+            fut = p.get("future")
+            if fut and not fut.done():
+                fut.set_result((False, "operation stopped by analyst"))
         self.run_task.cancel()
+        for sa in self.harness.subagents.values():
+            if sa.job and not sa.job.done():
+                sa.job.cancel()
         return True
 
     # ---- state ----------------------------------------------------------------------
@@ -502,6 +617,7 @@ class Dashboard:
             "running": bool(self.run_task and not self.run_task.done()),
             "run_label": self.run_label,
             "pending": [self._public(p) for p in self.pending.values()],
+            "interrupted": self.interrupted_public(),
             "playbooks": playbooks,
             "memory_kinds": KINDS,
             "last_seq": self.seq,
@@ -707,7 +823,21 @@ def create_app(dash: Dashboard) -> Starlette:
         drafts = sorted(h.reports_dir.glob("report_*.md"), key=lambda q: q.stat().st_mtime) if h.reports_dir.is_dir() else []
         finals = [q for q in drafts if q.name.endswith("_final.md")]
         p = finals[-1] if finals else drafts[-1] if drafts else h.case.dir / "report.md"
-        return PlainTextResponse(p.read_text(encoding="utf-8") if p.exists() else "")
+        text = p.read_text(encoding="utf-8") if p.exists() else ""
+        if request.query_params.get("format") == "json":  # the dashboard's Report tab: which file, for its buttons
+            return JSONResponse({"name": p.name if p.exists() and p.parent == h.reports_dir else "", "text": text,
+                                 "final": p.name.endswith("_final.md")})
+        return PlainTextResponse(text)
+
+    async def source(request: Request) -> Response:
+        """A report citation's source ([FIN-0001], [EV-12], [FILE:hunt_plan_x.md], ...) from this case's mission data."""
+        sid = request.path_params["sid"]
+        src = await asyncio.to_thread(dash.harness.mission_data().get, sid) if reports.SOURCE_ID.match(sid) else None
+        if not src:
+            return JSONResponse({"error": f"{sid[:80]} is not in this case's mission data"}, 404)
+        limit = 200_000
+        text = src.text if len(src.text) <= limit else src.text[:limit] + f"\n... [{len(src.text) - limit} more characters]"
+        return JSONResponse({"id": src.id, "kind": src.kind, "line": src.line, "text": text})
 
     # -- hunt plans folder: list, view/download, open in an editor --
     async def plans(request: Request) -> Response:
@@ -738,6 +868,24 @@ def create_app(dash: Dashboard) -> Starlette:
             return Response(data, media_type=media, headers={"Content-Disposition": f'attachment; filename="{safe}"'})
         return Response(data, media_type="text/plain; charset=utf-8")
 
+    async def plan_docx(request: Request) -> Response:
+        """A markdown plan or report from the case, as a Word document (stdlib writer). Audited: it leaves the case."""
+        path = plan_path(request)
+        if not path or path.suffix != ".md":
+            return JSONResponse({"error": "only a markdown file in this case's plans and reports folders can be exported"}, 404)
+        if path.stat().st_size > 5 * 1024 * 1024:
+            raise ValueError("file too large to export")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        draft = re.match(r"report_.+_v\d+\.md$", path.name) is not None
+        notice = ("DRAFT - not yet approved by the analyst as the final report" if draft else "")
+        data = await asyncio.to_thread(docx.to_docx, text, huntplans.title(path) or path.stem, notice)
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", path.stem) + ".docx"
+        s = dash.session(request)
+        dash.harness.audit.record("file_exported", file=str(path), format="docx", draft=draft, bytes=len(data),
+                                  user=s["user"] if s else "?")
+        return Response(data, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        headers={"Content-Disposition": f'attachment; filename="{safe}"'})
+
     async def plan_open(request: Request) -> Response:
         d = await body(request)
         path = plan_path(request)
@@ -764,16 +912,24 @@ def create_app(dash: Dashboard) -> Starlette:
             text = pb.read_text(encoding="utf-8") + "\n\n# Details from analyst\n" + (text or "(none)")
         if not text:
             raise ValueError("empty message")
-        if not dash.start_run(playbook or "mission", lambda: dash.harness.mission(text, str(d.get("text", "")), playbook)):
+        if not dash.start_run(playbook or "mission", lambda: dash.harness.mission(text, str(d.get("text", "")), playbook),
+                              playbook=playbook):
             return JSONResponse({"error": "an operation is already running - wait or press Stop"}, 409)
         return JSONResponse({"ok": True})
+
+    async def operation_resume(request: Request) -> Response:
+        dash.resume_run(user_of(request))
+        return JSONResponse({"ok": True})
+
+    async def operation_end(request: Request) -> Response:
+        return JSONResponse({"ok": dash.end_interrupted(user_of(request))})
 
     async def stop(request: Request) -> Response:
         return JSONResponse({"ok": dash.stop()})
 
     async def approval(request: Request) -> Response:
         d = await body(request)
-        ok = dash.resolve(request.path_params["aid"], bool(d.get("approve")), str(d.get("note", ""))[:2000])
+        ok = dash.resolve(request.path_params["aid"], bool(d.get("approve")), str(d.get("note", ""))[:2000], user_of(request))
         return JSONResponse({"ok": ok}, 200 if ok else 404)
 
     async def verdict(request: Request) -> Response:
@@ -796,7 +952,7 @@ def create_app(dash: Dashboard) -> Starlette:
         return JSONResponse({"ok": ok})
 
     async def retro(request: Request) -> Response:
-        if not dash.start_run("after-action review", dash.harness.retro):
+        if not dash.start_run("after-action review", dash.harness.retro, kind="retro"):
             return JSONResponse({"error": "an operation is already running"}, 409)
         return JSONResponse({"ok": True})
 
@@ -848,11 +1004,11 @@ def create_app(dash: Dashboard) -> Starlette:
     # -- subagents --
     async def subagent_steer(request: Request) -> Response:
         d = await body(request)
-        dash.harness.steer_subagent(request.path_params["sid"], str(d.get("message", "")), dash.cfg.operator)
+        dash.harness.steer_subagent(request.path_params["sid"], str(d.get("message", "")), user_of(request))
         return JSONResponse({"ok": True})
 
     async def subagent_stop(request: Request) -> Response:
-        dash.harness.stop_subagent(request.path_params["sid"], dash.cfg.operator)
+        dash.harness.stop_subagent(request.path_params["sid"], user_of(request))
         return JSONResponse({"ok": True})
 
     # -- conversations --
@@ -971,8 +1127,12 @@ def create_app(dash: Dashboard) -> Starlette:
         Route("/api/plans", guard(plans)),
         Route("/api/plans/{name}", guard(plan_file)),
         Route("/api/plans/{name}/open", guard(plan_open, True), methods=["POST"]),
+        Route("/api/plans/{name}/docx", guard(plan_docx)),
+        Route("/api/source/{sid}", guard(source)),
         Route("/api/message", guard(message, True), methods=["POST"]),
         Route("/api/stop", guard(stop, True), methods=["POST"]),
+        Route("/api/operation/resume", guard(operation_resume, True), methods=["POST"]),
+        Route("/api/operation/end", guard(operation_end, True), methods=["POST"]),
         Route("/api/approvals/{aid}", guard(approval, True), methods=["POST"]),
         Route("/api/verdict", guard(verdict, True), methods=["POST"]),
         Route("/api/remember", guard(remember, True), methods=["POST"]),

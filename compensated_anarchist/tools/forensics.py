@@ -17,6 +17,7 @@ import os
 import sys
 import re
 import shutil
+import signal
 import stat
 import uuid
 from datetime import datetime, timezone
@@ -83,15 +84,19 @@ class Forensics:
         return d
 
     async def _run(self, argv: list[str], timeout: int | None = None, cwd: Path | None = None) -> str:
+        # its own process group, so a timeout or Stop also ends the workers it starts (plaso runs several)
         proc = await asyncio.create_subprocess_exec(
             *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=cwd,
-            stdin=asyncio.subprocess.DEVNULL)
+            stdin=asyncio.subprocess.DEVNULL, start_new_session=True)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout or self.timeout)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_group(proc)
             await proc.wait()
             return f"ERROR: timed out after {timeout or self.timeout}s: {' '.join(argv[:4])} ..."
+        except asyncio.CancelledError:  # the analyst stopped the operation or this subagent, or the dashboard stopped
+            _kill_group(proc)
+            raise
         text = out[:MAX_CAPTURE].decode("utf-8", "replace")
         if proc.returncode != 0:
             text += f"\n[exit code {proc.returncode}]\n[stderr]\n" + err[-4000:].decode("utf-8", "replace")
@@ -523,3 +528,13 @@ class Forensics:
             Tool("local_run", "Run an allowlisted forensic binary (e.g. Sleuth Kit fls/icat/mmls, bulk_extractor) with argv list; no shell. Working dir = case artifacts.",
                  schema({"binary": S, "args": L, "timeout_s": I}, ["binary", "args"]), self.run),
         ]
+
+
+def _kill_group(proc: Any) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass

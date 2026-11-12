@@ -147,12 +147,13 @@ async function copyText(text) {
 /* ---------------------------------------------------------------- safe markdown -> DOM */
 function inline(text) {
   const frag = document.createDocumentFragment();
-  const re = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\*[^*\s][^*\n]*\*|(?:[\w.~-]*\/)*(?:hunt_plan_|hunt_results_|attack_layer_|vuln_report_|cte_plan_|cte_results_|report_)[\w.-]+\.(?:md|json))/g;
+  const re = /(\[[^\[\]\n]{1,400}\](?!\()|\*\*[^*\n]+\*\*|`[^`\n]+`|\*[^*\s][^*\n]*\*|(?:[\w.~-]*\/)*(?:hunt_plan_|hunt_results_|attack_layer_|vuln_report_|cte_plan_|cte_results_|report_)[\w.-]+\.(?:md|json))/g;
   let last = 0, m;
   while ((m = re.exec(text))) {
     if (m.index > last) frag.append(document.createTextNode(text.slice(last, m.index)));
     const t = m[0];
-    if (t.startsWith("**")) frag.append(el("strong", { text: t.slice(2, -2) }));
+    if (t.startsWith("[")) frag.append(citeNodes(t.slice(1, -1)) || el("span", {}, "[", inline(t.slice(1, -1)), "]"));
+    else if (t.startsWith("**")) frag.append(el("strong", { text: t.slice(2, -2) }));
     else if (t.startsWith("`")) frag.append(fileRef(t.slice(1, -1)) || el("code", { text: t.slice(1, -1) }));
     else if (t.startsWith("*")) frag.append(el("em", { text: t.slice(1, -1) }));
     else frag.append(fileRef(t) || document.createTextNode(t));
@@ -206,6 +207,48 @@ function md(src) {
   return root;
 }
 
+/* ---------------------------------------------------------------- report citations: each cited source opens */
+// Reports cite the mission data like [FIN-0001, EV-12] or [FILE:hunt_plan_x.md]; the same ids as the report writer.
+const SOURCE_ID = /^(?:(?:FIN|IOC|TIM|EVI|NOT|STA)-\d{4,}|EV-\d+|CASE|NOW|FILE:[\w.\-]+)$/i;
+const SOURCE_KIND = { finding: "Finding", ioc: "Indicator", timeline: "Timeline event", evidence: "Evidence", note: "Case note",
+  statement: "Your answer to an agent", case: "Case record", date: "The report's date", file: "Case file",
+  analyst_message: "Your message", subagent_report: "Subagent report", text: "Agent message", result: "Tool result" };
+function citeNodes(inner) {
+  const parts = inner.split(/([,;]\s*|\s+and\s+)/);
+  if (!parts.some((x) => SOURCE_ID.test(x.trim()))) return null;
+  const span = el("span", { class: "cites" }, "[");
+  for (const x of parts) span.append(SOURCE_ID.test(x.trim()) ? citeRef(x.trim()) : document.createTextNode(x));
+  span.append("]");
+  return span;
+}
+function citeRef(id) {
+  // a span, not a button: citations also sit inside clickable rows, and buttons cannot nest
+  const n = el("span", { class: "cite", role: "button", tabindex: "0", title: `Show the cited source ${id}` }, id);
+  const go = (e) => { e.preventDefault(); e.stopPropagation(); openSource(id); };
+  n.addEventListener("click", go);
+  n.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") go(e); });
+  return n;
+}
+async function openSource(id) {
+  let src;
+  try { src = await api("/api/source/" + encodeURIComponent(id)); } catch (e) { toast(e.message, true); return; }
+  const tab = { finding: "findings", ioc: "iocs", timeline: "timeline", evidence: "evidence" }[src.kind];
+  const file = src.kind === "file" ? src.id.slice(5) : "";
+  const dlg = openDialog({ title: src.id, sub: SOURCE_KIND[src.kind] || src.kind, iconName: "file", wide: true, cls: "source-view",
+    body: [el("div", { class: "muted small", text: src.line }), el("pre", { class: "code source-text", text: src.text || "(empty)" })],
+    foot: [el("span", { class: "note", text: "Mission data: what the report cites for this fact." }),
+      tab ? el("button", { type: "button", class: "btn btn-sm", onclick: () => { dlg.close(); showInCase(tab, src.id); } }, icon("panel", 14), "Show in the case panel") : null,
+      file && PLAN_FILE_RE.test(file) ? el("button", { type: "button", class: "btn btn-sm", onclick: () => { dlg.close(); viewPlan(file); } }, icon("file", 14), "Open the file") : null,
+      el("button", { type: "button", class: "btn btn-sm", onclick: () => dlg.close() }, "Close")] });
+}
+function showInCase(tab, id) {
+  if (S.view !== "ops") go("ops");
+  S.insp.open = true; S.insp.thread = null; S.insp.tab = tab; setPref("insp", "1");
+  renderInsp(); renderHeader();
+  const n = [...$("insp").querySelectorAll("[data-ref]")].find((x) => x.dataset.ref === id);
+  if (n) { n.scrollIntoView({ block: "center" }); n.classList.add("flash"); n.setAttribute("tabindex", "-1"); n.focus({ preventScroll: true }); setTimeout(() => n.classList.remove("flash"), 1700); }
+}
+
 function withCaret(root) {
   let host = root.lastElementChild || root;
   if (host.tagName === "UL" || host.tagName === "OL") host = host.lastElementChild || host;
@@ -223,7 +266,7 @@ function tailLine(s, n = 140) {
 /* ================================================================ state */
 const S = {
   st: null, convs: [], view: "ops", lastSeq: 0, es: null, connected: false,
-  replaying: false, loading: false, buffer: [],
+  replaying: false, loading: false, buffer: [], feedStart: 0,
   pending: new Map(), approvalCards: new Map(),
   subs: new Map(), turns: [], turn: null, hero: null,
   insp: { open: pref("insp", "1") === "1", tab: "findings", thread: null },
@@ -231,6 +274,7 @@ const S = {
   drafts: new Map(), dialogs: [], menu: null, ui: {},
   live: new Map(),        // agent_id -> { text, seq }: the reply being streamed right now
   stopArmed: new Map(),   // subagent id -> time until which "Confirm stop" stays armed (survives re-renders)
+  announced: new Set(),   // approval ids already announced to screen readers
   steerDrafts: new Map(), // subagent id -> unsent guidance text
   clsDraft: null,         // unsaved edits to the classification banner on the Settings page
   plans: null,            // /api/plans: the case's hunt plans folder and how this browser can open its files
@@ -318,8 +362,8 @@ function targetsOf(args) {
 }
 function statusChip(status, secs) {
   const map = { completed: ["chip ok", "Done"], blocked: ["chip warn", "Blocked"], needs_input: ["chip warn", "Needs input"],
-    failed: ["chip red", "Failed"], stopped: ["chip", "Stopped"], interrupted: ["chip warn", "Interrupted"] };
-  if (status === "running") return el("span", { class: "spin", title: "Running" });
+    failed: ["chip red", "Failed"], stopped: ["chip", "Stopped"], interrupted: ["chip warn", "Interrupted"], queued: ["chip", "Waiting for a slot"] };
+  if (status === "running") return el("span", { class: "spin", role: "img", "aria-label": "Running", title: "Running" });
   const [cls, label] = map[status] || ["chip", status || "Idle"];
   return el("span", { class: cls, text: label + (secs ? ` · ${fmtDur(secs)}` : "") });
 }
@@ -344,7 +388,8 @@ function navItem(view, ic, label, extra) {
   return el("a", { class: "navi" + (S.view === view ? " on" : ""), href: view === "ops" ? "#/" : "#/" + view, "aria-current": S.view === view ? "page" : null },
     icon(ic), label, extra || null);
 }
-function renderSide() {
+function renderSide() { keepFocus($("side"), drawSide); }
+function drawSide() {
   const st = S.st; if (!st) return;
   const side = clear($("side"));
   const top = el("div", { class: "side-top" },
@@ -408,12 +453,13 @@ function buildOps() {
     onclick: (e) => openMenu(e.currentTarget, convMenuItems()) }, icon("more"));
   const menuBtn = el("button", { type: "button", class: "btn btn-ghost icon-btn menu-btn", "aria-label": "Open sidebar", onclick: () => $("side").classList.toggle("open") }, icon("menu"));
   const top = el("header", { class: "topbar" }, menuBtn, el("div", { class: "topbar-title" }, ui.title, ui.sub), ui.gate, ui.posture, ui.inspBtn, more);
-  ui.banner = el("div", { class: "banner", role: "alert", hidden: true });
+  ui.resume = el("div", { class: "banner resume", role: "region", "aria-label": "Interrupted operation", hidden: true });
+  ui.banner = el("div", { class: "banner", role: "region", "aria-label": "Approval needed", hidden: true });
   ui.feed = el("div", { class: "feed", role: "log", "aria-label": "Operation feed" });
   ui.jump = el("button", { type: "button", class: "btn jump", hidden: true, onclick: scrollBottom }, icon("chevD", 15), "Jump to latest");
   ui.feedScroll = el("div", { class: "feed-scroll", onscroll: onFeedScroll }, ui.feed, ui.jump);
   ui.subframe = el("div", { class: "subframe", hidden: true });
-  ui.input = el("textarea", { rows: 1, placeholder: "Task the lead…", "aria-label": "Message the lead", oninput: onComposerInput, onkeydown: onComposerKey });
+  ui.input = el("textarea", { id: "composer", rows: 1, placeholder: "Task the lead…", "aria-label": "Message the lead", oninput: onComposerInput, onkeydown: onComposerKey });
   ui.pbPill = el("div", { class: "pb-pill", hidden: true });
   ui.pbBtn = el("button", { type: "button", class: "btn btn-ghost btn-sm", onclick: (e) => openMenu(e.currentTarget, playbookMenu()) }, icon("list", 15), "Playbook");
   ui.modelBtn = el("button", { type: "button", class: "btn btn-ghost btn-sm", title: "Model for the lead (config/models.yaml)", onclick: (e) => openModelMenu(e.currentTarget) });
@@ -423,7 +469,7 @@ function buildOps() {
     el("div", { class: "composer-bar" }, ui.pbBtn, ui.modelBtn, el("span", { class: "hint", text: "Enter to send · Shift+Enter for a new line" }), ui.sendBtn));
   ui.status = el("div", { class: "statusbar" });
   const dock = el("div", { class: "dock" }, el("div", { class: "dock-inner" }, ui.subframe, form, ui.status));
-  v.append(top, ui.banner, ui.feedScroll, dock);
+  v.append(top, ui.resume, ui.banner, ui.feedScroll, dock);
 }
 function renderHeader() {
   const st = S.st; if (!st) return;
@@ -441,17 +487,75 @@ function renderHeader() {
   S.ui.inspBtn.setAttribute("aria-pressed", String(S.insp.open));
   document.title = (S.pending.size ? `(${S.pending.size}) Approval needed · ` : "") + (c ? c.title + " · " : "") + "Compensated Anarchist";
 }
+// Redrawn every second for its clock: the text changes in place, the Review button is never replaced (a keyboard
+// user may be on it).
 function renderBanner() {
   const b = S.ui.banner;
   if (!S.pending.size) { b.hidden = true; return; }
   const p = S.pending.values().next().value;
+  if (!S.ui.bannerTxt) {
+    S.ui.bannerTxt = el("div", { class: "txt" });
+    b.append(icon("shield", 18), S.ui.bannerTxt, el("button", { type: "button", class: "btn btn-primary", onclick: () => openApproval(S.bannerId) }, "Review"));
+  }
+  S.bannerId = p.id;
   const tgt = targetsOf(p.arguments);
   const who = agentOf(p.why);
-  clear(b).append(icon("shield", 18),
-    el("div", { class: "txt" }, el("strong", { text: "Approval needed: " }), `${toolLabel(p.tool)}${tgt ? " · " + tgt : ""}`,
-      el("span", { class: "muted", text: ` · requested by ${who || "an agent"} ${fmtRel(p.requested)}${S.pending.size > 1 ? ` · ${S.pending.size - 1} more waiting` : ""}` })),
-    el("button", { type: "button", class: "btn btn-primary", onclick: () => openApproval(p.id) }, "Review"));
+  const when = p.restored ? "before the dashboard restarted" : fmtRel(p.requested);
+  clear(S.ui.bannerTxt).append(el("strong", { text: "Approval needed: " }), `${toolLabel(p.tool)}${tgt ? " · " + tgt : ""}`,
+    el("span", { class: "muted", text: ` · requested by ${who || "an agent"} ${when}${S.pending.size > 1 ? ` · ${S.pending.size - 1} more waiting` : ""}` }));
   b.hidden = false;
+  announce(p);
+}
+// Panels are redrawn from state; put keyboard focus back on the same control afterwards (matched by id, else by
+// its role, label and text), so redraws never drop a keyboard or screen-reader user back to the page.
+const FOCUSABLE = "button, a[href], input, textarea, select, [tabindex]";
+function focusKey(n) {
+  return n.id ? "#" + n.id : [n.tagName, n.getAttribute("role") || "", n.getAttribute("aria-label") || "", (n.textContent || "").trim().slice(0, 80), n.getAttribute("href") || ""].join("|");
+}
+function captureFocus(box) {
+  const ae = document.activeElement;
+  if (!ae || ae === document.body || !box.contains(ae)) return null;
+  return { el: ae, key: focusKey(ae), sel: typeof ae.selectionStart === "number" ? [ae.selectionStart, ae.selectionEnd] : null };
+}
+function restoreFocus(box, f) {
+  if (!f || (f.el.isConnected && box.contains(f.el))) return;
+  const n = [...box.querySelectorAll(FOCUSABLE)].find((x) => focusKey(x) === f.key);
+  if (!n) return;
+  n.focus({ preventScroll: true });
+  if (f.sel) try { n.setSelectionRange(f.sel[0], f.sel[1]); } catch (e) { /* not a text field */ }
+}
+function keepFocus(box, fn) { const f = captureFocus(box); fn(); restoreFocus(box, f); }
+// One spoken announcement per new approval (the banner itself is redrawn every second for its clock).
+function announce(p) {
+  if (!p || S.announced.has(p.id)) return;
+  S.announced.add(p.id);
+  const tgt = targetsOf(p.arguments);
+  $("announcer").textContent = `Approval needed: ${toolLabel(p.tool)}${tgt ? ", " + tgt : ""}, requested by ${agentOf(p.why) || "an agent"}.`;
+}
+// An operation cut off by a dashboard restart: resume it from where each agent stopped, or end it.
+function renderResume() { keepFocus(S.ui.resume, drawResume); }
+function drawResume() {
+  const b = S.ui.resume; const op = S.st && S.st.interrupted;
+  if (!op || S.running) { b.hidden = true; return; }
+  const what = op.label && op.label !== "mission" ? `The ${humanPb(op.label)} operation` : "The operation";
+  const how = op.waiting ? `It was waiting for your approval (${plural(op.waiting, "request")} below). Deciding it carries the operation on.`
+    : op.resumable ? "Resume carries each agent on from where it stopped; tool calls that had no result are checked against the ROE again."
+      : "An after-action review cannot be resumed. End it, then run it again.";
+  clear(b).append(icon("clock", 18),
+    el("div", { class: "txt" }, el("strong", { text: "Interrupted by a restart: " }), `${what} started ${fmtRel(op.started)} did not finish. `,
+      el("span", { class: "muted", text: how })),
+    op.resumable ? el("button", { type: "button", class: "btn btn-primary", onclick: resumeOp }, "Resume") : null,
+    el("button", { type: "button", class: "btn", onclick: endOpDialog }, "End it"));
+  b.hidden = false;
+}
+async function resumeOp() { try { await api("/api/operation/resume", {}); } catch (e) { toast(e.message, true); } }
+function endOpDialog() {
+  const dlg = openDialog({ title: "End the interrupted operation?", iconName: "stop",
+    body: [el("p", { css: { margin: "0" }, text: "Tool calls that had no result are closed as not executed, and approvals it was waiting for expire. Everything found so far stays in the case and the conversation." })],
+    foot: [el("span", { class: "note", text: "Recorded in the audit log." }), el("button", { type: "button", class: "btn", onclick: () => dlg.close() }, "Cancel"),
+      el("button", { type: "button", class: "btn btn-primary", onclick: async () => {
+        try { await api("/api/operation/end", {}); dlg.close(); toast("Ended the interrupted operation"); scheduleRefresh(); } catch (e) { toast(e.message, true); }
+      } }, "End it")] });
 }
 function renderStatus() {
   const s = clear(S.ui.status); const st = S.st; if (!st) return;
@@ -476,7 +580,8 @@ function renderComposerState() {
   const btn = clear(S.ui.sendBtn);
   if (S.running) { btn.append(icon("stop", 15, 2.2)); btn.setAttribute("aria-label", "Stop the operation"); btn.title = "Stop the operation"; }
   else { btn.append(icon("up", 16, 2)); btn.setAttribute("aria-label", "Send"); btn.title = "Send"; }
-  S.ui.input.placeholder = S.running ? "The lead is working. Stop it, or wait for its report." : "Task the lead…";
+  S.ui.input.placeholder = S.running ? "The lead is working. Stop it, or wait for its report."
+    : st.interrupted ? "Resume or end the interrupted operation above, or send a new task (that ends it)" : "Task the lead…";
   if (S.playbook) {
     clear(S.ui.pbPill).append(icon("list", 13), `Playbook: ${humanPb(S.playbook)}`,
       el("button", { type: "button", "aria-label": "Remove playbook", onclick: () => setPlaybook("") }, icon("x", 13, 2)));
@@ -515,7 +620,42 @@ function onFeedScroll() { const sc = S.ui.feedScroll; if (sc.scrollHeight - sc.s
 function scrollBottom() { const sc = S.ui.feedScroll; sc.scrollTop = sc.scrollHeight; S.ui.jump.hidden = true; }
 function resetFeed() {
   clear(S.ui.feed); S.turns = []; S.turn = null; S.hero = null; S.subs.clear(); S.approvalCards.clear(); S.insp.thread = null;
-  S.live.clear();
+  S.live.clear(); S.feedStart = 0;
+}
+// Long conversations: only the newest FEED_KEEP turns stay in the page. Older ones are detached (kept in memory, still
+// updated) and come back, a batch at a time, when you scroll up to them or press "Show earlier".
+const FEED_KEEP = 40, FEED_SLACK = 20, FEED_BATCH = 20;
+function trimFeed() {
+  if (S.turns.length - S.feedStart <= FEED_KEEP + FEED_SLACK) return;
+  if (!S.replaying) { const sc = S.ui.feedScroll; if (sc.scrollHeight - sc.scrollTop - sc.clientHeight > 400) return; } // reading back
+  const upTo = S.turns.length - FEED_KEEP;
+  for (let i = S.feedStart; i < upTo; i++) S.turns[i].root.remove();
+  S.feedStart = upTo;
+  syncMore();
+}
+function syncMore() {
+  if (!S.ui.more) {
+    S.ui.more = el("button", { type: "button", class: "btn btn-sm feed-more", onclick: () => showEarlier(FEED_BATCH) });
+    if ("IntersectionObserver" in window) {
+      S.moreObserver = new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting)) showEarlier(FEED_BATCH); },
+        { root: S.ui.feedScroll, rootMargin: "300px 0px 0px 0px" });
+    }
+  }
+  const b = S.ui.more, n = S.feedStart;
+  if (!n) { b.remove(); if (S.moreObserver) S.moreObserver.unobserve(b); return; }
+  b.textContent = `Show earlier turns (${n} more)`;
+  if (!b.isConnected) { S.ui.feed.prepend(b); if (S.moreObserver) S.moreObserver.observe(b); }
+}
+function showEarlier(n) {
+  if (!S.feedStart) return;
+  const sc = S.ui.feedScroll, before = sc.scrollHeight;
+  const from = Math.max(0, S.feedStart - n);
+  const frag = document.createDocumentFragment();
+  for (let i = from; i < S.feedStart; i++) frag.append(S.turns[i].root);
+  S.turns[S.feedStart].root.before(frag);
+  S.feedStart = from;
+  syncMore();
+  sc.scrollTop += sc.scrollHeight - before; // keep what you were reading where it was
 }
 function showHero() {
   if (S.hero || S.turns.length || !S.st) return;
@@ -539,6 +679,8 @@ function newTurn(kind, data, ts) {
       el("div", { class: "bubble-meta", title: new Date(ts * 1000).toISOString(), text: `${who}${data.playbook ? " · playbook " + humanPb(data.playbook) : ""} · ${fmtClock(ts)}` })));
   } else if (kind === "retro") {
     t.root.append(el("div", { class: "turn-label" }, icon("refresh", 14), "After-action review"));
+  } else if (kind === "resume") {
+    t.root.append(el("div", { class: "turn-label" }, icon("refresh", 14), `Resumed the interrupted operation${data && data.label && data.label !== "mission" ? " · " + humanPb(data.label) : ""}`));
   }
   t.workChev = el("span", { class: "chev" }, icon("chevR", 14));
   t.workWhat = el("span", { class: "what" });
@@ -560,6 +702,7 @@ function newTurn(kind, data, ts) {
   mutate(() => S.ui.feed.append(t.root));
   S.turns.push(t); S.turn = t;
   updateWorkHead(t);
+  trimFeed();
   return t;
 }
 function ensureTurn(ts) { return S.turn || newTurn("system", null, ts); }
@@ -591,10 +734,11 @@ function finishTurn(t, ts, d, silent) {
   updateWorkHead(t);
   if (d && !d.ok && !silent) {
     t.lead.hidden = false;
-    const box = el("div", { class: "error-card" },
-      el("div", { class: "head" }, icon("alert", 16), d.stopped ? "Stopped by you" : "The operation failed"),
+    const head = d.ended ? "Ended after the restart" : d.stopped ? "Stopped by you" : d.interrupted ? "Interrupted: the dashboard stopped" : "The operation failed";
+    const box = el("div", { class: "error-card" + (d.interrupted ? " warn" : "") },
+      el("div", { class: "head" }, icon(d.interrupted ? "clock" : "alert", 16), head),
       el("div", { class: "small", text: d.text || "" }),
-      d.stopped ? null : el("div", { class: "toolbar" },
+      d.stopped || d.interrupted ? null : el("div", { class: "toolbar" },
         t.text || t.playbook ? el("button", { type: "button", class: "btn btn-sm", onclick: () => send(t.text || "", t.playbook || "") }, icon("refresh", 14), "Retry") : null,
         el("button", { type: "button", class: "btn btn-sm", onclick: () => copyText(d.text || "") }, icon("copy", 14), "Copy details")));
     mutate(() => t.extras.append(box));
@@ -603,18 +747,22 @@ function finishTurn(t, ts, d, silent) {
 function addStep(t, o) {
   t.lead.hidden = false;
   const expandable = typeof o.body === "function";
-  const row = el(expandable ? "button" : "div", { class: "step" + (o.denied ? " denied" : "") + (o.note ? " note" : ""), type: expandable ? "button" : null, "aria-expanded": expandable ? "false" : null });
+  const asButton = expandable && !o.note;
+  const row = el(asButton ? "button" : "div", { class: "step" + (o.denied ? " denied" : "") + (o.note ? " note" : "") + (expandable ? " expandable" : ""), type: asButton ? "button" : null, "aria-expanded": asButton ? "false" : null });
   const st = { row, end: el("span", { class: "end" }), wrap: null, bodyEl: null, data: o };
   row.append(...[el("span", { class: "ic" }, icon(o.icon || "box")), o.note ? el("span", { class: "what" }, inline(o.what)) : el("span", { class: "what", text: o.what }),
     o.note ? null : el("span", { class: "detail", text: o.detail || "" }), st.end].filter(Boolean));
-  if (expandable) row.append(el("span", { class: "chev" }, icon("chevR", 14)));
+  const toggle = expandable && o.note ? el("button", { type: "button", class: "chev-btn", "aria-expanded": "false", "aria-label": "Show the full text" }, icon("chevR", 14)) : null;
+  if (asButton) row.append(el("span", { class: "chev" }, icon("chevR", 14)));
+  if (toggle) row.append(toggle);
   st.wrap = el("div", {}, row);
   if (expandable) {
-    row.addEventListener("click", () => {
-      if (st.bodyEl) { st.bodyEl.remove(); st.bodyEl = null; row.classList.remove("open"); row.setAttribute("aria-expanded", "false"); return; }
-      st.bodyEl = el("div", { class: "step-body fade" }, o.body(st));
-      st.wrap.append(st.bodyEl); row.classList.add("open"); row.setAttribute("aria-expanded", "true");
-    });
+    const flip = () => {
+      const open = !st.bodyEl;
+      if (!open) { st.bodyEl.remove(); st.bodyEl = null; } else { st.bodyEl = el("div", { class: "step-body fade" }, o.body(st)); st.wrap.append(st.bodyEl); }
+      row.classList.toggle("open", open); (toggle || row).setAttribute("aria-expanded", String(open));
+    };
+    row.addEventListener("click", (e) => { if (!toggle || !e.target.closest(".file-ref, .cite")) flip(); });
   }
   if (o.endNodes) st.end.append(...o.endNodes.filter(Boolean));
   mutate(() => t.workList.append(st.wrap));
@@ -664,32 +812,36 @@ function subLog(id, kind, d, ts) {
   if (S.insp.thread === id) renderInspSoon();
 }
 const renderSubframeSoon = debounce(() => renderSubframe(), 60);
-function renderSubframe() {
+function renderSubframe() { keepFocus(S.ui.subframe, drawSubframe); }
+function drawSubframe() {
   const f = S.ui.subframe;
   const subs = [...S.subs.values()].filter((s) => s.expert);
   if (!subs.length) { f.hidden = true; return; }
-  const running = subs.filter((s) => s.status === "running");
+  const running = subs.filter((s) => s.status === "running" || s.status === "queued");
   const waiting = running.filter(isWaiting);
-  const done = subs.length - running.length;
+  const interrupted = subs.filter((s) => s.status === "interrupted").length;
+  const done = subs.length - running.length - interrupted;
   const open = S.subframeOpen === null ? running.length > 0 : S.subframeOpen;
   const summary = [running.length - waiting.length ? `${running.length - waiting.length} running` : null,
-    waiting.length ? `${waiting.length} waiting for approval` : null, done ? `${done} finished` : null].filter(Boolean).join(" · ");
+    waiting.length ? `${waiting.length} waiting for approval` : null, interrupted ? `${interrupted} interrupted` : null,
+    done ? `${done} finished` : null].filter(Boolean).join(" · ");
   clear(f).append(el("button", { type: "button", class: "step head" + (open ? " open" : ""), "aria-expanded": String(open),
     onclick: () => { S.subframeOpen = !open; renderSubframe(); } },
     el("span", { class: "ic" }, icon("users")), el("span", { class: "what", text: plural(subs.length, "subagent") }),
     el("span", { class: "detail", text: summary }), el("span", { class: "chev" }, icon(open ? "chevD" : "chevU", 14))));
   if (open) {
     const list = el("div", { class: "sub-list" });
-    const order = [...subs].sort((a, b) => (b.status === "running") - (a.status === "running") || b.id.localeCompare(a.id));
+    const active = (s) => s.status === "running" || s.status === "queued";
+    const order = [...subs].sort((a, b) => active(b) - active(a) || b.id.localeCompare(a.id));
     for (const s of order) list.append(subRow(s));
     f.append(list);
   }
   f.hidden = false;
 }
 function subRow(s) {
-  const run = s.status === "running", wait = isWaiting(s);
+  const run = s.status === "running" || s.status === "queued", wait = isWaiting(s);
   const dot = run ? (wait ? "dot warn live" : "dot red live") : s.status === "completed" ? "dot ok" : s.status === "failed" ? "dot red" : "dot";
-  const act = run ? (wait ? "Waiting for your approval" : s.activity || "Working") : (s.report ? firstLine(s.report.summary, 140) : s.status);
+  const act = run ? (wait ? "Waiting for your approval" : s.status === "queued" ? "Waiting for a free slot" : s.activity || "Working") : (s.report ? firstLine(s.report.summary, 140) : s.status);
   s.actEl = el("span", { class: "act", text: act });
   return el("div", { class: "sub-row" },
     el("button", { type: "button", class: "open", title: s.task, onclick: () => openThread(s.id) },
@@ -697,15 +849,15 @@ function subRow(s) {
       el("span", { class: "nm", text: shortTitle(s.title) }),
       s.actEl),
     el("span", { class: "muted small", "data-elapsed": s.id, text: elapsedText(s) }),
-    run ? el("button", { type: "button", class: "btn btn-sm", onclick: () => openThread(s.id, true) }, "Steer") : null,
+    run ? el("button", { type: "button", class: "btn btn-sm", "aria-label": `Steer ${s.id}`, onclick: () => openThread(s.id, true) }, "Steer") : null,
     run ? stopButton(s) : null);
 }
 function stopButton(s) {
   const armed = () => (S.stopArmed.get(s.id) || 0) > Date.now();
-  const b = el("button", { type: "button", class: "btn btn-sm btn-danger stop-" + s.id }, armed() ? "Confirm stop" : "Stop");
+  const b = el("button", { type: "button", class: "btn btn-sm btn-danger stop-" + s.id, "aria-label": `${armed() ? "Confirm stop" : "Stop"} ${s.id}` }, armed() ? "Confirm stop" : "Stop");
   b.addEventListener("click", async () => {
     if (!armed()) {
-      S.stopArmed.set(s.id, Date.now() + 4000); b.textContent = "Confirm stop";
+      S.stopArmed.set(s.id, Date.now() + 4000); b.textContent = "Confirm stop"; b.setAttribute("aria-label", `Confirm stop ${s.id}`);
       setTimeout(() => { if (!armed()) document.querySelectorAll(".btn-danger.stop-" + CSS.escape(s.id)).forEach((x) => { x.textContent = "Stop"; }); }, 4100);
       return;
     }
@@ -722,7 +874,7 @@ function approvalCard(t, d, replay) {
   a.actions = el("div", { class: "toolbar" },
     el("button", { type: "button", class: "btn btn-primary", onclick: () => openApproval(d.id) }, "Review and approve"),
     el("button", { type: "button", class: "btn btn-danger", onclick: () => decide(d.id, false, "") }, "Deny"));
-  a.box = el("div", { class: "approval" },
+  a.box = el("div", { class: "approval", role: "group", "aria-label": `Approval needed: ${toolLabel(d.tool)}` },
     el("div", { class: "head" }, icon("shield", 18), el("strong", { text: `Approval needed · ${toolLabel(d.tool)}` }),
       el("span", { class: "tier approve", css: { marginLeft: "auto" }, text: "ROE: approve" })),
     el("div", { class: "kv" },
@@ -741,9 +893,10 @@ function resolveCard(id, d, how) {
   const a = S.approvalCards.get(id); if (!a || a.resolved) return;
   a.resolved = true; a.box.classList.add("done");
   let node;
-  if (how === "expired") node = el("div", { class: "result gone" }, icon("clock", 15), "No longer pending: the operation ended or the dashboard restarted");
-  else if (d.approved) node = el("div", { class: "result ok" }, icon("check", 15, 2.2), `Approved${d.by ? " by " + d.by : ""}${d.note ? " · " + d.note : ""}`);
-  else node = el("div", { class: "result no" }, icon("x", 15, 2.2), `Denied${d.note ? " · " + d.note : ""}`);
+  const later = d && d.later ? " · applies as the operation resumes" : "";
+  if (how === "expired") node = el("div", { class: "result gone" }, icon("clock", 15), "No longer pending: the operation ended or was stopped");
+  else if (d.approved) node = el("div", { class: "result ok" }, icon("check", 15, 2.2), `Approved${d.by ? " by " + d.by : ""}${d.note ? " · " + d.note : ""}${later}`);
+  else node = el("div", { class: "result no" }, icon("x", 15, 2.2), `Denied${d.by ? " by " + d.by : ""}${d.note ? " · " + d.note : ""}${later}`);
   a.actions.replaceWith(node); a.actions = node;
 }
 async function decide(id, approve, note) {
@@ -765,6 +918,7 @@ function openApproval(id) {
   dlg = openDialog({
     title: S.st && S.st.gated ? "Approve action" : "Approve response action", sub: p.tool, iconName: "shield",
     body: [
+      p.restored ? el("div", { class: "card warn-card small", text: "Asked before the dashboard restarted. Deciding it carries the interrupted operation on: your decision is applied when the agent reaches this action again." }) : null,
       el("div", { class: "kv" },
         el("span", { class: "label", text: "Action" }), el("span", { text: toolLabel(p.tool) }),
         tgt ? el("span", { class: "label", text: "Target" }) : null, tgt ? el("span", { class: "mono", text: tgt }) : null,
@@ -772,7 +926,7 @@ function openApproval(id) {
         commandOf(p.tool, p.arguments) ? el("span", { class: "mono cmd", text: commandOf(p.tool, p.arguments) }) : null,
         el("span", { class: "label", text: "Requested by" }), el("span", { text: agentOf(p.why) || "agent" }),
         el("span", { class: "label", text: "ROE" }), el("span", { text: ruleOf(p.why) }),
-        el("span", { class: "label", text: "Requested" }), el("span", { text: `${fmtClock(p.requested)} · ${fmtRel(p.requested)}` })),
+        el("span", { class: "label", text: "Requested" }), el("span", { text: `${fmtClock(p.requested)} · ${fmtRel(p.requested)}${p.restored || p.asked_before_restart ? " · before the restart" : ""}` })),
       el("div", { class: "label", text: "Action brief from the agent" }),
       p.rationale ? md(p.rationale) : el("div", { class: "muted small", text: "The agent gave no rationale. Consider denying until it explains the target, impact and rollback." }),
       el("details", {}, el("summary", { class: "small", css: { cursor: "pointer" }, text: "Arguments" }), el("pre", { class: "code", css: { marginTop: "8px" }, text: JSON.stringify(p.arguments, null, 2) })),
@@ -796,6 +950,15 @@ const H = {
     if (!S.replaying && S.st && !S.st.conversation) scheduleRefresh(); // this message just created the conversation
   },
   retro_start(d, ev) { newTurn("retro", null, ev.ts); },
+  operation_resumed(d, ev) { newTurn("resume", d, ev.ts); },
+  subagent_resumed(d, ev) {
+    const s = sub(d.id, { expert: d.expert, title: d.title, task: d.task || "", status: "running", started: ev.ts, ended: 0, activity: "Carrying on from where it stopped" });
+    s.seen = true;
+    const t = ensureTurn(ev.ts); t.subs.add(d.id);
+    s.step = addStep(t, { icon: "refresh", what: `Resumed ${d.id} · ${shortTitle(d.title)}`, detail: d.task || "", body: () => subStepBody(d.id) });
+    setEnd(s.step, statusChip("running"));
+    renderSubframeSoon();
+  },
   delta(d, ev) { applyDelta(d.agent_id || d.agent, d, ev.seq); },
   text(d, ev) {
     if (!isLead(d)) { S.live.delete(d.agent_id); subLog(d.agent_id, "text", d, ev.ts); return; }
@@ -874,10 +1037,12 @@ const H = {
     if (!S.replaying) scheduleRefresh();
   },
   approval_request(d, ev) {
-    const t = ensureTurn(ev.ts);
-    approvalCard(t, d, !!ev.replay);
+    const old = S.approvalCards.get(d.id); // asked again after a restart: the same card comes back to life
+    let t;
+    if (old && !old.resolved) { old.actions.hidden = !!ev.replay; t = S.turns.find((x) => x.approvals.has(d.id)); }
+    else { t = ensureTurn(ev.ts); approvalCard(t, d, !!ev.replay); }
     if (!ev.replay) { S.pending.set(d.id, d); onPendingChanged(); }
-    updateWorkHead(t);
+    if (t) updateWorkHead(t);
   },
   approval_resolved(d) {
     S.pending.delete(d.id); resolveCard(d.id, d);
@@ -948,7 +1113,7 @@ function onEvent(ev) {
   if (h) { try { h(ev.data || {}, ev); } catch (e) { console.error(ev.kind, e); } }
 }
 function onPendingChanged() { renderBanner(); renderStatus(); renderHeader(); renderSide(); renderSubframeSoon(); }
-function onRunChanged() { renderStatus(); renderComposerState(); renderSide(); }
+function onRunChanged() { renderStatus(); renderComposerState(); renderSide(); renderResume(); }
 /* ---------------------------------------------------------------- streaming */
 // Deltas carry their offset in the reply, so pieces seeded from /api/state and pieces from the event stream
 // stitch together without gaps or duplicates. A gap (missed piece) triggers a state refresh to resync.
@@ -1018,8 +1183,9 @@ function replay(evs) {
     if (t.running && (!S.running || t !== S.turn)) { t.interrupted = !t.ended; finishTurn(t, t.ended || null, null, true); }
   }
   syncPending([...S.pending.values()]);
+  settleSubs(S.st);
   if (!S.turns.length) showHero();
-  renderSubframe(); renderHeader(); renderBanner();
+  renderSubframe(); renderHeader(); renderBanner(); renderResume();
   scrollBottom();
 }
 async function loadConversation() {
@@ -1038,6 +1204,15 @@ async function loadConversation() {
     renderSide(); renderInsp(); renderStatus(); renderComposerState();
   } catch (e) { S.loading = false; toast("Could not load the conversation: " + e.message, true); }
 }
+// Nothing is running: the server's subagent statuses are final. (A replayed feed shows a subagent that a restart cut
+// off as still running.)
+function settleSubs(st) {
+  if (!st || st.running) return;
+  for (const m of st.subagents || []) {
+    const s = S.subs.get(m.id);
+    if (s && ["running", "queued"].includes(s.status)) Object.assign(s, { status: m.status, report: m.last_report || s.report });
+  }
+}
 function applyState(st) {
   const prevCase = S.st ? JSON.stringify(S.st.case) : "";
   S.st = st;
@@ -1051,14 +1226,17 @@ function applyState(st) {
   for (const m of st.subagents || []) {
     const s = sub(m.id);
     if (!s.seen) Object.assign(s, { expert: m.expert, title: m.title, task: m.task, status: m.status, report: m.last_report || null });
+    else if (["running", "queued"].includes(m.status) && ["running", "queued"].includes(s.status)) s.status = m.status;
+    // nothing is running: the server's status is final (a replayed feed shows a subagent cut off by a restart as running)
     if (m.status === "running" && m.elapsed !== null && m.elapsed !== undefined) s.started = Date.now() / 1000 - m.elapsed;
   }
+  settleSubs(st);
   return prevCase !== JSON.stringify(st.case);
 }
 async function refreshState() {
   const st = await api("/api/state");
   const caseChanged = applyState(st);
-  renderSide(); renderHeader(); renderBanner(); renderStatus(); renderComposerState(); renderSubframe();
+  renderSide(); renderHeader(); renderBanner(); renderResume(); renderStatus(); renderComposerState(); renderSubframe();
   if (caseChanged && !S.insp.thread) renderInsp();
   if (!S.turns.length) showHero();
 }
@@ -1131,7 +1309,7 @@ async function runRetro() { try { await api("/api/retro", {}); } catch (e) { toa
 function rateDialog() {
   let rating = 0;
   const seg = el("div", { class: "seg", role: "group", "aria-label": "Rating" });
-  const btns = [1, 2, 3, 4, 5].map((n) => el("button", { type: "button", onclick: () => { rating = n; btns.forEach((b, i) => b.classList.toggle("on", i + 1 === n)); } }, String(n)));
+  const btns = [1, 2, 3, 4, 5].map((n) => el("button", { type: "button", "aria-pressed": "false", "aria-label": `${n} of 5`, onclick: () => { rating = n; btns.forEach((b, i) => { b.classList.toggle("on", i + 1 === n); b.setAttribute("aria-pressed", String(i + 1 === n)); }); } }, String(n)));
   seg.append(...btns);
   const note = el("input", { type: "text", placeholder: "What worked, what didn't (optional)", "aria-label": "Rating note" });
   const dlg = openDialog({ title: "Rate this session", iconName: "star",
@@ -1183,19 +1361,14 @@ function renderInsp() {
   box.hidden = false;
   const keepScroll = box.querySelector(".insp-body");
   const scrollTop = keepScroll ? keepScroll.scrollTop : 0;
-  const ae = document.activeElement;
-  const focusId = ae && box.contains(ae) && ae.id ? ae.id : null;
-  const sel = focusId && typeof ae.selectionStart === "number" ? [ae.selectionStart, ae.selectionEnd] : null;
+  const focus = captureFocus(box);
   S.ui.threadLive = null;
   clear(box);
   if (S.insp.thread && S.subs.has(S.insp.thread)) renderThread(box, S.subs.get(S.insp.thread));
   else { S.insp.thread = null; renderCase(box); }
   const body = box.querySelector(".insp-body");
   if (body && keepScroll) body.scrollTop = scrollTop;
-  if (focusId) {
-    const n = document.getElementById(focusId);
-    if (n) { n.focus({ preventScroll: true }); if (sel) try { n.setSelectionRange(sel[0], sel[1]); } catch (e) { /* not a text field */ } }
-  }
+  restoreFocus(box, focus);
 }
 function inspClose() { return el("button", { type: "button", class: "btn btn-ghost icon-btn", "aria-label": "Close panel", title: "Close (Ctrl+.)", onclick: toggleInsp }, icon("x")); }
 function renderCase(box) {
@@ -1206,10 +1379,9 @@ function renderCase(box) {
   box.append(el("div", { class: "insp-head" },
     el("div", { class: "t" }, el("strong", { text: `Case ${c.id}` }), el("span", { class: "muted small", text: c.mission ? firstLine(c.mission, 140) : "No mission recorded yet" })),
     inspClose()));
-  box.append(el("div", { class: "tabs", role: "tablist", "aria-label": "Case sections" }, tabs.map(([id, label, n]) =>
-    el("button", { type: "button", role: "tab", class: "tab" + (S.insp.tab === id ? " on" : ""), "aria-selected": String(S.insp.tab === id),
-      onclick: () => { S.insp.tab = id; renderInsp(); if (id === "plans") refreshPlans(); } }, label, n ? el("span", { class: "count", text: n }) : null))));
-  const body = el("div", { class: "insp-body fade", role: "tabpanel" });
+  box.append(tabList("Case sections", "case", tabs.map(([id, label, n]) => [id, label, n ? el("span", { class: "count", "aria-label": `(${n})`, text: n }) : null]),
+    S.insp.tab, (id) => { S.insp.tab = id; renderInsp(); if (id === "plans") refreshPlans(); }));
+  const body = el("div", { class: "insp-body fade", role: "tabpanel", id: "case-panel", "aria-labelledby": `case-tab-${S.insp.tab}`, tabindex: "0" });
   box.append(body);
   ({ findings: caseFindings, iocs: caseIocs, timeline: caseTimeline, evidence: caseEvidence, plans: casePlans, report: caseReport })[S.insp.tab](body, c);
 }
@@ -1219,7 +1391,7 @@ function caseFindings(body, c) {
   const verdicts = [["tp", "True positive"], ["fp", "False positive"], ["benign", "Benign"], ["inconclusive", "Inconclusive"]];
   for (const f of [...c.findings].sort((a, b) => SEV_ORDER.indexOf(a.severity) - SEV_ORDER.indexOf(b.severity))) {
     const note = el("input", { type: "text", placeholder: "Verdict note (optional)", "aria-label": "Verdict note" });
-    body.append(el("div", { class: "card finding" },
+    body.append(el("div", { class: "card finding", "data-ref": f.id },
       el("div", { class: "top" }, el("span", { class: "sev " + f.severity, text: f.severity }), el("span", { class: "mono muted", text: f.id }),
         el("span", { class: "muted small", css: { marginLeft: "auto" }, text: f.confidence ? `Confidence ${f.confidence}` : "" })),
       el("h3", { text: f.title }),
@@ -1239,7 +1411,7 @@ function caseFindings(body, c) {
 function caseIocs(body, c) {
   if (!c.iocs.length) { body.append(el("div", { class: "empty", text: "No indicators recorded yet." })); return; }
   for (const i of c.iocs) {
-    body.append(el("div", { class: "card", css: { padding: "10px 12px" } },
+    body.append(el("div", { class: "card", "data-ref": i.id, css: { padding: "10px 12px" } },
       el("div", { css: { display: "flex", alignItems: "center", gap: "8px" } }, el("span", { class: "label", text: i.type }),
         el("span", { class: "chip" + (i.confidence === "high" ? " red" : ""), css: { marginLeft: "auto" }, text: i.confidence }),
         el("button", { type: "button", class: "btn btn-ghost icon-btn btn-sm", "aria-label": "Copy value", title: "Copy", onclick: () => copyText(i.value) }, icon("copy", 14))),
@@ -1254,7 +1426,7 @@ function caseTimeline(body, c) {
     const t = String(e.event_time || "");
     const d = t.slice(0, 10);
     if (d !== day) { day = d; body.append(el("div", { class: "tl-day", text: d || "Undated" })); }
-    body.append(el("div", { class: "tl-item" }, el("span", { class: "when", text: t.slice(11, 16) || "--:--" }), el("span", { class: "pin" }),
+    body.append(el("div", { class: "tl-item", "data-ref": e.id }, el("span", { class: "when", text: t.slice(11, 16) || "--:--" }), el("span", { class: "pin" }),
       el("span", {}, el("div", { class: "what", text: e.description }),
         el("div", { class: "src", text: [e.host, e.source, e.attack_technique].filter(Boolean).join(" · ") }))));
   }
@@ -1272,7 +1444,7 @@ function caseEvidence(body, c) {
   if (!c.evidence.length) { body.append(el("div", { class: "empty", text: "No evidence registered yet. The team registers and hashes each item before analysis." })); return; }
   for (const e of c.evidence) {
     const sha = (e.hashes && e.hashes.sha256) || "";
-    body.append(el("div", { class: "card", css: { padding: "10px 12px" } },
+    body.append(el("div", { class: "card", "data-ref": e.id, css: { padding: "10px 12px" } },
       el("div", { css: { fontWeight: "500", wordBreak: "break-all" }, text: String(e.path || "").split("/").pop() }),
       el("div", { class: "mono muted", css: { fontSize: "11.5px", wordBreak: "break-all" }, text: e.path }),
       sha ? el("div", { css: { display: "flex", alignItems: "center", gap: "6px", marginTop: "4px" } },
@@ -1366,6 +1538,7 @@ function fileMenu(name) {
   if (items.length) items.push("-");
   items.push({ icon: "file", label: "View here", run: () => viewPlan(name) },
     { icon: "download", label: "Download", run: () => downloadPlan(name) },
+    ...(/\.md$/i.test(name) ? [{ icon: "download", label: "Download as Word (.docx)", run: () => downloadDocx(name) }] : []),
     { icon: "copy", label: "Copy path", end: planPath(name).length > 46 ? "…" + planPath(name).slice(-45) : planPath(name), run: () => copyText(planPath(name)) });
   return items;
 }
@@ -1379,6 +1552,7 @@ function planActions(name, withView = true) {
   return [el("span", { class: "split" }, main, caret),
     withView ? el("button", { type: "button", class: "btn btn-sm", onclick: () => viewPlan(name) }, icon("file", 14), "View") : null,
     el("button", { type: "button", class: "btn btn-sm", onclick: () => downloadPlan(name) }, icon("download", 14), "Download"),
+    /\.md$/i.test(name) ? el("button", { type: "button", class: "btn btn-sm", title: "Download as a Word document", onclick: () => downloadDocx(name) }, icon("download", 14), ".docx") : null,
     el("button", { type: "button", class: "btn btn-ghost icon-btn btn-sm", "aria-label": "Copy path", title: "Copy path", onclick: () => copyText(planPath(name)) }, icon("copy", 14))].filter(Boolean);
 }
 function planCard(f, inPanel) {
@@ -1404,14 +1578,24 @@ function fileRef(text) {
 }
 
 async function caseReport(body) {
-  const ask = el("button", { type: "button", class: "btn", onclick: () => setPlaybook("report") }, "Ask the reporter to draft it");
+  const ask = el("button", { type: "button", class: "btn btn-sm", onclick: () => setPlaybook("report") }, "Ask the reporter to draft it");
   try {
-    const text = await api("/api/report");
-    if (text) body.append(el("div", { class: "toolbar" }, ask, el("button", { type: "button", class: "btn", onclick: () => copyText(text) }, icon("copy", 14), "Copy")), md(text));
-    else body.append(el("div", { class: "empty" }, el("div", { css: { fontWeight: "500", color: "var(--text)" }, text: "No report yet" }),
-      el("p", { text: "The reporter drafts it from this mission's data only, cites every fact, and asks you for anything missing." }), ask));
+    const r = await api("/api/report?format=json");
+    if (!r.text) {
+      body.append(el("div", { class: "empty" }, el("div", { css: { fontWeight: "500", color: "var(--text)" }, text: "No report yet" }),
+        el("p", { text: "The reporter drafts it from this mission's data only, cites every fact, and asks you for anything missing." }), ask));
+      return;
+    }
+    const v = /_v(\d+)\.md$/.exec(r.name || "");
+    body.append(el("div", { class: "muted small", text: r.final ? `Final report · ${r.name}` : r.name ? `Draft v${v ? v[1] : "?"} · ${r.name} · not yet approved as final` : "report.md" }),
+      el("div", { class: "toolbar" }, r.final ? null : ask,
+        r.name ? el("button", { type: "button", class: "btn btn-sm", onclick: () => downloadDocx(r.name) }, icon("download", 14), "Word (.docx)") : null,
+        el("button", { type: "button", class: "btn btn-sm", onclick: () => copyText(r.text) }, icon("copy", 14), "Copy")),
+      el("p", { class: "muted small", text: "Each citation, like [FIN-0001], opens the mission data it points at." }),
+      md(r.text));
   } catch (e) { body.append(el("div", { class: "empty", text: e.message })); }
 }
+function downloadDocx(name) { clickLink(`/api/plans/${encodeURIComponent(name)}/docx`, name.replace(/\.md$/i, ".docx")); toast("Exporting to Word"); }
 function renderThread(box, s) {
   const run = s.status === "running";
   box.append(el("div", { class: "insp-head" },
@@ -1482,14 +1666,19 @@ function renderThread(box, s) {
 }
 function threadRow(list, ic, what, detail, denied, body, note) {
   const expandable = typeof body === "function";
-  const row = el(expandable ? "button" : "div", { class: "step" + (denied ? " denied" : "") + (note ? " note" : ""), type: expandable ? "button" : null });
+  const asButton = expandable && !note;
+  const row = el(asButton ? "button" : "div", { class: "step" + (denied ? " denied" : "") + (note ? " note" : "") + (expandable ? " expandable" : ""), type: asButton ? "button" : null, "aria-expanded": asButton ? "false" : null });
   const st = { row, end: el("span", { class: "end" }), bodyEl: null };
   row.append(...[el("span", { class: "ic" }, icon(ic)), note ? el("span", { class: "what" }, inline(what)) : el("span", { class: "what", text: what }),
     note ? null : el("span", { class: "detail", text: detail || "" }), st.end].filter(Boolean));
+  const toggle = expandable && note ? el("button", { type: "button", class: "chev-btn", "aria-expanded": "false", "aria-label": "Show the full text" }, icon("chevR", 14)) : null;
+  if (toggle) row.append(toggle);
   const wrap = el("div", {}, row);
-  if (expandable) row.addEventListener("click", () => {
-    if (st.bodyEl) { st.bodyEl.remove(); st.bodyEl = null; return; }
-    st.bodyEl = el("div", { class: "step-body" }, body(st)); wrap.append(st.bodyEl);
+  if (expandable) row.addEventListener("click", (e) => {
+    if (toggle && e.target.closest(".file-ref, .cite")) return;
+    const open = !st.bodyEl;
+    if (!open) { st.bodyEl.remove(); st.bodyEl = null; } else { st.bodyEl = el("div", { class: "step-body" }, body(st)); wrap.append(st.bodyEl); }
+    (toggle || row).setAttribute("aria-expanded", String(open)); row.classList.toggle("open", open);
   });
   list.append(wrap);
   return st;
@@ -1508,10 +1697,13 @@ function go(view, push = true) {
   if (view !== "ops") renderPage(view);
 }
 async function renderPage(view) {
-  const root = clear($("view-page"));
+  const box = $("view-page");
+  const focus = captureFocus(box);
+  const root = clear(box);
   const inner = el("div", { class: "page-inner" });
   root.append(el("div", { class: "page" }, inner));
   try { await PAGES[view](inner); } catch (e) { inner.append(el("div", { class: "empty", text: "Could not load this page: " + e.message })); }
+  restoreFocus(box, focus);
 }
 function pageHead(title, sub, ...actions) {
   return el("div", { class: "page-head" }, el("div", { class: "t" }, el("h1", { text: title }), sub ? el("p", { text: sub }) : null), actions);
@@ -1539,18 +1731,19 @@ const PAGES = {
       (data.require_approval ? "Skills written by agents are used only after you approve them." : "Auto-approve is on: agent-written skills are used immediately."),
       el("span", { class: "muted small", text: "Import or export SKILL.md files with: canarchist skills import|export" })));
     const tabs = [["review", "Needs review", data.pending.length], ["all", "All skills", data.skills.length], ["weak", "Needs revision", weak.length]];
-    root.append(el("div", { class: "tabs", role: "tablist" }, tabs.map(([id, label, n]) =>
-      el("button", { type: "button", role: "tab", class: "tab" + (S.skillsTab === id ? " on" : ""), "aria-selected": String(S.skillsTab === id),
-        onclick: () => { S.skillsTab = id; renderPage("skills"); } }, label, el("span", { class: "count" + (id === "review" && n ? " warn" : ""), text: n })))));
-    if (S.skillsTab === "review") skillsReview(root, data);
-    else if (S.skillsTab === "all") skillsAll(root, data.skills);
-    else skillsWeak(root, weak);
+    root.append(tabList("Skills", "skills", tabs.map(([id, label, n]) => [id, label, el("span", { class: "count" + (id === "review" && n ? " warn" : ""), "aria-label": `(${n})`, text: n })]),
+      S.skillsTab, (id) => { S.skillsTab = id; renderPage("skills"); }));
+    const panel = el("div", { role: "tabpanel", id: "skills-panel", "aria-labelledby": `skills-tab-${S.skillsTab}`, class: "tab-panel" });
+    root.append(panel);
+    if (S.skillsTab === "review") skillsReview(panel, data);
+    else if (S.skillsTab === "all") skillsAll(panel, data.skills);
+    else skillsWeak(panel, weak);
   },
   async memory(root) {
     root.append(pageHead("Memory", "What the team has learned about your environment: facts, proven queries, false-positive patterns, observed tradecraft and lessons. Agent-written memories are used only after you promote them."));
     const statuses = [["candidate", "Candidates"], ["approved", "Approved"], ["rejected", "Rejected"], ["retired", "Retired"], ["", "All"]];
     root.append(el("div", {}, el("div", { class: "seg", role: "group", "aria-label": "Status" }, statuses.map(([v, label]) =>
-      el("button", { type: "button", class: S.memStatus === v ? "on" : "", onclick: () => { S.memStatus = v; renderPage("memory"); } }, label)))));
+      el("button", { type: "button", class: S.memStatus === v ? "on" : "", "aria-pressed": String(S.memStatus === v), onclick: () => { S.memStatus = v; renderPage("memory"); } }, label)))));
     const kind = el("select", { class: "field", "aria-label": "Kind" }, (S.st.memory_kinds || []).map((k) => el("option", { value: k, text: k })));
     const title = el("input", { type: "text", placeholder: "Title, specific and searchable", "aria-label": "Title" });
     const content = el("textarea", { class: "field", rows: 3, placeholder: "The knowledge, self-contained", "aria-label": "Content" });
@@ -1633,7 +1826,7 @@ const PAGES = {
     root.append(pageHead("Settings", "The theme is stored in this browser. The classification banner applies to everyone using this dashboard. Models live in config/models.yaml; other server settings in config/harness.yaml and config/roe.yaml."));
     const mode = pref("theme", "dark");
     const seg = el("div", { class: "seg", role: "group", "aria-label": "Theme" }, [["dark", "Dark"], ["light", "Light"], ["system", "Match system"]].map(([v, label]) =>
-      el("button", { type: "button", class: mode === v ? "on" : "", onclick: () => { applyTheme(v); renderPage("settings"); } }, label)));
+      el("button", { type: "button", class: mode === v ? "on" : "", "aria-pressed": String(mode === v), onclick: () => { applyTheme(v); renderPage("settings"); } }, label)));
     root.append(el("div", { class: "card form-grid" },
       el("span", { class: "label", text: "Theme" }), el("div", {}, seg),
       el("span", { class: "label", text: "Operator" }), el("span", { text: st.operator }),
@@ -1934,12 +2127,44 @@ async function skillAction(name, action, version) {
   catch (e) { toast(e.message, true); }
 }
 
+// Focus an element a re-render is about to create (pages render asynchronously).
+function focusWhenReady(id, tries = 40) {
+  const n = document.getElementById(id);
+  if (n) { n.focus(); return; }
+  if (tries > 0) setTimeout(() => focusWhenReady(id, tries - 1), 30);
+}
+// A WAI-ARIA tab list: one tab in the Tab order, arrow keys / Home / End move between tabs and select them.
+function tabList(label, prefix, tabs, current, pick) {
+  const list = el("div", { class: "tabs", role: "tablist", "aria-label": label });
+  for (const [id, text, extra] of tabs) {
+    const on = id === current;
+    list.append(el("button", { type: "button", role: "tab", id: `${prefix}-tab-${id}`, class: "tab" + (on ? " on" : ""), "aria-selected": String(on),
+      "aria-controls": `${prefix}-panel`, tabindex: on ? "0" : "-1", onclick: () => pick(id) }, text, extra || null));
+  }
+  list.addEventListener("keydown", (e) => {
+    const ids = tabs.map((x) => x[0]), i = ids.indexOf(current);
+    const j = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: ids.length - 1 }[e.key];
+    if (j === undefined) return;
+    e.preventDefault();
+    const next = ids[(j + ids.length) % ids.length];
+    pick(next);
+    focusWhenReady(`${prefix}-tab-${next}`);
+  });
+  return list;
+}
+
 /* ================================================================ overlays: dialogs, menus, palette */
 function openDialog(o) {
   const ov = el("div", { class: "overlay" + (o.top ? " top" : "") });
   const prev = document.activeElement;
   const handle = { el: null, close: null };
-  const close = () => { ov.remove(); S.dialogs = S.dialogs.filter((x) => x !== handle); if (prev && prev.focus) prev.focus(); };
+  const prevKey = prev && prev !== document.body ? focusKey(prev) : null;
+  const close = () => {
+    ov.remove(); S.dialogs = S.dialogs.filter((x) => x !== handle);
+    if (prev && prev.isConnected && prev.focus) { prev.focus(); return; }
+    const twin = prevKey && [...document.querySelectorAll(FOCUSABLE)].find((x) => focusKey(x) === prevKey);
+    if (twin) twin.focus(); else if (S.view === "ops" && S.ui.input) S.ui.input.focus();
+  };
   const dlg = el("div", { class: "dialog" + (o.wide ? " wide" : "") + (o.cls ? " " + o.cls : ""), role: "dialog", "aria-modal": "true", "aria-label": o.title || o.label || "Dialog" });
   if (o.title) {
     dlg.append(el("div", { class: "dialog-head" }, o.iconName ? el("span", { class: "badge-icon" }, icon(o.iconName, 18)) : null,
@@ -1966,23 +2191,29 @@ function trapFocus(e) {
   else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
   else if (!dlg.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
 }
-function closeMenu() { if (S.menu) { S.menu.remove(); S.menu = null; document.removeEventListener("mousedown", menuOutside, true); } }
+function closeMenu(refocus) {
+  if (!S.menu) return;
+  S.menu.remove(); S.menu = null; document.removeEventListener("mousedown", menuOutside, true);
+  const a = S.menuAnchor; S.menuAnchor = null;
+  if (a) { a.setAttribute("aria-expanded", "false"); if (refocus && a.isConnected) a.focus(); }
+}
 function menuOutside(e) { if (S.menu && !S.menu.contains(e.target)) closeMenu(); }
 function openMenu(anchor, items) {
   closeMenu();
-  const m = el("div", { class: "menu", role: "menu" });
+  const m = el("div", { class: "menu", role: "menu", "aria-label": anchor.getAttribute("aria-label") || anchor.textContent.trim() || "Menu" });
   for (const it of items) {
     if (it === "-") { m.append(el("div", { class: "menu-sep", role: "separator" })); continue; }
     if (it.header) { m.append(el("div", { class: "menu-head", role: "presentation", text: it.header })); continue; }
     m.append(el("button", { type: "button", class: "menu-item" + (it.danger ? " danger" : ""), role: "menuitem", disabled: !!it.disabled, title: it.title || null,
-      onclick: () => { closeMenu(); it.run(); } }, it.icon ? icon(it.icon, 15) : null, it.label, it.end ? el("span", { class: "end", text: it.end }) : null));
+      onclick: () => { closeMenu(true); it.run(); } }, it.icon ? icon(it.icon, 15) : null, it.label, it.end ? el("span", { class: "end", text: it.end }) : null));
   }
   document.body.append(m);
   const r = anchor.getBoundingClientRect(), mr = m.getBoundingClientRect();
   let top = r.bottom + 6; if (top + mr.height > innerHeight - 8) top = Math.max(8, r.top - mr.height - 6);
   let left = r.left; if (left + mr.width > innerWidth - 8) left = Math.max(8, innerWidth - mr.width - 8);
   m.style.top = top + "px"; m.style.left = left + "px";
-  S.menu = m;
+  S.menu = m; S.menuAnchor = anchor;
+  anchor.setAttribute("aria-haspopup", "menu"); anchor.setAttribute("aria-expanded", "true");
   setTimeout(() => document.addEventListener("mousedown", menuOutside, true), 0);
   const first = m.querySelector(".menu-item:not([disabled])"); if (first) first.focus();
 }
@@ -1993,6 +2224,7 @@ function menuKey(e) {
   const i = items.indexOf(document.activeElement);
   if (e.key === "ArrowDown") { e.preventDefault(); items[(i + 1) % items.length].focus(); return true; }
   if (e.key === "ArrowUp") { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); return true; }
+  if (e.key === "Home" || e.key === "End") { e.preventDefault(); items[e.key === "Home" ? 0 : items.length - 1].focus(); return true; }
   if (e.key === "Tab") { closeMenu(); return false; }
   return false;
 }
@@ -2018,16 +2250,18 @@ function openPalette() {
   if (S.dialogs.some((d) => d.palette)) return;
   const all = paletteItems();
   let sel = 0, shown = all;
-  const input = el("input", { type: "search", placeholder: "Search conversations, subagents, playbooks and commands", "aria-label": "Command search", autocomplete: "off" });
-  const list = el("div", { class: "pal-list", role: "listbox" });
+  const input = el("input", { type: "search", placeholder: "Search conversations, subagents, playbooks and commands", "aria-label": "Command search", autocomplete: "off",
+    role: "combobox", "aria-expanded": "true", "aria-controls": "pal-list", "aria-autocomplete": "list" });
+  const list = el("div", { class: "pal-list", role: "listbox", id: "pal-list", "aria-label": "Commands" });
   const run = (it) => { dlg.close(); it.run(); };
   const draw = () => {
     clear(list);
-    if (!shown.length) { list.append(el("div", { class: "empty", text: "No matches" })); return; }
+    if (!shown.length) { list.append(el("div", { class: "empty", text: "No matches" })); input.removeAttribute("aria-activedescendant"); return; }
+    input.setAttribute("aria-activedescendant", `pal-opt-${sel}`);
     let group = "";
     shown.forEach((it, i) => {
-      if (it.group !== group) { group = it.group; list.append(el("div", { class: "pal-group", text: group })); }
-      const b = el("button", { type: "button", class: "pal-item" + (i === sel ? " on" : ""), role: "option", "aria-selected": String(i === sel), onclick: () => run(it), onmousemove: () => { if (sel !== i) { sel = i; draw(); } } },
+      if (it.group !== group) { group = it.group; list.append(el("div", { class: "pal-group", role: "presentation", text: group })); }
+      const b = el("button", { type: "button", id: `pal-opt-${i}`, tabindex: "-1", class: "pal-item" + (i === sel ? " on" : ""), role: "option", "aria-selected": String(i === sel), onclick: () => run(it), onmousemove: () => { if (sel !== i) { sel = i; draw(); } } },
         icon(it.icon, 16), el("span", { class: "ellipsis", text: it.label }), it.end ? el("span", { class: "end", text: it.end }) : null);
       list.append(b);
       if (i === sel) setTimeout(() => b.scrollIntoView({ block: "nearest" }), 0);
@@ -2060,7 +2294,7 @@ document.addEventListener("keydown", (e) => {
   const mod = e.ctrlKey || e.metaKey;
   if (menuKey(e)) return;
   if (e.key === "Escape") {
-    if (S.menu) { closeMenu(); return; }
+    if (S.menu) { closeMenu(true); return; }
     if (S.dialogs.length) { e.preventDefault(); S.dialogs[S.dialogs.length - 1].close(); return; }
     if ($("side").classList.contains("open")) { $("side").classList.remove("open"); return; }
     if (S.insp.thread) { S.insp.thread = null; renderInsp(); return; }
@@ -2079,7 +2313,7 @@ function tick() {
   for (const n of document.querySelectorAll("[data-elapsed]")) { const s = S.subs.get(n.dataset.elapsed); if (s) n.textContent = elapsedText(s); }
   if (S.pending.size && S.view === "ops") renderBanner();
 }
-window.addEventListener("hashchange", route);
+window.addEventListener("hashchange", (e) => { if (location.hash === "#composer") { history.replaceState(null, "", "#/" + (S.view === "ops" ? "" : S.view)); if (S.view !== "ops") go("ops"); S.ui.input.focus(); return; } route(e); });
 window.addEventListener("popstate", route);
 
 // Sign-ins end after hours of no analyst activity. Background polling does not count; this ping (at most once a

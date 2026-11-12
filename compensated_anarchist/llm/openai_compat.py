@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from typing import Any
 
 import httpx
@@ -205,9 +206,9 @@ class OpenAICompatBackend:
             raw = fn.get("arguments") or "{}"
             try:
                 args = json.loads(raw) if isinstance(raw, str) else raw
-                calls.append(ToolCall(tc.get("id") or f"call_{len(calls)}", fn.get("name", ""), args or {}))
+                calls.append(ToolCall(tc.get("id") or f"call_{uuid.uuid4().hex[:12]}", fn.get("name", ""), args or {}))
             except json.JSONDecodeError as e:
-                calls.append(ToolCall(tc.get("id") or f"call_{len(calls)}", fn.get("name", ""), {}, f"invalid JSON arguments: {e}"))
+                calls.append(ToolCall(tc.get("id") or f"call_{uuid.uuid4().hex[:12]}", fn.get("name", ""), {}, f"invalid JSON arguments: {e}"))
 
         # Fallback: many local models emit Hermes-style <tool_call> text even in native mode.
         if not calls and "<tool_call>" in text:
