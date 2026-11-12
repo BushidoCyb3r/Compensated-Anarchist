@@ -47,7 +47,7 @@ from starlette.routing import Route
 
 from .. import NAME, __version__, docx, editors, huntplans, reports, service
 from . import account
-from ..agent import Harness
+from ..agent import BudgetExceeded, Harness
 from ..audit import verify
 from ..history import LATER
 from ..tools.registry import CURRENT_CALL
@@ -479,6 +479,10 @@ class Dashboard:
                 self.last_ok = True
                 h.emit("run_end", {"label": label, "ok": True, "text": text, "seconds": round(time.monotonic() - t0, 1),
                                    **({"learning": self.learning_counts()} if kind == "retro" else {})})
+            except BudgetExceeded as e:  # a clean stop at the run's budget, like the analyst's Stop
+                text = h.budget_stop(str(e))
+                h.emit("run_end", {"label": label, "ok": False, "stopped": True, "budget": True, "text": text,
+                                   "seconds": round(time.monotonic() - t0, 1)})
             except asyncio.CancelledError:
                 if self.shutting_down:  # the agents' checkpoints and pending approvals are kept for a resume
                     h.op_end("interrupted")
@@ -1012,7 +1016,25 @@ def create_app(dash: Dashboard) -> Starlette:
         return JSONResponse({"scope": scope, "case": dash.harness.case.id, "memories": mems,
                              "pending": [v | {"diff": st.diff(v["id"])} for v in versions], "skills": skills,
                              "tools": proposals, "blocked": blocked, "sandbox": dash.harness.onboarding.sandbox.describe(False),
+                             "recommended": dash.harness.learning_recommendation() if scope == "conversation" else None,
+                             "failing": [r | {"track_record": track_record(r)} for r in st.struggling()] if scope == "all" else [],
                              "counts": dash.learning_counts()})
+
+    async def approve_recommended(request: Request) -> Response:
+        """Approve, in one step, what this conversation's after-action review recommended (still waiting only)."""
+        h, user = dash.harness, user_of(request)
+        rec = h.learning_recommendation()
+        if not rec or not (rec["approve_memories"] or rec["approve_skill_versions"]):
+            raise ValueError("there is no recommendation waiting in this conversation")
+        for mid in rec["approve_memories"]:
+            h.memory.set_status(mid, "approved", user)
+        for vid in rec["approve_skill_versions"]:
+            h.skills.approve(vid, user, "recommended by the after-action review")
+        h.audit.record("learning_recommendation_approved", by=user, memories=rec["approve_memories"],
+                       skill_versions=rec["approve_skill_versions"])
+        dash.emit("memory_updated", {"recommended": True})
+        dash.emit("skills_updated", {"recommended": True})
+        return JSONResponse({"ok": True, "memories": len(rec["approve_memories"]), "skills": len(rec["approve_skill_versions"])})
 
     async def onboarded(request: Request) -> Response:
         cat = dash.harness.onboarding.catalog
@@ -1230,6 +1252,7 @@ def create_app(dash: Dashboard) -> Starlette:
         Route("/api/remember", guard(remember, True), methods=["POST"]),
         Route("/api/memory/{mid:int}", guard(memory_action, True), methods=["POST"]),
         Route("/api/learning", guard(learning)),
+        Route("/api/learning/approve-recommended", guard(approve_recommended, True), methods=["POST"]),
         Route("/api/tools/onboarded", guard(onboarded)),
         Route("/api/tools/onboarded/{name}/retire", guard(tool_retire, True), methods=["POST"]),
         Route("/api/tools/onboarded/{name}/retest", guard(tool_retest, True), methods=["POST"]),
@@ -1300,8 +1323,12 @@ def serve(cfg: HarnessConfig, case_id: str, model: str | None, posture: str | No
     shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     dash.url = f"{scheme}://{shown}:{port}"
     dash.bind = {"host": host, "port": port}
+    # the token goes to a terminal only: in the background this output is run/dashboard.log, and scripts/start.sh
+    # prints the token from run/dashboard.json (mode 600) instead
+    link = f"{dash.url}/login?token={dash.token}" if sys.stdout.isatty() else \
+        f"{dash.url}/login  (access token: printed by scripts/start.sh, kept in run/dashboard.json)"
     print(f"\n  Compensated Anarchist dashboard  case={case_id}\n"
-          f"  open: {dash.url}/login?token={dash.token}\n"
+          f"  open: {link}\n"
           f"  sign in with this start's access token plus the dashboard account's username and password.\n"
           f"  (the token is new at every start; keep it private. Ctrl+C to stop.)\n", flush=True)
     server = uvicorn.Server(uvicorn.Config(create_app(dash), host=host, port=port, log_level="warning",

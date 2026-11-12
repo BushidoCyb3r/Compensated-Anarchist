@@ -33,3 +33,9 @@ include = ["compensated_anarchist*"]
 
 [tool.setuptools.package-data]
 compensated_anarchist = ["prompts/*.md", "playbooks/*.md", "experts/*.md", "web/static/*", "builtin_skills/*/LICENSE-*", "builtin_skills/*/*/SKILL.md"]
+
+[tool.pytest.ini_options]
+# Only the project's own tests. Never collect from case, evidence or data folders: agents write code there (the
+# code writer's test files), and collecting a test file imports it, which runs its top-level code.
+testpaths = ["tests"]
+norecursedirs = ["cases", "forensics", "evidence", "data", "memory", "run", "tool_specs", "reports", "config", ".venv", ".git", "*.egg-info"]

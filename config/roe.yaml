@@ -62,6 +62,7 @@ rules:
   - {match: "onboard_trial",   tier: approve, observe: ask, note: "runs a draft tool on sample evidence in the sandbox (no network, read-only)"}
   - {match: "onboard_propose", tier: notify, note: "submits an onboarding proposal for the analyst to review"}
   - {match: "onboard_*",       tier: auto}
+  - {match: "learning_recommend", tier: auto, note: "the review records what it recommends; the analyst decides"}
 
   # --- SIEM / NSM connectors (read-only by construction) ------------------
   - {match: "security_onion__*", tier: auto}

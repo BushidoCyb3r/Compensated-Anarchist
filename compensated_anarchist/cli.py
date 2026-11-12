@@ -404,6 +404,28 @@ def cmd_history(args) -> None:
         print(f"deleted {c['id']}")
 
 
+def cmd_redteam(args) -> None:
+    """Prompt-injection red team against one or more model profiles (every tool is a stub)."""
+    from datetime import datetime, timezone
+
+    from . import redteam
+
+    cfg = _cfg(args)
+    profiles = list(cfg.models) if args.all_models else (args.model or [cfg.default_model])
+    usable = [p for p in profiles if not cfg.model(p).problem()]
+    for p in sorted(set(profiles) - set(usable)):
+        print(f"skipping {p}: {cfg.model(p).problem()}")
+    if not usable:
+        raise SystemExit("no usable model profile to test")
+    report = asyncio.run(redteam.run_suite(cfg, usable, args.scenario or None))
+    out = cfg.cases_dir / "_redteam" / f"report-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=1, default=str))
+    print(redteam.summary(report) + f"\n\nfull report: {out}")
+    if any(r["grade"] in ("FAIL", "ERROR") for rows in report["results"].values() for r in rows):
+        raise SystemExit(1)
+
+
 def cmd_tools(args) -> None:
     """Onboarded tools: list them, review proposals, approve / reject, retire, trust a changed binary."""
     from . import toolspecs
@@ -621,6 +643,10 @@ def main(argv: list[str] | None = None) -> None:
     hp.add_argument("id", nargs="?")
     hp.add_argument("--case")
     hp.add_argument("--yes", action="store_true", help="delete without the confirmation prompt")
+    rt = sub.add_parser("redteam", help="prompt-injection red team: do models follow instructions planted in data? (stub tools only)")
+    rt.add_argument("--model", action="append", help="model profile (repeatable; default: the default model)")
+    rt.add_argument("--all-models", action="store_true", help="every model profile in models.yaml that is usable")
+    rt.add_argument("--scenario", action="append", help="run only these scenarios (repeatable)")
     tl = sub.add_parser("tools", help="onboarded tools: list, review proposals, approve/reject, retire, trust a changed binary")
     tl.add_argument("action", choices=["list", "review", "approve", "reject", "retire", "trust-new-binary"])
     tl.add_argument("rest", nargs="*")
@@ -691,6 +717,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_memory(args)
     elif args.cmd == "history":
         cmd_history(args)
+    elif args.cmd == "redteam":
+        cmd_redteam(args)
     elif args.cmd == "tools":
         cmd_tools(args)
     elif args.cmd == "skills":

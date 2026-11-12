@@ -84,6 +84,17 @@ orchestration:
                "local_case_evidence", "hunt_plan_list", "cte_plan_list", "report_list"]
 
 # ---------------------------------------------------------------------------
+# Budgets: limits per operation (a mission, an after-action review, a resume), over every agent together. A run that
+# reaches one stops cleanly, like Stop, and says which; send a new message to carry on. 0 = no limit.
+# On a hosted model (Claude) tokens are billed: set these to what you are willing to spend on one run.
+# ---------------------------------------------------------------------------
+budgets:
+  max_tokens: 4000000        # input + output tokens as billed: cache reads count at cached_weight
+  cached_weight: 0.1         # Anthropic bills prompt-cache reads at about a tenth of normal input
+  max_tool_calls: 500
+  max_minutes: 90
+
+# ---------------------------------------------------------------------------
 # Learning: the after-action review turns an operation into memories and skill changes for you to review
 # (dashboard: Learning). It uses model time, so turn it off on a slow local model.
 # ---------------------------------------------------------------------------

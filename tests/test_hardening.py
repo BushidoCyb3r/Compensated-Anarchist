@@ -66,3 +66,14 @@ def test_local_run_tiers_for_static_parsers(tmp_path):
     for b in ("oledump.py", "pdfid.py", "pdf-parser.py", "diec", "densityscout"):
         t, why = tier(b)
         assert t == "approve" and "--plugins" in why, b
+
+
+def test_pytest_never_collects_agent_written_code():
+    """Agents write code into case folders (the code writer's test files); collecting a test file imports it and runs
+    its top-level code, so pytest looks only in tests/ and never descends into case, evidence or data folders."""
+    import tomllib
+    from pathlib import Path
+
+    cfg = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())["tool"]["pytest"]["ini_options"]
+    assert cfg["testpaths"] == ["tests"]
+    assert {"cases", "forensics", "evidence", "data", "tool_specs"} <= set(cfg["norecursedirs"])

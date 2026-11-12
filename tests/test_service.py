@@ -169,6 +169,8 @@ def test_start_stop_keeps_data_and_renews_token(tmp_path, monkeypatch, capsys):
         assert stat.S_IMODE((service.run_dir(cfg) / "dashboard.json").stat().st_mode) == 0o600
         out = capsys.readouterr().out
         assert f"Access token:  {first['token']}" in out and "username and password" in out
+        log = (service.run_dir(cfg) / "dashboard.log").read_text()
+        assert "open: http" in log and first["token"] not in log  # the background log never holds the token
         assert signin(first["url"], first["token"]) == 200
         assert service.start(cfg, str(p), opts) == 1  # already running (no terminal to confirm a restart)
         assert "already running" in capsys.readouterr().out

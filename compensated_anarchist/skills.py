@@ -134,6 +134,13 @@ class SkillStore:
                 "SELECT v.*, s.name, s.expert, s.active_version FROM skill_versions v JOIN skills s ON s.id=v.skill_id "
                 "WHERE v.status='candidate' ORDER BY v.created").fetchall()]
 
+    def versions_in(self, conversation_id: str) -> list[dict[str, Any]]:
+        """Every skill version proposed in one conversation (any status), oldest first."""
+        with self._lock:
+            return [dict(r) for r in self.db.execute(
+                "SELECT v.*, s.name, s.expert, s.active_version FROM skill_versions v JOIN skills s ON s.id=v.skill_id "
+                "WHERE v.conversation_id=? ORDER BY v.id", (conversation_id,)).fetchall()]
+
     def version(self, version_id: int) -> dict[str, Any] | None:
         with self._lock:
             r = self.db.execute("SELECT v.*, s.name, s.expert, s.active_version FROM skill_versions v "

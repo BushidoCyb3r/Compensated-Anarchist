@@ -213,6 +213,71 @@ def _tool_call(tc: dict[str, Any]) -> ToolCall:
 TERMINAL_TOOLS = {"submit_report"}  # a call to one of these ends the agent's turn
 
 
+class BudgetExceeded(Exception):
+    """The operation reached a limit under budgets: in harness.yaml. It stops cleanly, like the analyst's Stop."""
+
+
+class Budget:
+    """One operation's limits (a mission, a review, a resume), counted over every agent together: tokens, tool calls
+    and wall time. 0 means no limit. A warning at 80 %. Tokens count as they are billed: input and output in full,
+    prompt tokens read from the provider's cache at cached_weight (default 0.1; Anthropic bills cache reads at about a
+    tenth), so a long run on a cached hosted model is not stopped for tokens it barely paid for."""
+
+    def __init__(self, limits: dict[str, Any], emit: EventFn):
+        self.max_tokens = int(limits.get("max_tokens", 0) or 0)
+        self.max_tool_calls = int(limits.get("max_tool_calls", 0) or 0)
+        self.max_seconds = float(limits.get("max_minutes", 0) or 0) * 60
+        self.cached_weight = float(limits.get("cached_weight", 0.1))
+        self.tokens: float = 0
+        self.tool_calls = 0
+        self.t0 = time.monotonic()
+        self.emit = emit
+        self.warned: set[str] = set()
+        self.reason = ""
+
+    def used(self) -> dict[str, Any]:
+        return {"tokens": int(self.tokens), "tool_calls": self.tool_calls, "minutes": round((time.monotonic() - self.t0) / 60, 1),
+                "max_tokens": self.max_tokens, "max_tool_calls": self.max_tool_calls, "max_minutes": self.max_seconds / 60}
+
+    def _over(self) -> str:
+        secs = time.monotonic() - self.t0
+        if self.max_tokens and self.tokens >= self.max_tokens:
+            return f"{int(self.tokens):,} tokens used of its {self.max_tokens:,}"
+        if self.max_tool_calls and self.tool_calls >= self.max_tool_calls:
+            return f"{self.tool_calls} tool calls of its {self.max_tool_calls}"
+        if self.max_seconds and secs >= self.max_seconds:
+            return f"{secs / 60:.0f} minutes of its {self.max_seconds / 60:.0f}"
+        return ""
+
+    def _warn(self) -> None:
+        for what, used, top in (("tokens", self.tokens, self.max_tokens), ("tool calls", self.tool_calls, self.max_tool_calls),
+                                ("minutes", (time.monotonic() - self.t0) / 60, self.max_seconds / 60)):
+            if top and used >= 0.8 * top and what not in self.warned:
+                self.warned.add(what)
+                self.emit("budget_warning", {"what": what, "used": round(used, 1), "limit": top})
+
+    def check(self) -> None:
+        """Before a model call: raises BudgetExceeded once any limit is reached."""
+        if why := self._over():
+            self.reason = why
+            raise BudgetExceeded(why)
+        self._warn()
+
+    def add_tokens(self, usage: dict[str, int]) -> None:
+        cached = int(usage.get("cached", 0) or 0)  # part of input: prompt tokens read from the provider's cache
+        self.tokens += int(usage.get("input", 0) or 0) - cached + cached * self.cached_weight + int(usage.get("output", 0) or 0)
+        self._warn()
+
+    def add_tool_call(self) -> str:
+        """Before a tool runs: the reason it may not, or ""."""
+        if why := self._over():
+            self.reason = why
+            return why
+        self.tool_calls += 1
+        self._warn()
+        return ""
+
+
 class Agent:
     def __init__(self, name: str, system: str, backend: LLMBackend, executor: ToolExecutor, tools: list[ToolSpec],
                  max_steps: int, on_event: EventFn, agent_id: str = "",
@@ -229,6 +294,7 @@ class Agent:
         self.transcript_name = transcript_name or f"{self.agent_id}.json"
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         self.usage = {"input": 0, "output": 0, "cached": 0}  # cached: prompt tokens read from the provider's cache
+        self.budget_of: Callable[[], Budget | None] = lambda: None  # the running operation's budget (set by the harness)
         self.terminal: dict[str, Any] | None = None  # set by a terminal tool (submit_report) to end the turn
         self.inbox: list[str] = []  # analyst guidance ("steer"), delivered before the next model call
         # results of the current step's tool calls that have finished (call id -> [content, is_error]); saved with
@@ -382,6 +448,9 @@ class Agent:
 
         The text event comes before telemetry so a client can swap the streamed draft for the final text in one go.
         """
+        budget = self.budget_of()
+        if budget:
+            budget.check()  # a run over its budget stops here, before another model call
         sink = _DeltaSink(self) if _accepts_on_delta(self.backend) else None  # the backend can be switched mid-session
         t0 = time.monotonic()
         try:
@@ -397,6 +466,8 @@ class Agent:
         t1 = time.monotonic()
         for k in self.usage:
             self.usage[k] += resp.usage.get(k, 0)
+        if budget:
+            budget.add_tokens(resp.usage)
         unit = LoopDetector().check(resp.text or "")  # non-streamed replies (or a loop that began near the end)
         if unit is not None:
             if sink:
@@ -533,6 +604,7 @@ class Harness:
         self.audit = AuditLog(self.case.dir / "audit.jsonl", cfg.operator)
         self.memory = Memory(cfg.memory_db, cfg.memory, self.audit)
         self.memory.case_id = case_id
+        self.budget: Budget | None = None  # the running operation's limits (budgets: in harness.yaml)
         self.retro_ran_auto = False  # the CLI's --retro is not run twice
         self.memory.conversation_of = lambda: self.conversation["id"] if self.conversation else ""
         self.skills = SkillStore(cfg.memory_db, cfg.skills, self.audit)
@@ -543,6 +615,7 @@ class Harness:
         self.registry = ToolRegistry()
         self.executor = ToolExecutor(self.registry, self.roe, self.audit, self.case.artifacts / "spill",
                                      cfg.max_tool_result_chars, self.emit)
+        self.executor.budget_of = lambda: self.budget
         self.vault_dir = vault.ensure(Path(cfg.forensics.get("vault_dir") or cfg.evidence_roots[0] / "vault"))
         self.case_evidence_dir = casefiles.ensure_case_folder(cfg.forensics_dir, case_id)  # analyst drop folder
         self.hunt_plans_dir = huntplans.ensure(self.case.dir / "hunt_plans")  # hunt_planner writes, threat_hunter reads
@@ -828,15 +901,82 @@ class Harness:
     def _make_agent(self, name: str, agent_id: str, role_prompt: str, model: str | None, allow: list[str],
                     deny: list[str], max_steps: int) -> Agent:
         self._agent_seq += 1
-        return Agent(name, self._system(role_prompt), self.backend(model), self.executor, self.registry.specs(allow, deny),
-                     max_steps, self.emit, agent_id=agent_id, on_save=self._on_save,
-                     transcript_name=f"{self.session}__{agent_id}__{self._agent_seq:03d}.json")
+        agent = Agent(name, self._system(role_prompt), self.backend(model), self.executor, self.registry.specs(allow, deny),
+                      max_steps, self.emit, agent_id=agent_id, on_save=self._on_save,
+                      transcript_name=f"{self.session}__{agent_id}__{self._agent_seq:03d}.json")
+        agent.budget_of = lambda: self.budget
+        return agent
 
     def _new_lead(self) -> Agent:
         allow = list(self.cfg.orchestration.get("lead_tools") or DEFAULT_LEAD_TOOLS)
         lead = self._make_agent("lead", "lead", _prompt("lead"), None, allow, [], self.cfg.max_steps)
         lead.add_local(skill_tools(self.skills, LEAD, "lead", self._skill_ctx, list(self.experts), self.emit))
+        lead.add_local([Tool(
+            "learning_recommend",
+            "At the end of an after-action review: say which of this conversation's unreviewed memories and skill "
+            "versions you recommend the analyst approve for every case (checked against the evidence), and which to "
+            "reject (wrong or superseded), each with a short reason. The analyst can then approve your recommendations "
+            "in one step on the Learning page.",
+            schema({"approve_memories": {"type": "array", "items": {"type": "integer"}},
+                    "approve_skill_versions": {"type": "array", "items": {"type": "integer"}},
+                    "reject_memories": {"type": "array", "items": {"type": "integer"}},
+                    "reasons": {"type": "string"}}),
+            self._learning_recommend)])
         return lead
+
+    def _learning_recommend(self, approve_memories: list[int] | None = None, approve_skill_versions: list[int] | None = None,
+                            reject_memories: list[int] | None = None, reasons: str = "") -> str:
+        """Record the review's recommendations; only items written in this conversation and still unreviewed count."""
+        conv = self._conv()["id"]
+        mems = {m["id"] for m in self.memory.pending(conversation_id=conv)}
+        vers = {v["id"] for v in self.skills.pending() if v.get("conversation_id") == conv}
+        rec = {"approve_memories": sorted({int(i) for i in approve_memories or []} & mems),
+               "approve_skill_versions": sorted({int(i) for i in approve_skill_versions or []} & vers),
+               "reject_memories": sorted({int(i) for i in reject_memories or []} & mems), "reasons": reasons[:3000]}
+        ignored = sorted(({int(i) for i in approve_memories or []} | {int(i) for i in reject_memories or []}) - mems) + \
+            sorted({int(i) for i in approve_skill_versions or []} - vers)
+        self.history.append(conv, self.session, "learning_recommendation", rec, time.time())
+        self.audit.record("learning_recommendation", conversation=conv, **{k: v for k, v in rec.items() if k != "reasons"})
+        self.emit("learning_recommendation", rec)
+        return (f"Recorded: approve {len(rec['approve_memories'])} memories and {len(rec['approve_skill_versions'])} skill "
+                f"versions, reject {len(rec['reject_memories'])} memories."
+                + (f" Ignored (not unreviewed items of this conversation): {ignored}" if ignored else ""))
+
+    def learning_recommendation(self) -> dict[str, Any] | None:
+        """The latest review recommendation in this conversation, reduced to items still waiting for review."""
+        if not self.conversation:
+            return None
+        recs = [e for e in self.history.events(self.conversation["id"]) if e["kind"] == "learning_recommendation"]
+        if not recs:
+            return None
+        rec = recs[-1]["data"]
+        mems = {m["id"] for m in self.memory.pending(conversation_id=self.conversation["id"])}
+        vers = {v["id"] for v in self.skills.pending()}
+        return {"approve_memories": [i for i in rec.get("approve_memories", []) if i in mems],
+                "approve_skill_versions": [i for i in rec.get("approve_skill_versions", []) if i in vers],
+                "reject_memories": [i for i in rec.get("reject_memories", []) if i in mems], "reasons": rec.get("reasons", "")}
+
+    def what_we_learned(self, conv_id: str) -> str:
+        """The review's closing section, from the records rather than the model's memory of them."""
+        mems = [m for m in self.memory.list(limit=1000) if m.get("conversation_id") == conv_id]
+        vers = self.skills.versions_in(conv_id)
+        lines = ["## What we learned in this mission (from the records)"]
+        if mems:
+            lines.append("Memories:")
+            lines += [f"- M{m['id']} ({m['kind']}, {m['status']}): {m['title']}" for m in mems]
+        if vers:
+            lines.append("Skills:")
+            lines += [f"- {v['name']} v{v['version']} for {v['expert']} ({v['status']}): {((v.get('change_note') or '').splitlines() or [''])[0][:120]}" for v in vers]
+        if not mems and not vers:
+            lines.append("Nothing new was recorded.")
+        rec = self.learning_recommendation()
+        waiting = len(self.memory.pending(conversation_id=conv_id)) + sum(1 for v in vers if v["status"] == "candidate")
+        if waiting:
+            lines.append(f"\n{waiting} item(s) wait for your review on the Learning page"
+                         + (f"; the review recommends approving {len(rec['approve_memories']) + len(rec['approve_skill_versions'])} "
+                            "of them (one step there)." if rec and (rec['approve_memories'] or rec['approve_skill_versions']) else "."))
+        return "\n".join(lines)
+
 
     def _on_save(self, agent: Agent, transcript: bool = True) -> None:
         """Persist an agent's context to the conversation: at every checkpoint, and with its transcript (for training
@@ -1157,7 +1297,8 @@ class Harness:
                 mine = [u for u in usage if u["agent_id"] == sa.id]
                 block = "\n".join(f"- {u['name']} v{u['version']}: {u['outcome'] or 'not reported'} {u['note'] or ''}" for u in mine)
                 return await self._message(sa.id, _prompt("reflect") + f"\n\n# Analyst verdicts on findings\n{verdicts}\n\n"
-                                           f"# Skills you used in this operation\n{block or '(none)'}")
+                                           f"# Skills you used in this operation\n{block or '(none)'}\n\n"
+                                           f"# Did your procedure work?\n{self._worked(sa, mine)}")
             for sa, res in zip(subs, await asyncio.gather(*[reflect(s) for s in subs], return_exceptions=True)):
                 summary = (sa.last_report or {}).get("summary", "") if not isinstance(res, BaseException) else f"failed: {res}"
                 reflections.append(f"- {sa.id} {sa.expert}: {summary[:600]}")
@@ -1172,7 +1313,26 @@ class Harness:
                   f"\n\n# Subagent reflections\n" + ("\n".join(reflections) or "(no subagents reflected)")
                   + f"\n\n# Plans and reports the analyst edited after an agent saved them\n{self._analyst_edits()}"
                   + f"\n\n# Unreviewed memories written in this conversation\n{self._unreviewed_block(conv_id)}")
-        return await self.lead.turn(prompt)
+        text = await self.lead.turn(prompt)
+        summary = self.what_we_learned(conv_id)
+        self.emit("learning_summary", {"text": summary})
+        return f"{text}\n\n{summary}"
+
+    def _worked(self, sa: SubAgent, uses: list[dict[str, Any]]) -> str:
+        """The signals that a subagent's procedure worked: its report, the analyst's confirmation, how many steps."""
+        steps = sum(len(m.get("tool_calls") or []) for m in (sa.agent.messages if sa.agent else []) if m.get("role") == "assistant")
+        conv = self.conversation["id"] if self.conversation else ""
+        ratings = [r["rating"] for r in self.case.data.get("ratings", []) if r.get("conversation") == conv]
+        tp = [f["id"] for f in self.case.data["findings"] if f["verdict"] == "tp"]
+        confirmed = bool(tp) or (ratings and ratings[-1] >= 4)
+        signals = [f"- your report: {sa.status}", f"- tool calls you made: {steps}",
+                   f"- analyst confirmation: {'true-positive verdicts on ' + ', '.join(tp) if tp else 'none on findings'}"
+                   f"; operation rating: {ratings[-1] if ratings else 'not rated'}"]
+        if sa.status == "completed" and confirmed and steps >= 5 and not any(u["outcome"] == "good" for u in uses):
+            signals.append("Your multi-step procedure worked and the analyst confirmed it, and no skill you used covers "
+                           "it: write it as a skill now (skill_create), the exact steps and queries that worked, unless "
+                           "an existing skill already says it.")
+        return "\n".join(signals)
 
     def _analyst_edits(self, budget: int = 12000) -> str:
         """The analyst's changes to files agents saved (hunt plans, results, CTE plans, reports), as diffs."""
@@ -1196,6 +1356,7 @@ class Harness:
         if self.interrupted_operation():
             self.end_interrupted("a new request was started instead")
         self.op = self.history.op_create(self._conv()["id"], kind, label, playbook, os.getpid(), time.time())
+        self.budget = Budget(self.cfg.budgets, self.emit)
         return self.op
 
     def _learn_denials(self) -> None:
@@ -1205,6 +1366,21 @@ class Harness:
                             f"Agent {d['agent']} requested {d['tool']} with {json.dumps(d['args'])[:400]}. {d['reason']}",
                             tags=[d["tool"]], source="analyst")
         self.executor.denials.clear()
+
+    def budget_stop(self, why: str) -> str:
+        """End the operation at its budget, cleanly: every agent's open tool calls get a result, so the conversation
+        can carry on with a new message."""
+        if self.lead:
+            self.lead.repair("the run reached its budget")
+        for sa in self.subagents.values():
+            if sa.agent and sa.status in ("running", "queued"):
+                sa.status = "interrupted"
+                sa.agent.repair("the run reached its budget")
+        used = self.budget.used() if self.budget else {}
+        self.audit.record("budget_stop", reason=why, **used)
+        self.op_end("stopped", f"budget: {why}")
+        return (f"Stopped: this run reached its budget ({why}). Nothing more ran. Send a new message to carry on, "
+                "or raise the limits under budgets: in harness.yaml.")
 
     def auto_retro_due(self, playbook: str = "") -> str:
         """Why an after-action review should now run by itself (learning.auto_retro), or "". Never in a conversation
@@ -1259,6 +1435,7 @@ class Harness:
         self.refresh_models()
         self.history.op_update(op["id"], status="running", pid=os.getpid(), kind="resume" if op["kind"] == "mission" else op["kind"])
         self.op = {**op, "status": "running"}
+        self.budget = Budget(self.cfg.budgets, self.emit)  # a resumed operation gets a fresh budget
         self.audit.record("operation_resumed", operation=op["id"], label=op["label"])
         self.emit("operation_resumed", {"id": op["id"], "label": op["label"], "playbook": op["playbook"]})
         return await self.lead.resume()
@@ -1299,6 +1476,8 @@ class Harness:
         except (asyncio.CancelledError, KeyboardInterrupt):
             self.op_end("interrupted")
             raise
+        except BudgetExceeded as e:
+            return self.budget_stop(str(e))
         except BaseException as e:
             self.op_end("failed", f"{type(e).__name__}: {e}")
             raise

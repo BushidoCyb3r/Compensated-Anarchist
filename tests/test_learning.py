@@ -246,3 +246,126 @@ def test_learning_page_in_the_browser(tmp_path, monkeypatch):
     assert catalog.state("evtxhunt")["status"] == "active"
     m = [x for x in h.memory.list(status="approved") if x["id"] == mid][0]
     assert m["title"] == "Proxy squid01 is 10.0.0.9"
+
+
+def test_budgets_stop_a_run_cleanly(tmp_path, monkeypatch):
+    """A run that reaches its token, tool-call or time budget stops before the next model call or tool, like Stop:
+    the operation ends 'stopped', every agent's history stays valid, and a new message carries on."""
+    steps = [("Checking.", [("case_add_note", {"text": f"note {i}"})]) for i in range(6)]
+    h, fake = harness(tmp_path, monkeypatch, {"lead": steps + [("Carried on.", [])]})
+    h.cfg.budgets = {"max_tokens": 5}  # the scripted model reports 2 tokens per call
+    events = []
+    h.on_event = lambda kind, data: events.append((kind, data))
+
+    async def run():
+        await h.start()
+        try:
+            out = await h.operation("mission", lambda: h.mission("Take notes"), "mission")
+            op = h.history.op_latest(h.conversation["id"])
+            h.cfg.budgets = {"max_tool_calls": 1}
+            out2 = await h.operation("mission", lambda: h.mission("More notes"), "mission")
+            h.cfg.budgets = {}
+            out3 = await h.operation("mission", lambda: h.mission("Carry on"), "mission")
+            return out, op, out2, out3
+        finally:
+            await h.close()
+
+    out, op, out2, out3 = asyncio.run(run())
+    assert out.startswith("Stopped: this run reached its budget (6 tokens used of its 5)")
+    assert op["status"] == "stopped" and "budget" in op["note"] and len(fake.seen["lead"]) >= 3
+    assert any(k == "budget_warning" and d["what"] == "tokens" for k, d in events)
+    assert "1 tool calls of its 1" in out2
+    tool_msgs = [m for m in h.lead.messages if m["role"] == "tool"]
+    assert any("this run reached its budget" in str(m["content"]) for m in tool_msgs)  # the second call never ran
+    assert "Stopped" not in out3 and out3  # a new message carries on normally
+    calls = {tc["id"] for m in h.lead.messages if m["role"] == "assistant" for tc in m.get("tool_calls") or []}
+    results = {m.get("tool_call_id") for m in tool_msgs}
+    assert calls <= results  # no tool call left without a result
+    audit = (h.case.dir / "audit.jsonl").read_text()
+    assert audit.count('"event":"budget_stop"') == 2
+
+
+def test_budget_stop_in_the_dashboard(tmp_path, monkeypatch):
+    steps = [("Checking.", [("case_add_note", {"text": f"note {i}"})]) for i in range(5)]
+    dash, app = make(tmp_path, monkeypatch, {"lead": steps})
+    dash.cfg.budgets = {"max_tokens": 3}
+    with TestClient(app) as c:
+        login(c)
+        c.post("/api/message", json={"text": "take notes"}, headers=H)
+        from test_dashboard import wait_for
+        end, evs = wait_for(c, "run_end")
+        assert end["data"]["budget"] and end["data"]["stopped"] and not end["data"]["ok"]
+        assert end["data"]["text"].startswith("Stopped: this run reached its budget (4 tokens used of its 3)")
+        assert any(e["kind"] == "budget_warning" for e in evs)
+        h = dash.harness
+        assert h.history.op_latest(h.conversation["id"])["status"] == "stopped" and not dash.running()
+
+
+def test_review_recommends_and_the_analyst_approves_in_one_step(tmp_path, monkeypatch):
+    scripts = {"lead": [("Saving a fact.", [("memory_record", {"kind": "environment", "title": "Proxy is 10.0.0.9",
+                                                               "content": "squid on 10.0.0.9"}),
+                                            ("memory_record", {"kind": "lesson", "title": "Wrong guess", "content": "x"})]),
+                        ("Triage done.", [])],
+               "retro": [("Reviewed.", [("learning_recommend", {"approve_memories": [1, 999], "reject_memories": [2],
+                                                                "reasons": "M1 matches the proxy logs; M2 is a guess"})])]}
+    dash, app = make(tmp_path, monkeypatch, scripts)
+    dash.cfg.learning = {"auto_retro": True}
+    with TestClient(app) as c:
+        login(c)
+        c.post("/api/message", json={"text": "alerts on ws01", "playbook": "triage"}, headers=H)
+        deadline, evs = time.time() + 15, []
+        while time.time() < deadline:
+            evs = c.get("/api/events/poll?after=0").json()
+            if any(e["kind"] == "run_end" and e["data"].get("label") == "after-action review (automatic)" for e in evs):
+                break
+            time.sleep(0.1)
+        review = [e for e in evs if e["kind"] == "run_end"][-1]["data"]
+        assert "## What we learned in this mission (from the records)" in review["text"]
+        assert "M1 (environment, candidate): Proxy is 10.0.0.9" in review["text"] and "recommends approving 1" in review["text"]
+        q = c.get("/api/learning?scope=conversation").json()
+        assert q["recommended"]["approve_memories"] == [1] and q["recommended"]["reject_memories"] == [2]  # 999 ignored
+        assert "matches the proxy logs" in q["recommended"]["reasons"]
+        r = c.post("/api/learning/approve-recommended", json={}, headers=H).json()
+        assert r == {"ok": True, "memories": 1, "skills": 0}
+        mems = {m["id"]: m["status"] for m in c.get("/api/memory").json()}
+        assert mems[1] == "approved" and mems[2] == "candidate"  # the rejection stays the analyst's call
+        assert c.get("/api/learning?scope=conversation").json()["recommended"]["approve_memories"] == []
+        assert c.post("/api/learning/approve-recommended", json={}, headers=H).status_code == 400
+        audit = c.get("/api/audit?limit=60").json()["records"]
+        assert {"learning_recommendation", "learning_recommendation_approved"} <= {x["event"] for x in audit}
+
+
+def test_reflection_says_when_a_procedure_worked(tmp_path, monkeypatch):
+    sub = [("Working.", [("case_add_note", {"text": f"step {i}"}) for i in range(5)]),
+           ("Done.", [("submit_report", {"status": "completed", "summary": "beacon confirmed on ws01"})]),
+           ("Reflected.", [("submit_report", {"status": "completed", "summary": "wrote the skill"})])]
+    h, fake = harness(tmp_path, monkeypatch, {"lead": [("Tasking.", [("subagent_spawn", {"expert": "network_analyst", "task": "check ws01"})]),
+                                                       ("Confirmed.", [])],
+                                              "Network Security Monitoring Analyst": sub, "retro": [("Reviewed.", [])]})
+
+    async def run():
+        await h.start()
+        try:
+            await h.operation("mission", lambda: h.mission("Check ws01"), "mission")
+            h.case.add_finding("Beacon from ws01", "high", "ws01 beacons to 203.0.113.9", ["T1071.001"], ["ws01"])
+            h.set_verdict(h.case.data["findings"][-1]["id"], "tp", "confirmed")
+            return await h.operation("retro", h.retro, "after-action review")
+        finally:
+            await h.close()
+
+    out = asyncio.run(run())
+    reflect = next(str(m["content"]) for m in fake.seen["Network Security Monitoring Analyst"][-1] if "Did your procedure work?" in str(m.get("content")))
+    assert "tool calls you made: 6" in reflect and "true-positive verdicts on FIN-0001" in reflect
+    assert "write it as a skill now (skill_create)" in reflect
+    assert "## What we learned in this mission (from the records)" in out
+
+
+def test_cache_reads_count_as_billed():
+    from compensated_anarchist.agent import Budget
+
+    b = Budget({"max_tokens": 1000}, lambda *a: None)
+    b.add_tokens({"input": 10000, "cached": 9900, "output": 50})  # 100 fresh + 9,900 cached at 0.1 + 50 out
+    assert int(b.tokens) == 1140 and "1,140 tokens used of its 1,000" in b._over()
+    full = Budget({"max_tokens": 1000, "cached_weight": 1}, lambda *a: None)
+    full.add_tokens({"input": 500, "cached": 400, "output": 10})
+    assert full.tokens == 510

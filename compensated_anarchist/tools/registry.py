@@ -99,6 +99,7 @@ class ToolExecutor:
         self.registry = registry
         self.roe = roe
         self.audit = audit
+        self.budget_of: Callable[[], Any] = lambda: None  # the running operation's budget (set by the harness)
         self.spill_dir = spill_dir
         self.max_chars = max_chars
         self.on_event = on_event or (lambda kind, data: None)
@@ -122,6 +123,9 @@ class ToolExecutor:
             CURRENT_CALL.reset(token)
 
     async def _execute(self, call: ToolCall, agent: str, aid: str, tool: Tool, rationale: str) -> tuple[str, bool]:
+        budget = self.budget_of()
+        if budget and (why := budget.add_tool_call()):  # the run is over its budget: nothing more runs
+            return (f"NOT EXECUTED - this run reached its budget ({why}). Stop here and report what you have."), True
         if tool.quarantined:  # before the ROE: a quarantined server's annotations and tools are not trusted at all
             self.audit.record("tool_quarantined_call", agent=agent, agent_id=aid, tool=call.name)
             return (f"NOT EXECUTED - {call.name} is from an MCP server in quarantine. It becomes usable only after "

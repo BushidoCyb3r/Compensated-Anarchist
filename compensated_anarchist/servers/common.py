@@ -98,13 +98,19 @@ class ESClient:
         """Data streams/indices with doc counts and newest event, using only the `read` privilege (a terms
         aggregation on _index) - works with a least-privilege read-only API key, unlike _cat/_data_stream."""
         body = {"size": 0, "aggs": {"i": {"terms": {"field": "_index", "size": 2000},
-                                          "aggs": {"last": {"max": {"field": self.time_field}}}}}}
+                                          "aggs": {"last": {"max": {"field": self.time_field}},
+                                                   "future": {"filter": {"range": {self.time_field: {"gt": "now+1h"}}}}}}}}
         res = self.req("POST", f"/{pattern or '*'}/_search", body, params={"ignore_unavailable": "true"})
         out: dict[str, dict[str, Any]] = {}
         for b in res["aggregations"]["i"]["buckets"]:
             s = out.setdefault(_stream_name(b["key"]), {"name": _stream_name(b["key"]), "docs": 0, "backing_indices": 0, "last_event": None})
             s["docs"] += b["doc_count"]
             s["backing_indices"] += 1
+            if fut := (b.get("future") or {}).get("doc_count", 0):  # dated after now: a mis-parsed timestamp
+                s["future_dated"] = s.get("future_dated", 0) + fut
+                s["future_note"] = ("events dated in the future (usually a year-less syslog time put in the wrong year, "
+                                    "or a device clock): a window ending at now leaves them out; search with end set "
+                                    "past them to see them, and tell the analyst")
             last = b["last"].get("value_as_string")
             if last and (s["last_event"] is None or last > s["last_event"]):
                 s["last_event"] = last

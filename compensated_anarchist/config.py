@@ -170,6 +170,7 @@ class HarnessConfig:
     skills: dict[str, Any] = field(default_factory=dict)
     orchestration: dict[str, Any] = field(default_factory=dict)
     learning: dict[str, Any] = field(default_factory=dict)
+    budgets: dict[str, Any] = field(default_factory=dict)
     tool_specs_dir: Path = Path("tool_specs")
 
     def reload_models(self) -> bool:
@@ -296,5 +297,6 @@ def load_config(path: str | Path) -> HarnessConfig:
         skills=raw.get("skills") or {},
         orchestration=raw.get("orchestration") or {},
         learning=raw.get("learning") or {},
+        budgets=raw.get("budgets") or {},
         tool_specs_dir=rel((raw.get("tool_onboarding") or {}).get("specs_dir", "../tool_specs")),
     )

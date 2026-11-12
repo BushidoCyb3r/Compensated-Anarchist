@@ -1101,6 +1101,10 @@ const H = {
   case_updated() { scheduleRefresh(); refreshConvs(); },
   memory_updated() { scheduleRefresh(); if (S.view === "memory" || S.view === "learning") renderPage(S.view); },
   skills_updated() { scheduleRefresh(); if (S.view === "skills" || S.view === "learning") renderPage(S.view); },
+  budget_warning(d, ev) {
+    const st = addStep(ensureTurn(ev.ts), { icon: "clock", what: `This run has used 80% of its ${d.what} budget`, detail: `${d.used} of ${d.limit}; it stops cleanly at the limit (budgets: in harness.yaml)` });
+    setEnd(st, el("span", { class: "chip warn", text: "Budget" }));
+  },
   tool_proposed(d, ev) {
     const st = addStep(ensureTurn(ev.ts), { icon: "star", what: `Onboarding proposal ${d.name} #${d.n} is waiting for your review`, detail: "Learning page" });
     setEnd(st, el("span", { class: "chip warn", text: "Review" }));
@@ -1742,7 +1746,7 @@ function recordBar(s) {
   const total = s.successes + s.failures;
   return el("span", { class: "bar" + (total ? "" : " none") }, el("span", { css: { width: (total ? Math.round(100 * s.successes / total) : 0) + "%" } }));
 }
-function memoryReviewCard(m, page) {
+function memoryReviewCard(m, page, advice = "") {
   const card = el("div", { class: "card" });
   const done = () => { renderPage(page); scheduleRefresh(); };
   const act = (a, label, cls) => el("button", { type: "button", class: "btn btn-sm " + (cls || ""), onclick: async () => {
@@ -1750,6 +1754,7 @@ function memoryReviewCard(m, page) {
   const view = () => {
     clear(card).append(
       el("div", { css: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" } }, el("span", { class: "mono muted", text: `M${m.id}` }), el("strong", { text: m.title }),
+        advice ? el("span", { class: "chip " + (advice === "recommended" ? "ok" : "red"), text: advice === "recommended" ? "review: approve" : "review: reject" }) : null,
         el("span", { class: "chip", css: { marginLeft: "auto" }, text: m.kind })),
       el("div", { class: "muted small", text: `Unreviewed · from ${m.source}${m.case_id ? " in " + m.case_id + " (working memory there already)" : ""} · ${fmtRel(m.updated || m.created)}` }),
       el("div", { css: { whiteSpace: "pre-wrap", fontSize: "13px", margin: "8px 0" }, text: m.content }),
@@ -1862,13 +1867,39 @@ const PAGES = {
       S.learnScope, (id) => { S.learnScope = id; renderPage("learning"); }));
     const panel = el("div", { role: "tabpanel", id: "learn-panel", "aria-labelledby": `learn-tab-${S.learnScope}`, class: "tab-panel", css: { display: "flex", flexDirection: "column", gap: "18px" } });
     root.append(panel);
-    if (!data.memories.length && !data.pending.length && !data.tools.length && !data.blocked.length) {
+    const rec = data.recommended;
+    const recIds = new Set((rec && rec.approve_memories) || []), recVers = new Set((rec && rec.approve_skill_versions) || []);
+    const rejIds = new Set((rec && rec.reject_memories) || []);
+    if (rec && (recIds.size || recVers.size)) {
+      const go = el("button", { type: "button", class: "btn btn-primary btn-sm" }, `Approve the ${recIds.size + recVers.size} recommended`);
+      let armed = false, timer = null;
+      go.addEventListener("click", async () => {
+        if (!armed) { armed = true; go.textContent = "Confirm: approve them"; timer = setTimeout(() => { armed = false; go.textContent = `Approve the ${recIds.size + recVers.size} recommended`; }, 5000); return; }
+        clearTimeout(timer);
+        try { const r = await api("/api/learning/approve-recommended", {}); toast(`Approved ${r.memories} memories and ${r.skills} skill versions`); renderPage("learning"); scheduleRefresh(); }
+        catch (e) { toast(e.message, true); }
+      });
+      panel.append(el("div", { class: "card", css: { display: "flex", flexDirection: "column", gap: "8px" } },
+        el("strong", { text: "The after-action review checked these against the evidence" }),
+        el("div", { class: "small", text: `It recommends approving ${recIds.size} memories and ${recVers.size} skill versions for every case` + (rejIds.size ? `, and rejecting ${rejIds.size} memories (marked below).` : ".") }),
+        rec.reasons ? el("details", {}, el("summary", { class: "small", css: { cursor: "pointer" }, text: "Its reasons" }), el("div", { class: "small", css: { whiteSpace: "pre-wrap", marginTop: "6px" }, text: rec.reasons })) : null,
+        el("div", { class: "toolbar" }, el("span", { class: "muted small", css: { flex: "1 1 220px" }, text: "Each item below can still be approved, edited or rejected one by one." }), go)));
+    }
+    if (data.failing.length) {
+      panel.append(el("h2", { class: "sec-title", text: `Skills that keep failing (${data.failing.length})` }),
+        el("div", { css: { display: "flex", flexDirection: "column", gap: "8px" } }, data.failing.map((s) => el("div", { class: "card", css: { display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" } },
+          el("strong", { class: "mono", text: s.name }), el("span", { class: "chip", text: s.expert }), recordBar(s),
+          el("span", { class: "muted small", css: { flex: "1 1 220px" }, text: s.track_record }),
+          el("button", { type: "button", class: "btn btn-sm", "aria-label": `Retire ${s.name}`, onclick: async () => {
+            try { await api(`/api/skills/${encodeURIComponent(s.name)}/action`, { action: "retire" }); toast(`${s.name} retired`); renderPage("learning"); } catch (e) { toast(e.message, true); } } }, "Retire")))));
+    }
+    if (!data.memories.length && !data.pending.length && !data.tools.length && !data.blocked.length && !data.failing.length) {
       panel.append(el("div", { class: "empty", text: S.learnScope === "conversation" ? "Nothing from this conversation is waiting for review." : "Nothing is waiting for review." }));
       return;
     }
     if (data.memories.length) {
       panel.append(el("h2", { class: "sec-title", text: `Memories (${data.memories.length})` }),
-        el("div", { css: { display: "flex", flexDirection: "column", gap: "10px" } }, data.memories.map((m) => memoryReviewCard(m, "learning"))));
+        el("div", { css: { display: "flex", flexDirection: "column", gap: "10px" } }, data.memories.map((m) => memoryReviewCard(m, "learning", recIds.has(m.id) ? "recommended" : rejIds.has(m.id) ? "reject" : ""))));
     }
     if (data.blocked.length) {
       panel.append(el("h2", { class: "sec-title", text: `Blocked tools (${data.blocked.length})` }),
