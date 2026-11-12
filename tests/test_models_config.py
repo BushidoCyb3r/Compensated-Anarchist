@@ -42,7 +42,8 @@ def test_shipped_models(tmp_path, monkeypatch):
     assert {"GenAI", "Claude", "ChatGPT", "Local"} <= groups
     assert {"genai-gateway", "claude-opus", "claude-sonnet", "claude-haiku", "chatgpt", "chatgpt-luna",
             "local-ollama", "local-vllm", "local-textmode", "my-local-model"} <= set(cfg.models)
-    assert cfg.default_model == "local-vllm" and "claude-mythos" not in cfg.models  # commented out
+    assert cfg.default_model == "my-local-model" and "claude-mythos" not in cfg.models  # commented out
+    assert "CHANGE-ME" in cfg.model().problem()  # a fresh install starts on the template: it says what to set up
     m = cfg.models
     assert "CHANGE-ME" in m["my-local-model"].problem() and "CHANGE-ME" in m["genai-gateway"].problem()
     assert "OPENAI_API_KEY" in m["chatgpt"].problem()
@@ -232,3 +233,17 @@ def test_editors_do_not_inherit_secrets(monkeypatch):
     env = editors.graphical_env()
     assert env["DISPLAY"] == ":0" and "HOME" in env and "PATH" in env
     assert "ANTHROPIC_API_KEY" not in env and "SO_API_KEY" not in env
+
+
+def test_a_model_that_is_not_set_up_stops_the_run_with_what_to_do(tmp_path, monkeypatch):
+    """A fresh install starts on the my-local-model template: the first model call says what to set up, instead of a
+    connection error, and nothing falls back to another (possibly hosted) model by itself."""
+    import asyncio
+
+    from compensated_anarchist.llm import ModelNotReady, NotReadyBackend, make_backend
+    cfg = load_config(shipped(tmp_path, monkeypatch))
+    b = make_backend(cfg.model())
+    assert isinstance(b, NotReadyBackend) and b.profile_name == "my-local-model"
+    with pytest.raises(ModelNotReady, match=r"'my-local-model' is not set up yet: fill in its CHANGE-ME.*model picker"):
+        asyncio.run(b.chat([{"role": "user", "content": "hi"}], []))
+    assert not isinstance(make_backend(cfg.model("local-ollama")), NotReadyBackend)  # a ready profile is used as is

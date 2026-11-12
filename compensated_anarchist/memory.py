@@ -275,7 +275,7 @@ class Memory:
             Tool("memory_search", "Search institutional memory: environment facts, proven queries, lessons, known false positives, observed TTPs. Do this BEFORE writing new queries.",
                  schema({"query": S, "kinds": {"type": "array", "items": {"type": "string", "enum": KINDS}}, "limit": {"type": "integer"}}, ["query"]),
                  self._t_search),
-            Tool("memory_record", "Save durable knowledge for future operations (an environment fact, a query that worked with its platform, a lesson, a false-positive pattern, observed TTP). Be specific and self-contained. Never store secrets.",
+            Tool("memory_record", "Save durable knowledge for future operations (an environment fact, a query that worked with its platform, a lesson, a false-positive pattern, observed TTP). Be specific and self-contained. Never store secrets. The case and the date are recorded with it automatically: leave case ids out of the title, and describe the environment as 'this network', not by a case id.",
                  schema({"kind": {"type": "string", "enum": KINDS}, "title": S, "content": S, "tags": L, "attack_techniques": L},
                         ["kind", "title", "content"]), self._t_record),
             Tool("memory_feedback", "Mark a retrieved memory as helpful or misleading so ranking improves.",

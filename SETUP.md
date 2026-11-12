@@ -102,7 +102,9 @@ What the script does:
    - `--harden-vault` mounts the vault noexec (sudo).
 
 **Updating:** `git pull`, then `./scripts/install.sh` again: it reinstalls the package and leaves your settings,
-account and data alone. Stop and start the dashboard afterwards.
+account and data alone. Stop and start the dashboard afterwards. Your `config/roe.local.yaml` is a copy made at
+install time, so it does not get rules that later versions add to `roe.yaml`: `doctor` and every start list any it
+is missing. Copy them across in the same place (the first matching rule wins), or write your own rule for each.
 
 **Moving or copying an installation:** `.venv` is tied to its folder. After moving the checkout, delete `.venv`
 and run `./scripts/install.sh` again. Your data and settings are plain files and move with it.
@@ -146,7 +148,10 @@ model. The top of the file documents every field.
   `models.yaml`: add your own profiles, override a field of a shipped one, set `default_model`, or hide one with
   `enabled: false`.
 - **Secrets never go in either file.** Write `${VARIABLE}` there and put the value in `config/.env`.
-- **The default** is `default_model:` in `models.yaml`; `CA_MODEL` in `.env` or `--model` overrides it.
+- **The default** is `default_model:`. The shipped one is the `my-local-model` template, so until you fill it in or
+  choose another profile, a run stops at once and says which model to set up. Set yours with `default_model:` in
+  `models.local.yaml` (or `CA_MODEL` in `.env`); `--model` or the picker overrides it for a run. The harness never
+  falls back to another model by itself, so nothing is sent to a hosted model you did not choose.
 - **Edits apply without a restart:** the dashboard re-reads the files, and `config/.env`, when the picker or
   Settings opens and before each run. A new API key for a model works straight away. A
   profile that is missing its API key or still has `CHANGE-ME` values shows as "needs setup", with the reason,
@@ -633,6 +638,7 @@ scope:
 ```
 
 **How the scope is applied:**
+- **After an update,** `doctor` and start list any rules `roe.yaml` ships that your file lacks (section 0, *Updating*).
 - **Empty `allowed_targets` means no restriction.** Fill it in before enabling Velociraptor or any other
   response-capable connector.
 - **Velociraptor client ids are resolved live** to hostname, FQDN and last IP, so CIDR and hostname entries

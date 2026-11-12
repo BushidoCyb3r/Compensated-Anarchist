@@ -161,7 +161,9 @@ Model profiles live in `config/models.yaml`, and each one is a choice in the das
 with GenAI (government / enterprise gateway), Claude, ChatGPT and local-server profiles, plus a `my-local-model`
 template to fill in. Site profiles go in `config/models.local.yaml` (git-ignored, merged over it). Edits show up
 in a running dashboard without a restart, and profiles still missing a key or a `CHANGE-ME` value show as
-"needs setup". Switch with the picker, `--model`, `CA_MODEL` or `/model`:
+"needs setup". A fresh install starts on the `my-local-model` template: until a model is set up, a run stops at once
+and says what to set up, and nothing falls back to another model by itself. Switch with the picker, `--model`,
+`CA_MODEL` or `/model`:
 
 | provider | covers | notes |
 |---|---|---|
@@ -625,6 +627,8 @@ gitleaks git .                                                 # secrets in any 
 `tests/test_hardening.py` keeps the fixed issues fixed: index-name injection into Elasticsearch paths, Splunk
 write commands, invisible bidi characters in source, FIPS-mode hashing, XML entity declarations, and pytest
 collecting agent-written code.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md): privately, through GitHub, never in a public issue.
 
 ## Known limits / next steps
 

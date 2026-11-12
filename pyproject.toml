@@ -9,23 +9,43 @@ description = "Compensated Anarchist - agentic harness for Defensive Cyber Opera
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "compensated_anarchist/builtin_skills/code_writer/LICENSE-ponytail"]
+readme = "README.md"
+authors = [{name = "BushidoCyber"}]
+keywords = ["defensive cyber operations", "dco", "threat hunting", "incident response", "dfir", "security onion",
+            "velociraptor", "mcp", "agents"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+# Upper bounds at the next major version: tested with the latest releases of 2026-11 (starlette 1.10, httpx 0.28,
+# uvicorn 0.54, mcp 2.3, anthropic 2.7); a new major is let in only after the tests pass on it.
 dependencies = [
     "mcp>=2.3,<3",
-    "httpx>=0.27",
-    "pyyaml>=6",
-    "starlette>=0.40",
-    "uvicorn>=0.30",
+    "httpx>=0.27,<1",
+    "pyyaml>=6,<7",
+    "starlette>=0.40,<2",
+    "uvicorn>=0.30,<1",
 ]
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=2.7"]
-velociraptor = ["pyvelociraptor", "grpcio"]
+anthropic = ["anthropic>=2.7,<3"]
+velociraptor = ["pyvelociraptor>=0.1.14,<1", "grpcio>=1.60,<2"]
 forensics = ["yara-python", "volatility3", "flare-capa", "flare-floss", "memprocfs",
              "sigma-cli", "pysigma-backend-splunk", "pysigma-backend-elasticsearch", "pysigma-backend-kusto",
              "pysigma-pipeline-sysmon", "pysigma-pipeline-windows"]
 connectors = ["compensated-anarchist[anthropic,velociraptor]"]
 all = ["compensated-anarchist[anthropic,velociraptor,forensics]"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8,<10"]
+
+[project.urls]
+Homepage = "https://github.com/BushidoCyb3r/compensatedanarchist"
+Documentation = "https://github.com/BushidoCyb3r/compensatedanarchist/blob/main/SETUP.md"
+Issues = "https://github.com/BushidoCyb3r/compensatedanarchist/issues"
+Security = "https://github.com/BushidoCyb3r/compensatedanarchist/security/policy"
 
 [project.scripts]
 canarchist = "compensated_anarchist.cli:main"

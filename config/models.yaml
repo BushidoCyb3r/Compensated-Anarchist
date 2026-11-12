@@ -40,7 +40,11 @@
 # Route experts to models in harness.yaml (experts.overrides), e.g. a big model for the lead and a small fast one
 # for triage.
 
-default_model: local-vllm        # per run: --model <profile>, or CA_MODEL=<profile> in config/.env
+# The shipped default is the my-local-model template at the end of this file: until you fill it in, or choose
+# another profile (dashboard model picker, default_model in models.local.yaml, CA_MODEL in config/.env or
+# --model), runs stop at once and say which model to set up. Nothing falls back to another model by itself,
+# so data never goes to a hosted model you did not choose.
+default_model: my-local-model
 
 models:
   # ===========================================================================================================

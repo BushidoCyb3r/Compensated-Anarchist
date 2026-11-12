@@ -15,6 +15,7 @@ from typing import Any
 from . import NAME, __version__
 from .audit import verify
 from .config import load_config
+from .roe import roe_drift_note
 
 C = {"dim": "\033[2m", "b": "\033[1m", "r": "\033[31m", "g": "\033[32m", "y": "\033[33m", "c": "\033[36m", "m": "\033[35m", "x": "\033[0m"}
 if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
@@ -702,6 +703,8 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "doctor":
         async def doc(h):
             _print_status(h)
+            if note := roe_drift_note(h.cfg):
+                print(f"  {C['y']}ROE: {note}{C['x']}")
             _print_models(h.cfg, h.model_name)
             print()
             for t in h.registry.tools.values():

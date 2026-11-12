@@ -75,6 +75,9 @@ def test_case_working_memory_review_and_edits(tmp_path):
     assert {r["id"] for r in m.pending(case_id="IR-1")} >= {proxy, again, other}
 
 
+TRIAGE = "SOC Alert Triage Analyst"  # the alert_triage expert, scripted by its role title
+
+
 def harness(tmp_path, monkeypatch, scripts, **learning):
     cfg = load_config(write_config(tmp_path))
     cfg.learning = learning
@@ -85,8 +88,9 @@ def harness(tmp_path, monkeypatch, scripts, **learning):
 
 def test_auto_review_after_a_playbook_mission_with_the_analysts_edits(tmp_path, monkeypatch):
     scripts = {"lead": [("Recording the proxy.", [("memory_record", {"kind": "environment", "title": "Proxy is 10.0.0.9",
-                                                                     "content": "squid on 10.0.0.9"})]),
+                                                                     "content": "squid on 10.0.0.9"}), ("subagent_spawn", {"expert": "alert_triage", "task": "triage the open alerts"})]),
                         ("Triage done: two clusters, both benign.", []), ("Hunt done.", []), ("Gated mission done.", [])],
+               TRIAGE: [("Two clusters, both benign.", [("submit_report", {"status": "completed", "summary": "both benign"})])],
                "retro": [("Recorded what we learned; approve M1.", [])]}
     h, fake = harness(tmp_path, monkeypatch, scripts, auto_retro=True)
 
@@ -150,8 +154,9 @@ def test_every_n_missions_verdicts_and_ratings(tmp_path, monkeypatch):
 
 def test_learning_queue_in_the_dashboard(tmp_path, monkeypatch):
     scripts = {"lead": [("Saving a fact.", [("memory_record", {"kind": "environment", "title": "Proxy is 10.0.0.9",
-                                                               "content": "squid on 10.0.0.9"})]),
+                                                               "content": "squid on 10.0.0.9"}), ("subagent_spawn", {"expert": "alert_triage", "task": "triage the open alerts"})]),
                         ("Triage done.", [])],
+               TRIAGE: [("Two clusters, both benign.", [("submit_report", {"status": "completed", "summary": "both benign"})])],
                "retro": [("Reviewed: recommend approving the proxy fact.", [])]}
     dash, app = make(tmp_path, monkeypatch, scripts)
     dash.cfg.learning = {"auto_retro": True}
@@ -304,8 +309,10 @@ def test_budget_stop_in_the_dashboard(tmp_path, monkeypatch):
 def test_review_recommends_and_the_analyst_approves_in_one_step(tmp_path, monkeypatch):
     scripts = {"lead": [("Saving a fact.", [("memory_record", {"kind": "environment", "title": "Proxy is 10.0.0.9",
                                                                "content": "squid on 10.0.0.9"}),
-                                            ("memory_record", {"kind": "lesson", "title": "Wrong guess", "content": "x"})]),
+                                            ("memory_record", {"kind": "lesson", "title": "Wrong guess", "content": "x"}),
+                                            ("subagent_spawn", {"expert": "alert_triage", "task": "triage the open alerts"})]),
                         ("Triage done.", [])],
+               TRIAGE: [("Two clusters, both benign.", [("submit_report", {"status": "completed", "summary": "both benign"})])],
                "retro": [("Reviewed.", [("learning_recommend", {"approve_memories": [1, 999], "reject_memories": [2],
                                                                 "reasons": "M1 matches the proxy logs; M2 is a guess"})])]}
     dash, app = make(tmp_path, monkeypatch, scripts)
@@ -369,3 +376,26 @@ def test_cache_reads_count_as_billed():
     full = Budget({"max_tokens": 1000, "cached_weight": 1}, lambda *a: None)
     full.add_tokens({"input": 500, "cached": 400, "output": 10})
     assert full.tokens == 510
+
+
+def test_no_review_when_the_lead_only_asked_and_skill_ids_for_the_review(tmp_path, monkeypatch):
+    """A playbook run where the lead only asked the analyst questions did no work, so no automatic review runs (one
+    ran twice in a live report run). The review that does run lists each unreviewed skill version with the id that
+    learning_recommend takes."""
+    h, fake = harness(tmp_path, monkeypatch, {"lead": [("Before I task the reporter: which report type and markings?", [])],
+                                              "retro": [("reviewed", [])]}, auto_retro=True)
+
+    async def run():
+        await h.start()
+        try:
+            out = await h.operation("mission", lambda: h.mission("Write the hunt report", "Report", "report"), "report",
+                                    "report")
+            v = h.skills.propose("zeek-pivots", "network_analyst", "Pivot in Zeek", "1. pivot", "created",
+                                 conversation_id=h.conversation["id"])
+            return out, v, h._unreviewed_skills_block(h.conversation["id"])
+        finally:
+            await h.close()
+
+    out, v, block = asyncio.run(run())
+    assert "After-action review" not in out and "retro" not in fake.seen and h.op_tasked == 0
+    assert f"skill version id {v['id']}: zeek-pivots v1 for network_analyst: created" in block

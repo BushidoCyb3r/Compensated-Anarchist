@@ -57,6 +57,41 @@ GATE_ALL_PLAYBOOKS = ("vulnerability_assessment",)
 GateHook = Callable[[str, str, dict[str, Any]], str]
 
 
+def missing_shipped_rules(site: Path, shipped: Path) -> list[dict[str, Any]]:
+    """Rules of the shipped roe.yaml that a site ROE file has no rule for (same tool glob and argument globs). A site
+    file is a copy made at install time, so rules that later updates add are missing from it, and the tools they
+    cover fall to its default tier (usually approve, which OBSERVE denies). A site rule of its own for the same
+    match, at any tier, is the site's choice and is not reported."""
+    try:
+        if not site.exists() or not shipped.exists() or site.resolve() == shipped.resolve():
+            return []
+
+        def key(r: dict[str, Any]) -> tuple[str, str]:
+            return str(r.get("match")), json.dumps(r.get("args") or {}, sort_keys=True)
+        have = {key(r) for r in load_yaml(site).get("rules") or [] if isinstance(r, dict)}
+        return [r for r in load_yaml(shipped).get("rules") or [] if isinstance(r, dict) and key(r) not in have]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def drift_note(site: Path, shipped: Path) -> str:
+    """One warning for doctor and start when the site ROE file lacks shipped rules, or "" when it has them all."""
+    missing = missing_shipped_rules(site, shipped)
+    if not missing:
+        return ""
+    default = (load_yaml(site) or {}).get("default_tier", "approve")
+    names = ", ".join(f"{r['match']} ({r.get('tier')})" for r in missing)
+    return (f"your ROE file {site.name} has no rule for {len(missing)} rule(s) that {shipped.name} now ships: {names}. "
+            f"The calls they cover get a later rule or the default tier ({default}) instead. Copy them from "
+            f"{shipped.name} into {site.name}, in the same place (the first matching rule wins), or add your own rule "
+            "for each to keep a different choice.")
+
+
+def roe_drift_note(cfg: Any) -> str:
+    """drift_note for an installation: its ROE file (harness.roe) against the roe.yaml shipped next to it."""
+    return drift_note(Path(cfg.roe_path), Path(cfg.root) / "roe.yaml")
+
+
 def human_gated(tool: str) -> bool:
     return any(fnmatch.fnmatchcase(tool, p) for p in HUMAN_GATED)
 

@@ -606,6 +606,7 @@ class Harness:
         self.memory.case_id = case_id
         self.budget: Budget | None = None  # the running operation's limits (budgets: in harness.yaml)
         self.retro_ran_auto = False  # the CLI's --retro is not run twice
+        self.op_tasked = 0  # subagent taskings in the current operation (no tasking: nothing for a review to learn)
         self.memory.conversation_of = lambda: self.conversation["id"] if self.conversation else ""
         self.skills = SkillStore(cfg.memory_db, cfg.skills, self.audit)
         self.skills.import_dir(BUILTIN_DIR, "built-in", only_new=True)  # shipped skills, e.g. ponytail for code_writer
@@ -915,8 +916,9 @@ class Harness:
             "learning_recommend",
             "At the end of an after-action review: say which of this conversation's unreviewed memories and skill "
             "versions you recommend the analyst approve for every case (checked against the evidence), and which to "
-            "reject (wrong or superseded), each with a short reason. The analyst can then approve your recommendations "
-            "in one step on the Learning page.",
+            "reject (wrong or superseded), each with a short reason. Memories by number (M12 -> 12); skill versions by "
+            "the 'skill version id' the review lists. The analyst can then approve your recommendations in one step "
+            "on the Learning page.",
             schema({"approve_memories": {"type": "array", "items": {"type": "integer"}},
                     "approve_skill_versions": {"type": "array", "items": {"type": "integer"}},
                     "reject_memories": {"type": "array", "items": {"type": "integer"}},
@@ -1133,12 +1135,14 @@ class Harness:
             sa.agent = self._build_subagent(sa)
         sa.stop_requested = False
         self.emit("subagent_resumed", {"id": sa.id, "expert": sa.expert, "title": sa.title, "task": sa.task})
+        self.op_tasked += 1
         return await self._drive_sub(sa, sa.agent.resume)
 
     async def _run_sub(self, sa: SubAgent, text: str) -> str:
         if sa.lock.locked():
             return f"ERROR: {sa.id} is still working on an earlier task; wait for that report"
         assert sa.agent
+        self.op_tasked += 1
         sa.status, sa.stop_requested = "queued", False
         sa.agent.add_user(text)  # the task is saved before it waits for a slot, so a restart cannot lose it
         return await self._drive_sub(sa, sa.agent.resume)
@@ -1312,7 +1316,8 @@ class Harness:
                   f"\n\n# Skills with a poor track record (revise or replace)\n{weak}"
                   f"\n\n# Subagent reflections\n" + ("\n".join(reflections) or "(no subagents reflected)")
                   + f"\n\n# Plans and reports the analyst edited after an agent saved them\n{self._analyst_edits()}"
-                  + f"\n\n# Unreviewed memories written in this conversation\n{self._unreviewed_block(conv_id)}")
+                  + f"\n\n# Unreviewed memories written in this conversation\n{self._unreviewed_block(conv_id)}"
+                  + f"\n\n# Unreviewed skill versions proposed in this conversation\n{self._unreviewed_skills_block(conv_id)}")
         text = await self.lead.turn(prompt)
         summary = self.what_we_learned(conv_id)
         self.emit("learning_summary", {"text": summary})
@@ -1349,6 +1354,12 @@ class Harness:
         rows = self.memory.pending(conversation_id=conv_id)[:40]
         return "\n".join(f"- M{m['id']} ({m['kind']}) {m['title']}: {m['content'][:300]}" for m in rows) or "(none)"
 
+    def _unreviewed_skills_block(self, conv_id: str) -> str:
+        """The skill versions waiting for review, with the ids learning_recommend takes (approve_skill_versions)."""
+        rows = [v for v in self.skills.versions_in(conv_id) if v["status"] == "candidate"][:40]
+        return "\n".join(f"- skill version id {v['id']}: {v['name']} v{v['version']} for {v['expert']}: "
+                         + ((v.get("change_note") or "").splitlines() or [""])[0][:200] for v in rows) or "(none)"
+
     # ---- operations: recorded, so one cut off by a restart or a crash can be resumed or ended ------------
     def op_begin(self, kind: str, label: str, playbook: str = "") -> dict[str, Any]:
         """Record a new operation (mission, after-action review). An interrupted one in this conversation is ended
@@ -1357,6 +1368,7 @@ class Harness:
             self.end_interrupted("a new request was started instead")
         self.op = self.history.op_create(self._conv()["id"], kind, label, playbook, os.getpid(), time.time())
         self.budget = Budget(self.cfg.budgets, self.emit)
+        self.op_tasked = 0
         return self.op
 
     def _learn_denials(self) -> None:
@@ -1389,6 +1401,8 @@ class Harness:
         if not cfg.get("auto_retro", False) or self.gate_reason or not self.conversation:
             return ""
         if playbook:
+            if not self.op_tasked:  # the lead only answered or asked the analyst: no work was done to learn from yet
+                return ""
             return f"the {playbook.replace('_', ' ')} playbook completed"
         n = int(cfg.get("every_n_missions", 0) or 0)
         done = [o for o in self.history.ops_since(self.conversation["id"], "retro")
@@ -1435,6 +1449,7 @@ class Harness:
         self.refresh_models()
         self.history.op_update(op["id"], status="running", pid=os.getpid(), kind="resume" if op["kind"] == "mission" else op["kind"])
         self.op = {**op, "status": "running"}
+        self.op_tasked = 0
         self.budget = Budget(self.cfg.budgets, self.emit)  # a resumed operation gets a fresh budget
         self.audit.record("operation_resumed", operation=op["id"], label=op["label"])
         self.emit("operation_resumed", {"id": op["id"], "label": op["label"], "playbook": op["playbook"]})

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import HarnessConfig
+from .roe import roe_drift_note
 from .web import account
 
 READY_TIMEOUT_S = 180
@@ -446,6 +447,15 @@ def start(cfg: HarnessConfig, config_path: str, opts: dict[str, Any]) -> int:
     for name, v in conn.items():
         if not str(v).startswith("connected"):
             print(f"  note: connector {name}: {v}")
+    if note := roe_drift_note(cfg):
+        print(f"  note: {note}")
+    try:
+        why = cfg.model(state.get("model") or None).problem()
+    except KeyError as e:
+        why = str(e)
+    if why:
+        print(f"  note: the model {state.get('model')} is not set up yet: {why}.\n"
+              "        Choose a ready one in the dashboard's model picker, or set it up (SETUP.md section 1).")
     return 0
 
 

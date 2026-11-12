@@ -175,3 +175,23 @@ def test_splunk_blocks_write_commands_and_index_injection(monkeypatch):
             sp._spl(spl)
     with pytest.raises(ToolError, match="index"):
         sp.data_inventory(index="* | outputlookup x.csv")
+
+
+def test_roe_drift_is_reported(tmp_path):
+    """A site ROE file is a copy made at install time: rules a later update ships are missing from it, so doctor and
+    start say which. A site rule of its own for the same match, at any tier, is the site's choice."""
+    from compensated_anarchist.roe import drift_note, missing_shipped_rules
+    shipped, site = tmp_path / "roe.yaml", tmp_path / "roe.local.yaml"
+    shipped.write_text(yaml.safe_dump({"rules": [{"match": "cte_*", "tier": "auto"},
+                                                 {"match": "local_run", "tier": "notify", "args": {"binary": ["olevba"]}},
+                                                 {"match": "local_run", "tier": "approve"}]}))
+    site.write_text(yaml.safe_dump({"default_tier": "approve", "rules": [{"match": "local_run", "tier": "approve"}]}))
+    assert [(r["match"], r.get("args")) for r in missing_shipped_rules(site, shipped)] == [
+        ("cte_*", None), ("local_run", {"binary": ["olevba"]})]
+    note = drift_note(site, shipped)
+    assert "2 rule(s)" in note and "cte_* (auto)" in note and "default tier (approve)" in note
+    site.write_text(yaml.safe_dump({"rules": [{"match": "cte_*", "tier": "deny"},  # the site's own choice
+                                              {"match": "local_run", "tier": "deny", "args": {"binary": ["olevba"]}},
+                                              {"match": "local_run", "tier": "approve"}]}))
+    assert missing_shipped_rules(site, shipped) == [] and drift_note(site, shipped) == ""
+    assert missing_shipped_rules(shipped, shipped) == []  # running on the shipped file itself
