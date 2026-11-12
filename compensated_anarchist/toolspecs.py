@@ -62,7 +62,8 @@ INTERPRETERS = {"sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "env"
 CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 ROWS = 50            # rows of parsed output shown to the agent
 TEXT = 12000         # characters of text output shown to the agent
-MAX_CAPTURE = 4_000_000
+MAX_CAPTURE = 4_000_000  # bytes of a tool's stdout kept (output files are counted in full, streamed: parse_file)
+MAX_JSON_FILE = 64_000_000  # a JSON output file is parsed whole only up to this size
 
 
 def sha256_file(path: Path) -> str:
@@ -356,6 +357,55 @@ async def run_process(argv: list[str], cwd: Path, timeout: int) -> dict[str, Any
             "stdout_truncated": len(out) > MAX_CAPTURE, "stderr": err[-4000:].decode("utf-8", "replace")}
 
 
+def parse_file(fmt: str, path: Path) -> dict[str, Any]:
+    """Like parse_output, for an output file: rows are counted over the whole file, however large, by streaming it
+    (only the first rows are kept). A file that cannot be read whole (JSON over MAX_JSON_FILE, or text over
+    MAX_CAPTURE) says so with `truncated`, so a partial count is never passed off as the total."""
+    size = path.stat().st_size
+    if fmt == "csv":
+        with path.open(encoding="utf-8", errors="replace", newline="") as fh:
+            reader = csv.DictReader(fh)
+            first: list[Any] = []
+            n = 0
+            for row in reader:
+                if n < ROWS:
+                    first.append(row)
+                n += 1
+            return {"format": "csv", "rows": n, "columns": reader.fieldnames or [], "first": first}
+    if fmt in ("ndjson", "lines"):
+        first, n, bad = [], 0, 0
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                if fmt == "ndjson":
+                    try:
+                        v = json.loads(line)
+                    except ValueError:
+                        bad += 1
+                        continue
+                else:
+                    v = line.rstrip("\r\n")
+                if n < ROWS:
+                    first.append(v)
+                n += 1
+        out: dict[str, Any] = {"format": fmt, "rows": n, "first": first}
+        if fmt == "ndjson":
+            out["unparsed_lines"] = bad
+        return out
+    if fmt == "json":
+        if size > MAX_JSON_FILE:
+            return {"format": "json", "bytes": size, "truncated": True,
+                    "error": f"{size:,} bytes is too large to parse whole: narrow the run, or read the file in parts"}
+        return parse_output("json", path.read_text(encoding="utf-8", errors="replace"))
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        head = fh.read(TEXT + 1)
+    out = {"format": "text", "bytes": size, "head": head[:TEXT]}
+    if len(head) > TEXT:
+        out["truncated"] = True
+    return out
+
+
 def parse_output(fmt: str, text: str) -> dict[str, Any]:
     """The tool's output for the agent: a row count and the first rows, or the head of the text."""
     if fmt == "json":
@@ -403,13 +453,18 @@ async def execute(spec: dict[str, Any], args: dict[str, Any], jail: PathJail, ou
     t0 = time.monotonic()
     res = await run_process(sandbox.wrap(argv, ro, outdir, network), outdir, int(spec.get("timeout_s", 600)))
     src = spec.get("output_from", "stdout")
-    text = res["stdout"]
+    fmt = "text" if argv_override is not None else spec.get("output", "text")
     if argv_override is None and src != "stdout":
         f = outdir / f"{src}.{next(p for p in spec['params'] if p['name'] == src).get('ext', 'out')}"
-        text = f.read_text(encoding="utf-8", errors="replace")[:MAX_CAPTURE] if f.is_file() else ""
-    fmt = "text" if argv_override is not None else spec.get("output", "text")
+        result = parse_file(fmt, f) if f.is_file() else parse_output(fmt, "")
+    else:
+        result = parse_output(fmt, res["stdout"])
+        if res.get("stdout_truncated"):  # the counts cover only what was kept: say so, never pass them off as totals
+            result["truncated"] = True
+            result["note"] = (f"the tool's output was cut at {MAX_CAPTURE:,} bytes, so these counts cover only that part. "
+                              "For complete counts the adapter should have the tool write a file (output_from).")
     out = {"argv": argv, "exit": res["exit"], "seconds": round(time.monotonic() - t0, 2), "sandbox": sandbox.describe(network),
-           "outputs": _outputs(outdir), "result": parse_output(fmt, text)}
+           "outputs": _outputs(outdir), "result": result}
     if res.get("timed_out"):
         out["timed_out"] = True
     if res["exit"] not in (0, None) or res.get("timed_out"):

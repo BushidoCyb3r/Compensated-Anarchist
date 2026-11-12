@@ -652,3 +652,12 @@ collecting agent-written code.
   approval-tier action asks you again).
 - The orchestration and skill loop is tested with a scripted model. How well a given local model uses
   `submit_report` and writes useful skills has not been measured yet.
+
+## License
+
+Copyright 2026 BushidoCyber. Licensed under the [Apache License, Version 2.0](LICENSE): free to use, modify and
+redistribute, commercially too, with the license and the [NOTICE](NOTICE) file kept, changes stated, and an explicit
+patent grant. Provided "as is", without warranty.
+
+The code_writer's ponytail skills are bundled under their own MIT license (see NOTICE and
+`compensated_anarchist/builtin_skills/code_writer/LICENSE-ponytail`).

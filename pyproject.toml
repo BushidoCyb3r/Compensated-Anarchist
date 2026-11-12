@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]   # 77+: SPDX license expression and license-files
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,8 @@ name = "compensated-anarchist"
 version = "0.2.0"
 description = "Compensated Anarchist - agentic harness for Defensive Cyber Operations (hunt, triage, forensics, response) with MCP connectors, ROE enforcement, multi-agent experts and learning memory."
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "compensated_anarchist/builtin_skills/code_writer/LICENSE-ponytail"]
 dependencies = [
     "mcp>=2.3,<3",
     "httpx>=0.27",

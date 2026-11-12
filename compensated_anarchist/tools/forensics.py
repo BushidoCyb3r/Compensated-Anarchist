@@ -98,6 +98,9 @@ class Forensics:
             _kill_group(proc)
             raise
         text = out[:MAX_CAPTURE].decode("utf-8", "replace")
+        if len(out) > MAX_CAPTURE:  # never let a partial output pass for the whole: counts made from it are partial
+            text += (f"\n[OUTPUT CUT: only the first {MAX_CAPTURE:,} of {len(out):,} bytes are shown. Counts made from "
+                     "this text are partial; narrow the run, or have the tool write a file and read that.]")
         if proc.returncode != 0:
             text += f"\n[exit code {proc.returncode}]\n[stderr]\n" + err[-4000:].decode("utf-8", "replace")
         return text or "(no output)"

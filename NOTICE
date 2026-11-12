@@ -1,0 +1,16 @@
+Compensated Anarchist
+Copyright 2026 BushidoCyber
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this
+software except in compliance with the License. A copy is in the LICENSE file and at
+http://www.apache.org/licenses/LICENSE-2.0. Unless required by applicable law or agreed
+to in writing, the software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied.
+
+This product bundles third-party material under its own license:
+
+  ponytail skills (compensated_anarchist/builtin_skills/code_writer/ponytail,
+  ponytail-review, ponytail-audit, ponytail-debt)
+  Copyright (c) 2026 DietrichGebert - MIT License
+  https://github.com/DietrichGebert/ponytail
+  License text: compensated_anarchist/builtin_skills/code_writer/LICENSE-ponytail
