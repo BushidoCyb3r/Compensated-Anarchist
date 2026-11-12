@@ -35,6 +35,7 @@ from typing import Any, Callable
 
 from ..roe import _matches_target
 from .registry import Tool, schema
+from .. import xmlsafe
 
 # Assessment programs: discovery, service/version and TLS checks, web and vulnerability scanners, enumeration,
 # exploit-database lookups and local audits. Nothing here exploits, cracks passwords or floods.
@@ -336,7 +337,7 @@ def _quote(a: str) -> str:
 
 
 def _nmap_summary(xml: str) -> str:
-    root = ET.fromstring(xml)
+    root = xmlsafe.fromstring(xml)
     rows = [f"nmap {root.get('version', '')}: {root.get('args', '')}"]
     for h in root.iter("host"):
         st = h.find("status")

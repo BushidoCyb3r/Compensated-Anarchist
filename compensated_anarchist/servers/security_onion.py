@@ -27,7 +27,7 @@ import json
 
 from mcp.server.mcpserver import MCPServer
 
-from .common import tool_factory, READ, ESClient, ESHTTPError, dumps, env
+from .common import tool_factory, READ, ESClient, ESHTTPError, dumps, env, check_index
 
 mcp = MCPServer("security_onion", instructions="Read-only Security Onion NSM/alert data: Suricata, Zeek, Strelka, endpoint logs.")
 tool = tool_factory(mcp)
@@ -174,7 +174,7 @@ def list_data_streams(pattern: str = "logs-*") -> str:
     """List the data streams that hold data (where SO3 stores each log source), with doc counts and newest event -
     verify a source exists before hunting in it."""
     try:
-        res = es.req("GET", f"/_data_stream/{pattern or '*'}")
+        res = es.req("GET", f"/_data_stream/{check_index(pattern or '*')}")
         return dumps([{"name": d["name"], "indices": len(d.get("indices", [])), "status": d.get("status")}
                       for d in res.get("data_streams", [])][:500])
     except ESHTTPError as e:

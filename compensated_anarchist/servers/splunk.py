@@ -29,7 +29,16 @@ http = httpx.Client(base_url=env("SPLUNK_URL", required=True).rstrip("/"), heade
 MAX = int(env("SPLUNK_MAX_RESULTS", "200"))
 
 _BLOCKED = ("delete", "collect", "mcollect", "meventcollect", "tscollect", "outputlookup", "outputcsv", "outputtext",
-            "sendemail", "sendalert", "script", "run", "runshellscript", "map", "dump", "rest", "sendtocyberark")
+            "sendemail", "sendalert", "script", "run", "runshellscript", "map", "dump", "rest", "sendtocyberark",
+            "summaryindex", "dbxquery", "dbxoutput", "dbxlookup", "outputtelemetry", "sendresults")
+# Macros can hide commands from this list: give the connector a role that cannot write (see SETUP.md).
+_INDEX_RE = re.compile(r"^[A-Za-z0-9_*:.-]{1,200}$")
+
+
+def _index(index: str) -> str:
+    if not _INDEX_RE.match(index or ""):
+        raise ValueError(f"index: an index name or pattern such as main or wineventlog*; got {index!r}")
+    return index
 _BLOCK_RE = re.compile(r"\|\s*(" + "|".join(_BLOCKED) + r")\b", re.I)
 
 
@@ -73,7 +82,7 @@ def list_indexes() -> str:
 @tool(READ)
 def data_inventory(index: str = "*", earliest: str = "-7d") -> str:
     """Which sourcetypes/hosts feed an index (tstats) - verify data exists and learn field sources before hunting."""
-    rows = _oneshot(f"| tstats count max(_time) as last where index={index} by index, sourcetype "
+    rows = _oneshot(f"| tstats count max(_time) as last where index={_index(index)} by index, sourcetype "
                     f"| eval last=strftime(last, \"%Y-%m-%dT%H:%M:%SZ\") | sort -count", earliest, "now", 500)
     return dumps(rows)
 
@@ -90,6 +99,7 @@ def field_summary(spl: str, earliest: str = "-24h", latest: str = "now") -> str:
 def ioc_sweep(values: list[str], index: str = "*", earliest: str = "-30d", latest: str = "now") -> str:
     """Sweep IOCs across indexes; per IOC: hit count, first/last seen, indexes, sourcetypes, hosts."""
     out = {}
+    index = _index(index)
     for v in values[:50]:
         v = v.replace('"', "")
         if re.fullmatch(r"[\w.\-:@]+", v):

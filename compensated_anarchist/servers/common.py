@@ -61,6 +61,20 @@ def dumps(obj: Any, limit: int = 60000) -> str:
     return s if len(s) <= limit else s[:limit] + f"\n...[truncated {len(s) - limit} chars - narrow the query]"
 
 
+_INDEX_PART = re.compile(r"^-?[A-Za-z0-9.*:][A-Za-z0-9_.*:+-]*$")
+
+
+def check_index(index: str) -> str:
+    """An index, data stream or pattern list as Elasticsearch names them (logs-*, .ds-x, remote:logs-*, a,-b), and
+    nothing else: it goes into the request path, so a '/', '?' or '#' (or a part starting with '_', how Elasticsearch
+    names its APIs) could turn a search into another API call - _delete_by_query with the search's own query, say."""
+    s = (index or "").strip()
+    parts = s.split(",")
+    if not s or len(s) > 1000 or not all(_INDEX_PART.match(x) and not x.lstrip("-").startswith("_") for x in parts):
+        raise ValueError(f"index: index names or patterns such as logs-*, logs-zeek-so or logs-*,-logs-old; got {index!r}")
+    return s
+
+
 class ESHTTPError(RuntimeError):
     def __init__(self, status: int, text: str):
         super().__init__(f"HTTP {status}: {text[:2000]}")
@@ -100,7 +114,7 @@ class ESClient:
         body = {"size": 0, "aggs": {"i": {"terms": {"field": "_index", "size": 2000},
                                           "aggs": {"last": {"max": {"field": self.time_field}},
                                                    "future": {"filter": {"range": {self.time_field: {"gt": "now+1h"}}}}}}}}
-        res = self.req("POST", f"/{pattern or '*'}/_search", body, params={"ignore_unavailable": "true"})
+        res = self.req("POST", f"/{check_index(pattern or '*')}/_search", body, params={"ignore_unavailable": "true"})
         out: dict[str, dict[str, Any]] = {}
         for b in res["aggregations"]["i"]["buckets"]:
             s = out.setdefault(_stream_name(b["key"]), {"name": _stream_name(b["key"]), "docs": 0, "backing_indices": 0, "last_event": None})
@@ -131,7 +145,7 @@ class ESClient:
             body["query"]["bool"]["must"] = [{"query_string": {"query": query, "analyze_wildcard": True}}]
         if fields:
             body["_source"] = fields
-        res = self.req("POST", f"/{index}/_search", body)
+        res = self.req("POST", f"/{check_index(index)}/_search", body)
         hits = res.get("hits", {})
         total = hits.get("total", {}).get("value", 0)
         docs = [{"_index": h["_index"], "_id": h["_id"], **h.get("_source", {})} for h in hits.get("hits", [])]
@@ -154,7 +168,7 @@ class ESClient:
         }
         if query and query.strip() not in ("*", ""):
             body["query"]["bool"]["must"] = [{"query_string": {"query": query, "analyze_wildcard": True}}]
-        res = self.req("POST", f"/{index}/_search", body, params={"ignore_unavailable": "true"})
+        res = self.req("POST", f"/{check_index(index)}/_search", body, params={"ignore_unavailable": "true"})
         total = res.get("hits", {}).get("total", {}).get("value", 0)
         aggs = res.get("aggregations") or {}
         pairs = sorted(((x["key"], y["key"], y["doc_count"]) for x in aggs.get("a", {}).get("buckets", [])
@@ -171,7 +185,7 @@ class ESClient:
     def search_dsl(self, index: str, body: dict[str, Any]) -> str:
         body = dict(body)
         body["size"] = min(int(body.get("size", 50)), self.max_hits)
-        res = self.req("POST", f"/{index}/_search", body)
+        res = self.req("POST", f"/{check_index(index)}/_search", body)
         return dumps({"total": res.get("hits", {}).get("total"), "hits": [h.get("_source") for h in res.get("hits", {}).get("hits", [])],
                       "aggregations": res.get("aggregations")})
 
@@ -188,7 +202,7 @@ class ESClient:
 
     def eql(self, index: str, query: str, start: str, end: str, size: int) -> str:
         body = {"query": query, "size": min(size or 50, self.max_hits), "filter": self.time_filter(start, end)}
-        res = self.req("POST", f"/{index}/_eql/search", body)
+        res = self.req("POST", f"/{check_index(index)}/_eql/search", body)
         h = res.get("hits", {})
         out = {"total": h.get("total"), "events": [e.get("_source") for e in h.get("events", [])],
                "sequences": [[e.get("_source") for e in s.get("events", [])] for s in h.get("sequences", [])]}
@@ -196,7 +210,7 @@ class ESClient:
 
     def indices(self, pattern: str) -> str:
         try:
-            res = self.req("GET", f"/_cat/indices/{pattern or '*'}", params={"format": "json", "h": "index,docs.count,store.size,health",
+            res = self.req("GET", f"/_cat/indices/{check_index(pattern or '*')}", params={"format": "json", "h": "index,docs.count,store.size,health",
                                                                             "s": "index", "expand_wildcards": "open"})
             return dumps(res[:500])
         except ESHTTPError as e:
@@ -214,7 +228,7 @@ class ESClient:
         }
         if query and query.strip() not in ("*", ""):
             body["query"]["bool"]["must"] = [{"query_string": {"query": query}}]
-        res = self.req("POST", f"/{index}/_search", body)
+        res = self.req("POST", f"/{check_index(index)}/_search", body)
         return dumps({"field": field, "mode": "rarest" if rare else "top",
                       "buckets": [(b["key"], b["doc_count"]) for b in res["aggregations"]["v"]["buckets"]]})
 
@@ -228,7 +242,7 @@ class ESClient:
                 "where": {"terms": {"field": group_field, "size": 10}},
                 "idx": {"terms": {"field": "_index", "size": 5}}}}},
         }
-        res = self.req("POST", f"/{index}/_search", body)
+        res = self.req("POST", f"/{check_index(index)}/_search", body)
         out = {}
         for v, b in res["aggregations"]["ioc"]["buckets"].items():
             out[v] = {"hits": b["doc_count"]}

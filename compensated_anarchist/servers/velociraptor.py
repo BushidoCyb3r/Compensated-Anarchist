@@ -309,7 +309,7 @@ def download_flow_uploads(client_id: str, flow_id: str, path_regex: str = "", ma
             if (existing := vault.stored_copy(dest)) is not None:
                 out.append({"client_path": u["client_path"], "local_path": str(existing), "already_in_vault": True})
                 continue
-            sha, md5, off = hashlib.sha256(), hashlib.md5(), 0
+            sha, md5, off = hashlib.sha256(), hashlib.md5(usedforsecurity=False), 0  # md5: Velociraptor's id; FIPS-safe
             with vault.open_new(dest) as fh:
                 while True:
                     rows, logs = _query(stub, "SELECT base64encode(string=read_file(accessor='fs', filename=CaPath, "

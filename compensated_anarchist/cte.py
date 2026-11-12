@@ -35,6 +35,7 @@ import yaml
 from . import huntplans
 from .attack import AttackKB, _ext_id
 from .tools.registry import Tool, schema
+from . import xmlsafe
 
 PREFIXES = ("cte_plan_", "cte_results_")
 KINDS = {"plan": "cte_plan_", "results": "cte_results_"}
@@ -154,7 +155,7 @@ def _drawio_models(root: ET.Element) -> list[tuple[str, ET.Element]]:
         if m is None and (d.text or "").strip():  # compressed: base64 -> raw deflate -> URL-encoded XML
             try:
                 raw = zlib.decompress(base64.b64decode(d.text.strip()), -15)
-                m = ET.fromstring(urllib.parse.unquote(raw.decode("utf-8")))
+                m = xmlsafe.fromstring(urllib.parse.unquote(raw.decode("utf-8")))
             except (ValueError, zlib.error, ET.ParseError, UnicodeDecodeError):
                 m = None
         if m is not None:
@@ -207,22 +208,22 @@ def read_vsdx(data: bytes) -> str:
     names = set(z.namelist())
     masters: dict[str, str] = {}
     if "visio/masters/masters.xml" in names:
-        for m in ET.fromstring(z.read("visio/masters/masters.xml")).iter(f"{VNS}Master"):
+        for m in xmlsafe.fromstring(z.read("visio/masters/masters.xml")).iter(f"{VNS}Master"):
             masters[m.get("ID", "")] = m.get("NameU") or m.get("Name") or ""
     page_names: dict[str, str] = {}
     if "visio/pages/pages.xml" in names:
         rels = {}
         if "visio/pages/_rels/pages.xml.rels" in names:
-            for r in ET.fromstring(z.read("visio/pages/_rels/pages.xml.rels")):
+            for r in xmlsafe.fromstring(z.read("visio/pages/_rels/pages.xml.rels")):
                 rels[r.get("Id")] = r.get("Target")
-        for p in ET.fromstring(z.read("visio/pages/pages.xml")).iter(f"{VNS}Page"):
+        for p in xmlsafe.fromstring(z.read("visio/pages/pages.xml")).iter(f"{VNS}Page"):
             rid = next((v for k, v in p.find(f"{VNS}Rel").attrib.items() if k.endswith("}id")), None) \
                 if p.find(f"{VNS}Rel") is not None else None
             if rid in rels:
                 page_names[rels[rid]] = p.get("NameU") or p.get("Name") or ""
     out = []
     for pg in sorted(n for n in names if re.fullmatch(r"visio/pages/page\d+\.xml", n)):
-        root = ET.fromstring(z.read(pg))
+        root = xmlsafe.fromstring(z.read(pg))
         shapes: dict[str, dict[str, Any]] = {}
 
         def walk(el: ET.Element, parent: str) -> None:
@@ -277,11 +278,11 @@ def read_map(path: Path, max_chars: int = 60000) -> str:
     if suffix == ".vsdx" or data[:2] == b"PK":
         body = read_vsdx(data)
     else:
-        text = data.decode("utf-8", errors="replace").lstrip("﻿")
+        text = data.decode("utf-8", errors="replace").lstrip("\ufeff")
         body = ""
         if suffix in (".xml", ".drawio", ".svg") or text.lstrip().startswith("<"):
             try:
-                root = ET.fromstring(text)
+                root = xmlsafe.fromstring(text)
             except ET.ParseError as e:
                 return head + f"XML that could not be parsed: {e}"
             tag = root.tag.split("}")[-1]

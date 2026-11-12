@@ -21,3 +21,5 @@ run/
 # historical reports dropped in for the report writer (format examples; sensitive)
 reports/
 tool_specs/
+build/
+dist/

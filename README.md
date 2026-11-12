@@ -591,6 +591,9 @@ Run tests: `.venv/bin/python -m pytest -q`
 - SOC-native Security Onion features (cases, PCAP jobs, OQL) need SO Pro's Connect API / official MCP server.
 - Events dated in the future (a year-less syslog time parsed into the wrong year, or a device clock) fall outside
   windows that end at now. `list_data_streams` reports them per stream (`future_dated`) so the agents can say so.
+- Dependency advisory (pip-audit, 2026-11-12): `diskcache` 5.6.3, pulled in by pySigma (forensics extra), uses pickle,
+  so whoever can write its cache folder can run code (PYSEC-2026-2447, no fixed release). It is exploitable only
+  if another account can write your `~/.cache`; keep your home folder private (mode 700).
 - The dashboard serves one case per process. Run several on different ports for parallel cases.
 - **Most decisions are attributed to the configured operator, not to whoever clicked.** Approval records, steer and
   stop name the signed-in dashboard user, but the ROE audit entries, skill and memory reviews and conversation

@@ -354,7 +354,7 @@ def _find(obj: Any, key: str) -> Any:
 # untrusted text: data from the network
 # ---------------------------------------------------------------------------------------------------------------
 # C0/C1 controls (except tab and newline), and bidi / zero-width controls that hide or reorder text
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f​-‏‪-‮⁠-⁤⁦-⁩﻿]")
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]")
 
 
 def clean_text(s: str) -> str:

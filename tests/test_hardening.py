@@ -77,3 +77,101 @@ def test_pytest_never_collects_agent_written_code():
     cfg = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())["tool"]["pytest"]["ini_options"]
     assert cfg["testpaths"] == ["tests"]
     assert {"cases", "forensics", "evidence", "data", "tool_specs"} <= set(cfg["norecursedirs"])
+
+
+def test_evidence_hashing_works_in_fips_mode(tmp_path, monkeypatch):
+    """On a FIPS-mode host hashlib.md5()/sha1() raise unless usedforsecurity=False: evidence hashing must not."""
+    import hashlib
+
+    from compensated_anarchist import case
+
+    real_md5, real_sha1 = hashlib.md5, hashlib.sha1
+
+    def fips(real):
+        def h(*a, usedforsecurity=True, **k):
+            if usedforsecurity:
+                raise ValueError("[digital envelope routines] unsupported (FIPS mode)")
+            return real(*a, usedforsecurity=False, **k)
+        return h
+    monkeypatch.setattr(hashlib, "md5", fips(real_md5))
+    monkeypatch.setattr(hashlib, "sha1", fips(real_sha1))
+    f = tmp_path / "e.bin"
+    f.write_bytes(b"evidence")
+    h = case.sha256_file(f)
+    assert h["md5"] == real_md5(b"evidence").hexdigest() and len(h["sha256"]) == 64
+
+
+def test_source_has_no_invisible_or_bidi_characters():
+    """Trojan Source: invisible and bidi control characters make code read differently from how it runs."""
+    import re
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    ranges = [(0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2066, 0x2069), (0xFEFF, 0xFEFF), (0xAD, 0xAD)]
+    bad = re.compile("[" + "".join(f"{chr(a)}-{chr(b)}" for a, b in ranges) + "]")  # from numbers: no such character here
+    hits = []
+    for f in subprocess.run(["git", "ls-files"], capture_output=True, text=True, cwd=root).stdout.split():
+        try:
+            text = (root / f).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, IsADirectoryError, FileNotFoundError):
+            continue
+        hits += [f"{f}:{i}" for i, line in enumerate(text.splitlines(), 1) if bad.search(line)]
+    assert hits == []
+
+
+def test_untrusted_xml_with_entities_is_refused():
+    import pytest
+
+    from compensated_anarchist import xmlsafe
+
+    laughs = b'<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;">]><x>&lol2;</x>'
+    xxe = '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]><r>&x;</r>'
+    for doc in (laughs, xxe, xxe.encode("utf-16"), xxe.encode("utf-16-le")):
+        with pytest.raises(ValueError, match="declares entities"):
+            xmlsafe.fromstring(doc)
+    nmap = b'<?xml version="1.0"?><!DOCTYPE nmaprun><nmaprun scanner="nmap"><host><address addr="10.0.0.5"/></host></nmaprun>'
+    assert xmlsafe.fromstring(nmap).find("host/address").get("addr") == "10.0.0.5"  # a plain DOCTYPE is fine
+
+
+def test_index_names_cannot_become_other_elasticsearch_apis(monkeypatch):
+    """An agent's index argument goes into the request path: '/', '?', '#' or an API name (_security, _delete_by_query)
+    must never reach Elasticsearch, where it could turn a search into a delete with the search's own query."""
+    import importlib
+
+    import httpx
+    import pytest
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from compensated_anarchist.servers.common import check_index
+
+    for ok in ("logs-*", "logs-zeek-so", ".ds-logs-x-000001", "remote:logs-*", "logs-*,-logs-old", "*"):
+        assert check_index(ok) == ok
+    for bad in ("logs-*/_delete_by_query?x=", "../_cluster/settings#", "_security", "logs-*,_all/_doc",
+                "logs zeek", "a?b", "a#b", "%2e%2e", "", "-_cat"):
+        with pytest.raises(ValueError):
+            check_index(bad)
+    monkeypatch.setenv("ES_URL", "https://es.invalid")
+    monkeypatch.setenv("ES_API_KEY", "k")
+    el = importlib.reload(importlib.import_module("compensated_anarchist.servers.elastic"))
+    sent = []
+    el.es.http = httpx.Client(base_url="https://es.invalid", transport=httpx.MockTransport(lambda r: sent.append(r) or httpx.Response(200, json={})))
+    with pytest.raises(ToolError, match="index"):
+        el.search("*", index="logs-*/_delete_by_query?x=")
+    assert sent == []  # refused before anything was sent
+
+
+def test_splunk_blocks_write_commands_and_index_injection(monkeypatch):
+    import importlib
+
+    import pytest
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    monkeypatch.setenv("SPLUNK_URL", "https://splunk.invalid:8089")
+    monkeypatch.setenv("SPLUNK_TOKEN", "t")
+    sp = importlib.reload(importlib.import_module("compensated_anarchist.servers.splunk"))
+    for spl in ("index=main | summaryindex index=evil", "| dbxquery query=\"DROP TABLE x\"", "index=main | collect index=x"):
+        with pytest.raises(ValueError, match="not permitted"):
+            sp._spl(spl)
+    with pytest.raises(ToolError, match="index"):
+        sp.data_inventory(index="* | outputlookup x.csv")

@@ -31,7 +31,9 @@ def _now() -> str:
 
 
 def sha256_file(path: Path) -> dict[str, str]:
-    h = {"md5": hashlib.md5(), "sha1": hashlib.sha1(), "sha256": hashlib.sha256()}
+    # MD5 and SHA-1 are evidence identifiers that other tools and reports quote, not a security check; without
+    # usedforsecurity=False they raise on a FIPS-mode host (common on DoD RHEL / Rocky)
+    h = {"md5": hashlib.md5(usedforsecurity=False), "sha1": hashlib.sha1(usedforsecurity=False), "sha256": hashlib.sha256()}
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             for x in h.values():
