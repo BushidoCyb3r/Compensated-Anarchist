@@ -58,11 +58,13 @@ def test_scope_resolution(tmp_path):
 
 
 def test_local_run_tiers_for_static_parsers(tmp_path):
-    """olevba and pescan only read and print: notify. Tools that can load plugin, decoder or signature scripts, or
-    write files, stay at approve, and the approval note tells the analyst what to look for."""
+    """Every static parser is approved run by run: olevba and pescan by their own rule (they load no plugins), and
+    tools that can load plugin, decoder or signature scripts, or write files, with a note on what to look for. The
+    read-only Sleuth Kit and hashing tools are notify."""
     g = gate(tmp_path, [])
     tier = lambda binary: g.classify("local_run", {"binary": binary, "args": ["/x/sample.doc"]})  # noqa: E731
-    assert tier("olevba")[0] == "notify" and tier("pescan")[0] == "notify" and tier("fls")[0] == "notify"
+    assert tier("olevba")[0] == "approve" and tier("pescan")[0] == "approve" and tier("fls")[0] == "notify"
+    assert "load no plugins" in tier("olevba")[1]
     for b in ("oledump.py", "pdfid.py", "pdf-parser.py", "diec", "densityscout"):
         t, why = tier(b)
         assert t == "approve" and "--plugins" in why, b

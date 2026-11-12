@@ -47,8 +47,8 @@ rules:
   # --- local forensics (read-only, jailed to evidence roots) -------------
   - {match: "local_run", tier: notify, args: {binary: [fls, icat, ils, mmls, fsstat, istat, mactime, sha256sum, ssdeep, exiftool]},
      note: "read-only Sleuth Kit / hashing"}
-  - {match: "local_run", tier: notify, args: {binary: [olevba, pescan]},
-     note: "static parsers: read the file, print to the screen, load no plugins"}
+  - {match: "local_run", tier: approve, args: {binary: [olevba, pescan]},
+     note: "static parsers: they read the file and print, and load no plugins; each run is approved (check which file and why)"}
   # oledump.py, pdfid.py and pdf-parser.py can load Python plugin and decoder files (-p / --plugins, -D / --decoders),
   # and evidence paths are allowed as arguments, so a plugin could come from attacker-controlled evidence. diec can load
   # signature scripts from a folder; densityscout can write an output file. They stay at approve.
