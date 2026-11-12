@@ -95,6 +95,16 @@ budgets:
   max_minutes: 90
 
 # ---------------------------------------------------------------------------
+# Credential redaction: credential values in tool output (API keys, bearer tokens, passwords, private keys, the
+# secrets in config/.env, ...) are replaced with a fingerprint such as <redacted:bearer fp:3f9a1c2e7b> before any
+# model sees them or anything is saved. The same value always gets the same fingerprint (keyed with
+# config/secrets/redaction.key). Evidence files on disk are never changed.
+# ---------------------------------------------------------------------------
+redaction:
+  enabled: true
+  patterns: []               # extra regular expressions for your own secret formats; the whole match is replaced
+
+# ---------------------------------------------------------------------------
 # Learning: the after-action review turns an operation into memories and skill changes for you to review
 # (dashboard: Learning). It uses model time, so turn it off on a slow local model.
 # ---------------------------------------------------------------------------

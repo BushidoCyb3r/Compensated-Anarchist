@@ -441,6 +441,27 @@ The ROE gate runs in code, so the model cannot talk its way past it.
 - **Untrusted data:** tool output is wrapped as untrusted data, and agents are instructed to treat
   instructions found in logs or files as a sign of adversary activity, never to follow them.
 
+## Credential redaction
+
+Security data is full of credentials: API keys on command lines, bearer tokens in HTTP headers, passwords in scripts,
+private keys in files. Every tool result passes through a redactor in the tool executor before the model, the
+dashboard feed, spill files, transcripts or the audit hash see it, so a credential an agent comes across is not copied
+into the model request (off the network, on a hosted model) or into everything saved after it.
+
+- **What it replaces:** this installation's own secrets from `config/.env` (by exact value), private key blocks,
+  passwords in URLs, Authorization headers and bare Bearer / ApiKey / Basic credentials, JWTs, AWS / GitHub / Slack /
+  AI-provider key formats, and `password=`, `api_key:`, `--token X` style pairs. Add your own formats under
+  `redaction.patterns` in harness.yaml.
+- **What it keeps:** each value becomes `<redacted:bearer fp:3f9a1c2e7b>`. The fingerprint is keyed with
+  `config/secrets/redaction.key`, so the same value always gets the same fingerprint (agents can still count distinct
+  tokens and follow one across events) but it cannot be checked against guessed passwords. An Elasticsearch API key
+  also keeps its key id, which names the key to invalidate. Agents are told that something was redacted, and report a
+  credential in data as a finding.
+- **What it does not touch:** evidence files on disk, which stay byte-for-byte for chain of custody, and your own
+  messages.
+- **Limits:** it works by shape, so a credential with no recognizable shape (a password passed as a bare argument)
+  still gets through. It hides a leaked credential from the model; it does not make it safe again: rotate it.
+
 ## Onboarding a new tool
 
 Give the team a tool you supplied, and it learns to use it under the same controls as everything else. Ask for
@@ -604,6 +625,7 @@ compensated_anarchist/
   toolspecs.py      tool onboarding: adapter specs, the sandbox, proposals, approved tools, MCP quarantine
   redteam.py        prompt-injection red team (canarchist redteam)
   xmlsafe.py        XML parsing that refuses entity declarations (network maps, Word files, nmap XML)
+  redact.py         credential redaction for tool output (keyed fingerprints)
   service.py        start / stop, first-run layout, the dashboard's TLS certificate
   web/              dashboard (Starlette app + self-contained single-page UI, sign-in page, logo)
   experts/ prompts/ playbooks/ builtin_skills/

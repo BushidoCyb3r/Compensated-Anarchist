@@ -40,6 +40,7 @@ from .llm.base import LoopDetector, RepetitionLoop, ToolCall, estimate_tokens
 from .mcp_manager import McpManager
 from .memory import Memory
 from .roe import RoeGate, cli_approver, deny_all_approver
+from .redact import Redactor
 from .skills import BUILTIN_DIR, LEAD, SkillStore, skill_tools
 from . import attack, casefiles, cte, huntplans, reports, toolspecs, vault
 from .tools import vulnscan
@@ -615,7 +616,7 @@ class Harness:
         self.roe = RoeGate(cfg.roe_path, self.audit, cli_approver if interactive else deny_all_approver, posture)
         self.registry = ToolRegistry()
         self.executor = ToolExecutor(self.registry, self.roe, self.audit, self.case.artifacts / "spill",
-                                     cfg.max_tool_result_chars, self.emit)
+                                     cfg.max_tool_result_chars, self.emit, redactor=Redactor.for_config(cfg))
         self.executor.budget_of = lambda: self.budget
         self.vault_dir = vault.ensure(Path(cfg.forensics.get("vault_dir") or cfg.evidence_roots[0] / "vault"))
         self.case_evidence_dir = casefiles.ensure_case_folder(cfg.forensics_dir, case_id)  # analyst drop folder

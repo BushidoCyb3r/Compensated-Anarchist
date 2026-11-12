@@ -21,6 +21,7 @@ from typing import Any, Awaitable, Callable
 
 from ..audit import AuditLog
 from ..llm.base import ToolCall, ToolSpec
+from ..redact import HARNESS_NOTE, Redactor
 from ..roe import RoeGate
 
 Handler = Callable[..., Awaitable[str] | str]
@@ -95,8 +96,10 @@ class ToolRegistry:
 
 class ToolExecutor:
     def __init__(self, registry: ToolRegistry, roe: RoeGate, audit: AuditLog, spill_dir: Path, max_chars: int,
-                 on_event: Callable[[str, dict[str, Any]], None] | None = None):
+                 on_event: Callable[[str, dict[str, Any]], None] | None = None, redactor: Redactor | None = None):
         self.registry = registry
+        # credentials in tool output are replaced before the model, the feed, spill files or the audit hash see it
+        self.redactor = redactor or Redactor()
         self.roe = roe
         self.audit = audit
         self.budget_of: Callable[[], Any] = lambda: None  # the running operation's budget (set by the harness)
@@ -151,13 +154,17 @@ class ToolExecutor:
         except Exception as e:  # tool failures are returned to the model, not raised
             out, is_error = f"ERROR: {type(e).__name__}: {e}", True
         elapsed = round(time.monotonic() - t0, 2)
+        out, redacted = self.redactor.redact(out)
 
         digest = hashlib.sha256(out.encode("utf-8", "replace")).hexdigest()
         self.audit.record("tool_result", agent=agent, agent_id=aid, tool=call.name, sha256=digest, chars=len(out),
-                          error=is_error, seconds=elapsed)
+                          error=is_error, seconds=elapsed, **({"credentials_redacted": redacted} if redacted else {}))
         self.on_event("result", {"agent": agent, "agent_id": aid, "tool": call.name, "chars": len(out), "error": is_error,
                                  "seconds": elapsed, "preview": out[:800]})
-        return self._wrap(call.name, tool.server, out), is_error
+        wrapped = self._wrap(call.name, tool.server, out)
+        if redacted:  # the harness's own note, outside the untrusted data
+            wrapped += "\n" + HARNESS_NOTE.format(n=redacted)
+        return wrapped, is_error
 
     def _wrap(self, name: str, server: str, out: str) -> str:
         if len(out) > self.max_chars:

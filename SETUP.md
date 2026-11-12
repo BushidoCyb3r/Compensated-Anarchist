@@ -671,6 +671,10 @@ The shipped defaults suit most sites. Change them in `harness.yaml`:
   bubblewrap sandbox (`sandbox: bwrap`), so `bwrap` must be installed and work for your user. The installer checks
   this. Adapters, proposals and trial runs are kept in `tool_specs/` (git-ignored). Review proposals on the
   Learning page or with `canarchist tools review`.
+- **Credential redaction** (`redaction:`). On by default: credentials in tool output are replaced with
+  fingerprints before any model sees them or anything is saved (README, *Credential redaction*). Add regular
+  expressions for your own secret formats under `patterns`. The fingerprint key is created once in
+  `config/secrets/redaction.key`; keep it with your other secrets.
 - **A new MCP server:** add it under `mcp_servers:` with `quarantine: true` (there is an example at the end of
   that section). Its tools stay unusable until you approve them.
 - **Checking a model before you rely on it:** `.venv/bin/canarchist redteam --model <profile>` runs the
