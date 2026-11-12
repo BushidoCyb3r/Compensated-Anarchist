@@ -116,7 +116,11 @@ api_get() {  # value of a key inside the top-level API: block of server.config.y
 VERSION="$("$BIN" version 2>/dev/null | awk -F': *' '/^version:/{print $2; exit}')"
 BIND_CUR="$(api_get bind_address)"
 PORT="$(api_get bind_port)"; PORT="${PORT:-8001}"
-[ -n "$API_ADDR" ] || API_ADDR="$(ip -4 route get "$HARNESS_IP" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+SCHEME="$(api_get bind_scheme)"
+[ "${SCHEME:-tcp}" = "tcp" ] || die "the API listens on bind_scheme '$SCHEME', not tcp - the harness needs tcp; change it by hand"
+ROUTE="$(ip -4 route get "$HARNESS_IP" 2>/dev/null | head -1 || true)"
+IFACE="$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<<"$ROUTE")"   # the interface that reaches the harness (firewall zone)
+[ -n "$API_ADDR" ] || API_ADDR="$(sed -n 's/.* src \([0-9.]*\).*/\1/p' <<<"$ROUTE")"
 [ -n "$API_ADDR" ] || die "could not work out this server's address towards $HARNESS_IP - pass --api-address"
 [ -n "$BIND" ] || BIND="$API_ADDR"
 INV="$NAME" ADM="${NAME}_admin"
@@ -134,6 +138,13 @@ cat <<EOF
     - restart ${SVC:-the server} so it loads the new API users$( [ "$NO_RESTART" = 1 ] && echo " (skipped: --no-restart)")
     - point the key files at $API_ADDR:$PORT and verify them with read-only queries
 EOF
+case "$BIND_CUR" in
+  127.*|localhost|::1)
+    if [ "$BIND" != "$BIND_CUR" ] && [ "$BIND" != "0.0.0.0" ]; then
+      warn "programs on this server that reach the API at $BIND_CUR:$PORT (other API clients, scripts) will stop"
+      info "     reaching it. To keep them working, use --bind 0.0.0.0 (the firewall rule still limits who can connect)."
+    fi ;;
+esac
 [ "$DRY" = 1 ] && info "dry run: nothing will be changed"
 confirm "Proceed?" || die "aborted - nothing changed"
 
@@ -186,10 +197,19 @@ FW="none"
 if [ "$NO_FW" = 1 ]; then
   warn "skipped (--no-firewall)"; FW="skipped"
 elif systemctl is-active -q firewalld 2>/dev/null; then
+  # the zone of the interface that reaches the harness; an interface without one is in the default zone
+  ZONE=""
+  [ -n "$IFACE" ] && ZONE="$(firewall-cmd --get-zone-of-interface="$IFACE" 2>/dev/null || true)"
+  [[ "$ZONE" =~ ^[A-Za-z0-9_.-]+$ ]] || ZONE="$(firewall-cmd --get-default-zone 2>/dev/null || true)"
+  [[ "$ZONE" =~ ^[A-Za-z0-9_.-]+$ ]] || die "could not work out the firewalld zone - add the rule by hand, or use --no-firewall"
+  if firewall-cmd --zone="$ZONE" --query-port="$PORT/tcp" >/dev/null 2>&1; then
+    warn "port $PORT/tcp is already open to every address in zone $ZONE, so a harness-only rule restricts nothing."
+    info "     Close it if nothing else needs it: firewall-cmd --permanent --zone=$ZONE --remove-port=$PORT/tcp && firewall-cmd --reload"
+  fi
   rule="rule family=\"ipv4\" source address=\"$HARNESS_IP/32\" port port=\"$PORT\" protocol=\"tcp\" accept"
-  if confirm "Add firewalld rule: $rule ?"; then
-    run firewall-cmd --permanent --add-rich-rule="$rule" && run firewall-cmd --reload
-    FW="firewalld: $rule"; ok "$FW"
+  if confirm "Add firewalld rule to zone $ZONE${IFACE:+ (interface $IFACE)}: $rule ?"; then
+    run firewall-cmd --permanent --zone="$ZONE" --add-rich-rule="$rule" && run firewall-cmd --reload
+    FW="firewalld zone $ZONE: $rule"; ok "$FW"
   fi
 elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
   if confirm "Add ufw rule: allow from $HARNESS_IP to any port $PORT proto tcp ?"; then
@@ -197,7 +217,7 @@ elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status:
     FW="ufw: allow from $HARNESS_IP to port $PORT/tcp"; ok "$FW"
   fi
 else
-  FW="NONE - no host firewall is active. Add a network/hypervisor rule: allow TCP $PORT to $API_ADDR from $HARNESS_IP/32 only"
+  FW="NOT SET - neither firewalld nor ufw is active. Allow TCP $PORT to $API_ADDR from $HARNESS_IP/32 only, in this host's nftables/iptables rules or on the network/hypervisor firewall"
   warn "$FW"
   info "until then any host that can reach $API_ADDR can try the API (it still requires a client cert from this server's CA)"
 fi
@@ -328,4 +348,5 @@ cat <<EOF
   Rollback, if ever needed:
     cp -a $BACKUP $CFG && systemctl restart ${SVC:-<service>}
     delete the API users $INV$( [ "$ADMIN" = 1 ] && echo " and $ADM") in the GUI (Users), and remove the firewall rule above
+    (firewalld: firewall-cmd --permanent --zone=<zone> --remove-rich-rule='<the rule>' && firewall-cmd --reload)
 EOF

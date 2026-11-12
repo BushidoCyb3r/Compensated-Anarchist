@@ -32,20 +32,39 @@ and the expert team **writes, scores and revises its own skills** as it works.
                   model profiles: vLLM / Ollama / llama.cpp / gateway / Anthropic ...
 ```
 
+## Requirements
+
+- **Linux:** RHEL-family (RHEL, Rocky, Alma), Debian/Ubuntu or Kali. The tool-onboarding sandbox uses Linux
+  namespaces.
+- **Python 3.11 or newer** with `venv` (Debian/Ubuntu: `apt install python3-venv`).
+- **git**, and **openssl** (the dashboard makes its own TLS certificate when it serves beyond localhost).
+- **bubblewrap** (`bwrap`) for onboarding new tools (`dnf install bubblewrap` / `apt install bubblewrap`).
+  Everything else works without it.
+- **A model:** an API key for a hosted one (Claude, ChatGPT, an enterprise or government gateway), or a local
+  OpenAI-compatible server (vLLM, Ollama, llama.cpp, LM Studio, an MLX server).
+- **Package access** for the installer: PyPI, or a wheelhouse you copy in (`--wheelhouse DIR`) on an air-gapped
+  network. The installer needs no root; only the optional `--harden-vault` uses sudo.
+- Optional: the connectors you have, local forensic tools (SETUP.md section 8), and Chrome or Chromium for the
+  browser-driven accessibility tests.
+
 ## Quick start
 
-**Setting up the model and connectors:** follow [SETUP.md](SETUP.md). It covers a step-by-step for each system
-(Security Onion, Elastic, Splunk, Velociraptor, MISP, OpenCTI, local tools) and the scope file.
-
 ```bash
-scripts/start.sh     # first run: builds everything (install.sh) and asks you to create the dashboard account;
-                     # every run: asks posture / address / case (Enter keeps your last choice), then prints
-                     # the sign-in link with a NEW access token (your data is kept)
+git clone https://github.com/BushidoCyb3r/compensatedanarchist.git
+cd compensatedanarchist
+scripts/start.sh     # first run: builds everything (scripts/install.sh) and asks you to create the dashboard
+                     # account; every run: asks posture / address / case (Enter keeps your last choice), then
+                     # prints the sign-in link with a NEW access token (your data is kept)
 scripts/stop.sh      # stops it; cases, conversations, memory, skills and audit logs stay
 ```
 
+Then **set up a model and the connectors you have** with [SETUP.md](SETUP.md): a step-by-step for each system
+(Security Onion, Elastic, Splunk, Velociraptor, MISP, OpenCTI, Archer, local tools) and the scope file. Nothing in
+the repository is site-specific: your addresses, keys, scope, cases and evidence live only in git-ignored files
+and folders (`config/.env`, `config/secrets/`, `config/*.local.yaml`, `cases/`, `forensics/`, `evidence/`, ...).
+
 ```bash
-./scripts/install.sh                                             # (start.sh runs this on the first run)
+./scripts/install.sh                                             # (start.sh runs this on the first run; --help)
 $EDITOR config/.env                                              # models + connector credentials (SETUP.md)
 # evidence for a case goes in forensics/<case-id>/ (created per case; the forensics playbook starts there)
 .venv/bin/canarchist attack fetch                                # MITRE ATT&CK data for actor-based hunt plans (optional)
@@ -225,6 +244,17 @@ stderr goes to `cases/<id>/logs/`.
 
 Use least-privilege accounts. For example, a read-only ES role, a Splunk role without `delete_by_keyword`,
 and a Velociraptor `investigator,api` client.
+
+**Adding a connector.** There are three ways, from least to most work:
+- **A REST API with an OpenAPI 3 document:** the team can onboard it itself. The tool_integrator proposes the
+  operations it needs as `api_<name>__<operation>` tools, and they work once you approve (see *Onboarding a new
+  tool* below). Auth is none, bearer, a header key or basic, with the secret read from `config/.env`.
+- **An existing MCP server:** add it under `mcp_servers:` in harness.yaml with `quarantine: true`. Its tools are
+  listed but cannot be called until you approve the tiers and experts the tool_integrator proposes.
+- **Anything else** (a session login, certificate pinning, response shaping, as the Archer connector does): a small
+  Python MCP server in `compensated_anarchist/servers/`, using `servers/archer.py` as the pattern, plus an entry in
+  harness.yaml, ROE rules and tests. The `code` playbook can draft one, but the harness never runs code an agent
+  wrote, so you review it and add it yourself.
 
 **Archer notes:**
 - **Reads only.** The connector sends GET to a fixed list of read routes; the one POST is the login. Any other
@@ -570,13 +600,31 @@ compensated_anarchist/
   tools/            registry/executor, local forensics
   servers/          MCP servers: security_onion, splunk, elastic, velociraptor, misp, opencti, archer
   toolspecs.py      tool onboarding: adapter specs, the sandbox, proposals, approved tools, MCP quarantine
+  redteam.py        prompt-injection red team (canarchist redteam)
+  xmlsafe.py        XML parsing that refuses entity declarations (network maps, Word files, nmap XML)
+  service.py        start / stop, first-run layout, the dashboard's TLS certificate
   web/              dashboard (Starlette app + self-contained single-page UI, sign-in page, logo)
-  experts/ prompts/ playbooks/
-config/             harness.yaml, models.yaml, roe.yaml, env.example
+  experts/ prompts/ playbooks/ builtin_skills/
+config/             harness.yaml, models.yaml, roe.yaml, env.example (your copies: .env, *.local.yaml, secrets/)
+scripts/            install.sh, start.sh, stop.sh, velociraptor_setup.sh (runs on the Velociraptor server)
 tests/              end-to-end (real MCP subprocess, scripted model) + unit tests
 ```
 
-Run tests: `.venv/bin/python -m pytest -q`
+Run tests: `scripts/install.sh --test`, or `.venv/bin/python -m pytest -q` once pytest is installed. Live
+tests against your own systems skip unless their `CA_LIVE_*` variables are set (SETUP.md).
+
+## Security checks
+
+Before a release, from the checkout:
+```bash
+.venv/bin/pip install bandit pip-audit
+.venv/bin/bandit -q -r compensated_anarchist                  # static analysis
+.venv/bin/pip-audit                                            # known-vulnerable dependencies
+gitleaks git .                                                 # secrets in any commit (gitleaks is a separate binary)
+```
+`tests/test_hardening.py` keeps the fixed issues fixed: index-name injection into Elasticsearch paths, Splunk
+write commands, invisible bidi characters in source, FIPS-mode hashing, XML entity declarations, and pytest
+collecting agent-written code.
 
 ## Known limits / next steps
 

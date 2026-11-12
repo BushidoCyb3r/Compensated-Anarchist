@@ -9,7 +9,8 @@
 #   2. installs the harness (pip; or offline from a wheelhouse with --wheelhouse DIR)
 #   3. creates config/.env (mode 600) from config/env.example, config/secrets/ (700), the site scope file
 #      config/roe.local.yaml (600), and the evidence, vault, cases and memory folders
-#   4. checks the evidence vault mount (noexec) and which local forensic tools are installed (it installs none)
+#   4. checks the evidence vault mount (noexec), the system tools it uses (openssl, bwrap) and which local
+#      forensic tools are installed (it installs none)
 #   5. runs `canarchist doctor` (and the test suite with --test)
 set -euo pipefail
 
@@ -188,7 +189,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------------------------
-step "5. Local forensic tools (optional - none are installed by this script)"
+step "5. System tools"
+if command -v openssl >/dev/null 2>&1; then
+  ok "openssl: the dashboard's TLS certificate when it serves beyond localhost"
+else
+  warn "openssl not found: install it to serve the dashboard beyond this host (scripts/start.sh --localhost works without it)"
+fi
+if command -v bwrap >/dev/null 2>&1; then
+  if bwrap --unshare-all --ro-bind / / true 2>/dev/null; then
+    ok "bwrap (bubblewrap): the sandbox for onboarded tools"
+  else
+    warn "bwrap is installed but cannot create a sandbox here (user namespaces disabled?) - tool onboarding will not work"
+    info "     check: sysctl user.max_user_namespaces (must be > 0); on Ubuntu 24.04+ also the AppArmor userns restriction"
+  fi
+else
+  warn "bwrap (bubblewrap) not found: needed only to onboard new tools (dnf install bubblewrap | apt install bubblewrap)"
+fi
+
+# ---------------------------------------------------------------------------------------------------------------
+step "6. Local forensic tools (optional - none are installed by this script)"
 have=() missing=()
 for t in file strings yara vol log2timeline.py tshark zeek capa floss exiftool hayabusa chainsaw sigma fls bulk_extractor dotnet; do
   if command -v "$t" >/dev/null 2>&1 || [ -x ".venv/bin/$t" ]; then have+=("$t"); else missing+=("$t"); fi
@@ -199,7 +218,7 @@ info "Install only what your team needs, after clearing it with your security te
 info "--forensics installs the Python ones (YARA, Volatility 3, capa, FLOSS, MemProcFS, sigma-cli) into .venv."
 
 # ---------------------------------------------------------------------------------------------------------------
-step "6. MITRE ATT&CK data (hunt planning)"
+step "7. MITRE ATT&CK data (hunt planning)"
 if [ -f data/attack/enterprise-attack.json ]; then
   ok "data/attack/enterprise-attack.json present"
 elif [ "$ATTACK" = 1 ] && [ -x .venv/bin/canarchist ]; then
@@ -209,7 +228,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------------------------
-step "7. Checks"
+step "8. Checks"
 if [ -x .venv/bin/canarchist ]; then
   if [ "$RUN_TESTS" = 1 ]; then
     .venv/bin/python -m pytest -q && ok "test suite passed" || warn "some tests failed (see above)"
@@ -233,7 +252,7 @@ cat <<EOF
   Next, follow SETUP.md:
     1. Model (required): pick or fill in a profile in config/models.yaml (e.g. the my-local-model template)
        and put its key in config/.env; the dashboard's model picker lists them all (SETUP.md section 1).
-    2. Connectors you have: Security Onion, Elastic, Splunk, Velociraptor, MISP, OpenCTI (sections 2-7).
+    2. Connectors you have: Security Onion, Elastic, Splunk, Velociraptor, MISP, OpenCTI, Archer (sections 2-7b).
        Velociraptor: run scripts/velociraptor_setup.sh on the Velociraptor server; put the key files
        in config/secrets/ (section 5).
     3. Scope: config/roe.local.yaml - allowed_targets and protected_assets (section 9).

@@ -57,24 +57,55 @@ scripts/stop.sh             # stop
 
 ## 0. Before you start
 
+**What the harness host needs:**
+- Linux, with Python 3.11 or newer and its `venv` module (Debian/Ubuntu: `apt install python3-venv`).
+- `git` and `openssl`. The dashboard makes its own self-signed certificate with openssl when it serves beyond
+  localhost.
+- `bwrap` (bubblewrap) to onboard new tools: `dnf install bubblewrap` or `apt install bubblewrap`. Without it,
+  everything else still works.
+- Access to PyPI for the Python packages, or a wheelhouse you copy in (air-gapped; see below).
+- No root. Only the optional `--harden-vault` uses sudo.
+
 **Install:** one script takes you from `git clone` to ready-to-configure. It is safe to re-run, and never
 overwrites your settings:
 ```bash
-git clone <repo> compensatedanarchist && cd compensatedanarchist
-./scripts/install.sh               # --help for options
+git clone https://github.com/BushidoCyb3r/compensatedanarchist.git
+cd compensatedanarchist
+./scripts/install.sh               # --help for options; scripts/start.sh runs it for you on the first start
 ```
 What the script does:
 1. **Python and packages:** finds Python 3.11 or newer, creates `.venv`, and installs the harness with the
    Claude and Velociraptor client libraries.
    - `--forensics` also installs the Python forensic tools.
-   - `--wheelhouse DIR` installs offline, for air-gapped networks.
-2. **Configuration files:** creates `config/.env` (600) from the template, `config/secrets/` (700), and your
-   site scope file `config/roe.local.yaml` (600).
-3. **Folders:** creates `evidence/`, the vault `evidence/vault/` (700), `cases/` and `memory/`.
-4. **Checks:** confirms all of these are git-ignored, reports the vault's mount and which local forensic tools
-   are present (it installs none of them), then runs `doctor`.
-   - `--test` also runs the test suite.
+   - `--wheelhouse DIR` installs offline, for air-gapped networks. Build the wheelhouse on a connected machine
+     with the same OS and Python version, in a checkout:
+     `python3 -m pip wheel -w wheelhouse pip setuptools wheel '.[connectors]'` (add `pytest` for `--test`,
+     `.[connectors,forensics]` for `--forensics`). Copy `wheelhouse/` across.
+   - `--core` installs the harness only, without the Claude and Velociraptor libraries.
+2. **Configuration files:**
+   - `config/.env` (600), from `config/env.example`;
+   - `config/secrets/` (700);
+   - your site scope file `config/roe.local.yaml` (600), a copy of `roe.yaml`;
+   - `config/models.local.yaml`, for your own model profiles.
+3. **Folders:** `evidence/`, the vault `evidence/vault/` (700), `forensics/` (per-case evidence folders),
+   `cases/` and `memory/`.
+4. **The dashboard account:** in a terminal it asks for the username and password you will sign in with.
+   Otherwise the first `scripts/start.sh` asks.
+5. **Checks:** confirms all of these are git-ignored, reports:
+   - the vault's mount;
+   - the system tools the harness uses (`openssl`, `bwrap`);
+   - which local forensic tools are present (it installs none of them).
+   
+   Then it runs `doctor`.
+   - `--test` also installs pytest and runs the test suite.
+   - `--attack` downloads the MITRE ATT&CK data (section 8b).
    - `--harden-vault` mounts the vault noexec (sudo).
+
+**Updating:** `git pull`, then `./scripts/install.sh` again: it reinstalls the package and leaves your settings,
+account and data alone. Stop and start the dashboard afterwards.
+
+**Moving or copying an installation:** `.venv` is tied to its folder. After moving the checkout, delete `.venv`
+and run `./scripts/install.sh` again. Your data and settings are plain files and move with it.
 
 **Where secrets live:**
 - `config/.env` holds every URL, key and token.
@@ -277,15 +308,25 @@ sudo ./velociraptor_setup.sh --harness-ip <harness host IP> --admin    # plus th
 What it does:
 - **Finds the installation** (service, binary, config, service user) from systemd.
 - **Creates the key(s)** as the service user and backs up `server.config.yaml` first.
-- **Exposes the API** by moving its listen address to the IP that can reach the harness, and allows the port
-  from the harness host only (firewalld or ufw; otherwise it tells you which network rule to add).
+- **Exposes the API** by moving its listen address to the IP that can reach the harness (`--bind` to choose
+  another), and allows the port from the harness host only:
+  - **firewalld:** a rich rule in the zone of the interface that reaches the harness. It warns if the port is
+    already open to everyone, which would make that rule pointless.
+  - **ufw:** an allow rule for the harness address.
+  - **Anything else** (nftables or iptables directly, or a network firewall): it tells you which rule to add.
+
+  If other programs on the server use the API through `127.0.0.1`, pass `--bind 0.0.0.0` so they keep working.
+  The firewall rule still limits who can connect.
 - **Restarts the server and verifies** each key with a read-only query.
 - **Prints a report with no secrets:** version, API address, client count and ranges, the harness
   workstation's own client id, stale clients, and a ready-to-paste `allowed_targets` / `protected_assets` block
   for `roe.local.yaml`.
 
-It asks before every change, has `--dry-run`, and never prints key contents. `--deliver user@harness:<repo>/config/secrets/`
-copies the keys with scp and offers to shred the server-side copies.
+It asks before every change, has `--dry-run`, and never prints key contents. Run `--dry-run` first to see the
+plan. `--deliver user@harness:<repo>/config/secrets/` copies the keys with scp and offers to shred the
+server-side copies. It finds a standard package install (the `velociraptor_server` service) on its own. For
+anything else, pass `--binary`, `--config` and `--user`, and restart the server yourself. The API must listen
+on TCP (`API: bind_scheme: tcp`, the default). `--help` lists every option.
 
 **On the Velociraptor server, by hand** (run the commands as the service user, usually `velociraptor`, so the
 datastore files it writes stay owned correctly):
@@ -604,7 +645,35 @@ scope:
 
 ---
 
-## 10. Final check
+## 10. Learning, budgets and new tools (`config/harness.yaml`)
+
+The shipped defaults suit most sites. Change them in `harness.yaml`:
+
+- **Budgets** (`budgets:`). Each operation's limits over all its agents together:
+  - `max_tokens` (4,000,000), with prompt-cache reads counted at `cached_weight` (0.1);
+  - `max_tool_calls` (500);
+  - `max_minutes` (90).
+
+  The feed warns at 80 %; at a limit the run stops cleanly and you can carry on with a new message. On a hosted
+  model, tokens are money: lower `max_tokens` to cap what one operation can cost.
+- **Learning** (`learning:`). `auto_retro: true` runs the after-action review when a playbook mission completes;
+  `every_n_missions: N` also runs it after every N other missions. The review uses model time, so on a slow local
+  model set `auto_retro: false` and run `/retro` (or *After-action review*) yourself. What it proposes waits on
+  the dashboard's **Learning** page for your approval.
+- **New tools** (`tool_onboarding:`). Put tools you want the team to use under one of `tool_roots`
+  (`/opt`, `/usr/local`, `~/tools`): the tool_integrator looks nowhere else. Every onboarded tool runs in the
+  bubblewrap sandbox (`sandbox: bwrap`), so `bwrap` must be installed and work for your user. The installer checks
+  this. Adapters, proposals and trial runs are kept in `tool_specs/` (git-ignored). Review proposals on the
+  Learning page or with `canarchist tools review`.
+- **A new MCP server:** add it under `mcp_servers:` with `quarantine: true` (there is an example at the end of
+  that section). Its tools stay unusable until you approve them.
+- **Checking a model before you rely on it:** `.venv/bin/canarchist redteam --model <profile>` runs the
+  prompt-injection checks: six scenarios, stub tools only, reports in `cases/_redteam/`. It calls the model, so
+  on a hosted model it costs tokens.
+
+---
+
+## 11. Final check
 
 ```bash
 .venv/bin/canarchist doctor --case SETUP-CHECK
@@ -626,3 +695,12 @@ scripts/start.sh --case IR-0001     # prints the sign-in link and this start's a
 | Agent replies loop or come back empty | The model is too small for the task; try a larger one (the loop guard cuts loops off) |
 | Approval-tier actions always denied | Response actions need RESPOND posture (by design), the target is outside `allowed_targets`, or the run is non-interactive |
 | `doctor` says the vault is not on a noexec mount | Run the bind-mount commands in section 5 (root); files are still read-only and non-executable meanwhile |
+| `install.sh`: "Python 3.11 or newer is required" or "lacks venv/ensurepip" | Install a newer Python (and `python3-venv` on Debian/Ubuntu), or pass `--python /path/to/python3.x` |
+| `start.sh`: "No dashboard account yet" | It was run without a terminal. Run `scripts/start.sh` in a terminal once, or `.venv/bin/canarchist account create` |
+| `start.sh`: "openssl is needed" | Install openssl, or serve on this host only with `scripts/start.sh --localhost` |
+| `start.sh`: "Port 8765 ... is in use" | Another program (or another installation's dashboard) has the port: `--port 8766` |
+| The dashboard link does not open from another machine | It is bound to 127.0.0.1. Choose the main address at start (or on the Settings page) and open the port to your workstation |
+| Tool onboarding fails with a sandbox error | `bwrap` is missing, or user namespaces are disabled (`sysctl user.max_user_namespaces`; Ubuntu 24.04+ also restricts them with AppArmor) |
+| "Stopped: this run reached its budget" | The operation hit a `budgets:` limit (section 10). Send a new message to carry on, or raise the limit |
+| "No MITRE ATT&CK data" (hunt or emulation plans) | `.venv/bin/canarchist attack fetch`, or `--from <file>` with a copied `enterprise-attack.json` (section 8b) |
+| `velociraptor_setup.sh`: "no Velociraptor server service found" | Not a standard package install: pass `--binary`, `--config` and `--user` |
