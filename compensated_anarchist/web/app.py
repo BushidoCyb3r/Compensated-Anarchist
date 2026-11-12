@@ -55,7 +55,9 @@ from ..config import HarnessConfig
 from ..memory import KINDS
 
 COOKIE = "ca_session"
-EPHEMERAL = {"telemetry", "delta", "ui_updated", "settings_changed"}  # broadcast live, never kept in the replay buffer
+# broadcast live, never kept in the replay buffer. case_switched tells open pages to reload: kept, every page load
+# would replay it and reload again, over and over.
+EPHEMERAL = {"telemetry", "delta", "ui_updated", "settings_changed", "case_switched"}
 MAX_LOGIN_FAILURES = 10    # per client address, per 5 minutes
 HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 MAX_MARKING_CHARS = 120

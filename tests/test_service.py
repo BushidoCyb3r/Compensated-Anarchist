@@ -225,6 +225,8 @@ def test_live_posture_and_case(tmp_path, monkeypatch):
         assert r.status_code == 200 and dash.harness.case.id == "IR-7"
         st = c.get("/api/state").json()  # still signed in, on the new case, same posture
         assert st["case"]["id"] == "IR-7" and st["posture"] == "respond"
+        # the reload signal is live only: kept in the backlog, every page load replayed it and reloaded again
+        assert not [e for e in c.get("/api/events/poll?after=0").json() if e["kind"] == "case_switched"]
         assert (old_case / "notes.txt").read_text() == "keep me"
         assert c.post("/api/settings/case", json={"case": "../etc"}, headers=H).status_code == 400
         r = c.post("/api/settings/address", json={"address": "127.0.0.1"}, headers=H)
@@ -233,6 +235,32 @@ def test_live_posture_and_case(tmp_path, monkeypatch):
         assert saved["posture"] == "respond" and saved["case"] == "IR-7"   # the next start's defaults
         audit = (dash.harness.case.dir / "audit.jsonl").read_text() + (old_case / "audit.jsonl").read_text()
         assert '"event":"posture_changed"' in audit and '"event":"case_switch"' in audit
+
+
+def test_case_switch_reloads_the_page_once(tmp_path, monkeypatch):
+    """Switching case from Settings reloads the page once and it stays put (it used to reload over and over)."""
+    from test_accessibility import CHROME, Served
+
+    if CHROME is None:
+        pytest.skip("no Chrome/Chromium on this host")
+    dash, _ = make(tmp_path, monkeypatch, {})
+    with Served(dash, tmp_path) as chrome:
+        chrome.send("Page.addScriptToEvaluateOnNewDocument",  # counts page loads in this tab from here on
+                    {"source": "sessionStorage.loads = String(+(sessionStorage.loads || 0) + 1);"})
+        chrome.js("go('settings'); true")
+        chrome.wait("!!document.getElementById('run-case-new')")
+        chrome.js("const f = document.getElementById('run-case-new'); f.value = 'IR-9'; f.dispatchEvent(new Event('input'));"
+                  "[...document.querySelectorAll('button')].find((b) => b.textContent === 'Switch case').click(); true")
+        chrome.wait("sessionStorage.loads === '1' && typeof S !== 'undefined' && !!S.st && S.st.case.id === 'IR-9'")
+        time.sleep(2)
+        assert chrome.js("sessionStorage.loads") == "1"  # one reload for the reply and the live event together
+        # a reload signal left in the backlog (as an older dashboard kept it) is not acted on when replayed
+        dash.seq += 1
+        dash.events.append({"seq": dash.seq, "ts": time.time(), "kind": "case_switched", "data": {"case": "IR-9"}})
+        chrome.js("setTimeout(() => location.reload(), 50); true")
+        chrome.wait("sessionStorage.loads === '2' && typeof S !== 'undefined' && !!S.st")
+        time.sleep(2)
+        assert chrome.js("sessionStorage.loads") == "2"
 
 
 def test_handoff_token_only_for_this_process(tmp_path):

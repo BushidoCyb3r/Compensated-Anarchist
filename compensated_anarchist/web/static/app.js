@@ -1102,7 +1102,7 @@ const H = {
   },
   rated() { scheduleRefresh(); },
   settings_changed(d) { if (!d.restarting) { scheduleRefresh(); if (S.view === "settings" && !S.clsDraft) renderPage("settings"); } },
-  case_switched() { location.reload(); },
+  case_switched(d, ev) { if (!S.replaying && !ev.replay) reloadOnce(); }, // live only: a replayed one would loop
   ready() { scheduleRefresh(); },
 };
 function onEvent(ev) {
@@ -1112,6 +1112,8 @@ function onEvent(ev) {
   const h = H[ev.kind];
   if (h) { try { h(ev.data || {}, ev); } catch (e) { console.error(ev.kind, e); } }
 }
+// The page that switched the case gets both its own reply and the live event: reload once, not twice.
+function reloadOnce() { if (S.reloading) return; S.reloading = true; location.reload(); }
 function onPendingChanged() { renderBanner(); renderStatus(); renderHeader(); renderSide(); renderSubframeSoon(); }
 function onRunChanged() { renderStatus(); renderComposerState(); renderSide(); renderResume(); }
 /* ---------------------------------------------------------------- streaming */
@@ -1909,7 +1911,7 @@ function runSettings(info) {
   pick.addEventListener("change", sync); fresh.addEventListener("input", sync);
   switchBtn.addEventListener("click", async () => {
     switchBtn.disabled = true; switchBtn.textContent = "Switching…";
-    try { await api("/api/settings/case", { case: target() }); location.reload(); }
+    try { await api("/api/settings/case", { case: target() }); reloadOnce(); }
     catch (e) { toast(e.message, true); switchBtn.textContent = "Switch case"; sync(); }
   });
 
