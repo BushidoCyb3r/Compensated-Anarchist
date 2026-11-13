@@ -1,8 +1,8 @@
 # Compensated Anarchist - model profiles
 #
 # Every enabled profile below is a choice in the dashboard's model picker and for `--model <name>` / `/model` on
-# the CLI. Add, change or remove models here. A running dashboard picks the changes up the next time the picker
-# or the Settings page opens; no restart needed.
+# the CLI. Add, change or remove models here. The picker reloads definitions, but restart after changes to
+# reliably update existing agent backends/credentials and the default model (SETUP.md section 1).
 #
 # Site-specific profiles go in models.local.yaml next to this file. It is git-ignored, has the same layout, and is
 # merged over this file, so it can add profiles, override fields of a profile here, set default_model, or turn
@@ -29,7 +29,8 @@
 #   max_output_tokens  cap per reply (reasoning models count their reasoning against it)
 #   max_tokens_param   max_tokens (most servers) | max_completion_tokens (OpenAI's own API)
 #   timeout_s          per request, in seconds
-#   stream             true streams replies to the dashboard; false for gateways that mishandle streaming
+#   stream             true shows incremental replies; false disables OpenAI-compatible request streaming,
+#                      but only hides incremental text for Anthropic (its API requests always stream)
 #   extra_body         provider knobs sent as-is, e.g. {temperature: 0.2} or {reasoning_effort: medium}
 #   effort             anthropic only: low | medium | high
 #
@@ -42,8 +43,8 @@
 
 # The shipped default is the my-local-model template at the end of this file: until you fill it in, or choose
 # another profile (dashboard model picker, default_model in models.local.yaml, CA_MODEL in config/.env or
-# --model), runs stop at once and say which model to set up. Nothing falls back to another model by itself,
-# so data never goes to a hosted model you did not choose.
+# --model), runs stop at once and say which model to set up. The harness does not switch profiles/providers
+# automatically. The Anthropic backend separately requests provider-side fallbacks for supported model IDs.
 default_model: my-local-model
 
 models:

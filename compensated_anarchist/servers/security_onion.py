@@ -8,9 +8,10 @@ Field layout verified against a live Security Onion 3.4.0 grid:
     Both carry event.severity_label (low|medium|high|critical).
   - network.community_id joins Suricata alerts with Zeek records.
 
-Access: authenticate with a read-only API key (or a SOC account). Port 9200 on the manager is not open to analysts
-by default: add a port group for 9200 and a host group containing the harness host (Administration ->
-Configuration -> firewall), not raw iptables. TLS: the grid CA is /etc/pki/ca.crt on the manager.
+Access: authenticate with an encoded read-only Elasticsearch API key (or a local SOC account with ES access).
+Use the standalone/managersearch node or distributed manager endpoint. For remote direct access, allow TCP
+9200 via the destination node's firewall.hostgroups.elasticsearch_rest override if needed; see SETUP.md section 2.
+TLS: the default grid CA is /etc/pki/ca.crt on the manager/single node; the URL must match the endpoint certificate.
 A read-only key without view_index_metadata works: list_data_streams falls back to a read-only aggregation.
 Security Onion Pro also ships an official MCP server (Connect API / OQL) - it can be added to harness.yaml
 alongside this connector.

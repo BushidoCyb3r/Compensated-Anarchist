@@ -160,9 +160,11 @@ single-page app (no CDNs, system fonts), so it works air-gapped, and nothing rel
 Model profiles live in `config/models.yaml`, and each one is a choice in the dashboard's model picker. It ships
 with GenAI (government / enterprise gateway), Claude, ChatGPT and local-server profiles, plus a `my-local-model`
 template to fill in. Site profiles go in `config/models.local.yaml` (git-ignored, merged over it). Edits show up
-in a running dashboard without a restart, and profiles still missing a key or a `CHANGE-ME` value show as
-"needs setup". A fresh install starts on the `my-local-model` template: until a model is set up, a run stops at once
-and says what to set up, and nothing falls back to another model by itself. Switch with the picker, `--model`,
+in the picker, but restart after credential/profile/default changes to reliably update existing agents.
+Local readiness checks detect placeholders and some missing credentials; they do not validate backend access.
+A fresh install starts on the `my-local-model` template: until a model is set up, a run stops and says what to
+configure. The harness does not switch profiles/providers automatically; Anthropic profiles can request
+provider-side fallbacks. Switch with the picker, `--model`,
 `CA_MODEL` or `/model`:
 
 | provider | covers | notes |
@@ -180,7 +182,8 @@ and says what to set up, and nothing falls back to another model by itself. Swit
 - Both providers stream (`stream: true`, the default). The CLI prints the lead's reply as it is written
   when attached to a terminal (`CA_NO_STREAM=1` turns that off). If an OpenAI-compatible gateway rejects a
   streaming request while the same request works without streaming, the backend stops asking for the rest
-  of the session. Set `stream: false` to never ask. In `tool_mode: text`, `<tool_call>` blocks are held
+  of the session. `stream: false` disables OpenAI-compatible request streaming; for Anthropic it only hides
+  incremental text (the API request still streams). In `tool_mode: text`, `<tool_call>` blocks are held
   back from the stream and only the surrounding prose is shown.
 - `context_tokens` drives automatic history compaction. Tool output above `max_tool_result_chars` is
   written to the case directory and paged on demand, which keeps small-context local models usable.
@@ -236,10 +239,10 @@ stderr goes to `cases/<id>/logs/`.
 
 | server | backend | highlights |
 |---|---|---|
-| `security_onion` | Security Onion 3, via its Elasticsearch data streams (`logs-*-so`, a read-only API key or SOC account, a firewall host group for :9200). **Tested against a live 3.4.0 grid** | alert summary (Suricata + SO Detections), Zeek/Suricata search, ES\|QL, community_id pivot, beacon candidates, IOC sweep, field stacking, data stream inventory. SO Pro's official MCP server can be added alongside it |
+| `security_onion` | Security Onion 3, via its Elasticsearch data streams (`logs-*-so`, a scoped API key or local SOC account with ES access). See [deployment-specific endpoint and firewall setup](SETUP.md#2a-choose-the-endpoint-for-your-deployment). **Tested against a live 3.4.0 grid** | alert summary (Suricata + SO Detections), Zeek/Suricata search, ES\|QL, community_id pivot, beacon candidates, IOC sweep, field stacking, data stream inventory. SO Pro's official MCP server can be added alongside it |
 | `splunk` | REST :8089, token auth | SPL oneshot search, data inventory (tstats), field summary, IOC sweep, ES notables. Write/exec SPL commands are refused |
 | `elastic` | Elasticsearch / Elastic Security, API key. **Tested against a live 9.x cluster** (Kibana detection alerts verified on mocks only) | query_string, DSL, ES\|QL, EQL sequences, alerts + summary, stacking, IOC sweep, index inventory |
-| `velociraptor` + `velociraptor_admin` | gRPC API (`config api_client`). **Tested against a live 0.77.3 server** | 19 tools split by privilege. Investigator key: clients, client flow history, artifact search and detail, collect (wait + results), flow status/logs/results/uploads, labels, cancel, hunts, memory acquisition (Windows). Admin key: **evidence download with SHA-256 and size verification**, quarantine/unquarantine (Windows/Linux/macOS), server VQL |
+| `velociraptor` + `velociraptor_admin` | gRPC API (`config api_client`). **Tested against a live 0.77.3 server** | 19 tools split by privilege. Investigator key: clients, client flow history, artifact search and detail, collect (wait + results), flow status/logs/results/uploads, labels, cancel, hunts, memory acquisition (Windows). Admin key: **evidence download with a calculated SHA-256 and reported size comparison**, quarantine/unquarantine (Windows/Linux/macOS), server VQL |
 | `misp` | MISP REST API, auth key | IOC lookup (events, threat level, galaxy/ATT&CK tags), **warninglist check** (known-benign), event search and detail, sightings. Events it creates are always unpublished and org-only |
 | `archer` | Archer REST API (HTTPS, session login), a **Viewer** account | Read-only: overview counts, per-host roll-up, campaigns (one destination, many sources), finding search (Lucene `q`, IP/CIDR, time, score, IOC), finding detail with beacon interval statistics, the raw Zeek records behind a finding, 30-day pair history, sensor health, analysis status. See the Archer notes below |
 | `opencti` | OpenCTI GraphQL, read-only token | IOC lookup (observables, indicators, score, kill chain, related intrusion sets/malware), entity search (actors, malware, campaigns, ATT&CK patterns, reports), relationships, read-only GraphQL escape hatch (mutations refused) |
@@ -289,16 +292,19 @@ and a Velociraptor `investigator,api` client.
   inside the forensic jail, so Volatility, YARA and the other local tools can read (never run) them.
 - **No injection.** Tool arguments reach VQL only as parameters. They are prefixed `Ca…` because plain
   names collide with VQL builtins (`Artifact`) and keywords (`DESC`).
-- **Artifact names.** `Windows.KapeFiles.Targets` is no longer built in as of 0.77; import it with
-  `Server.Import.Extras`. Full-memory acquisition is built in for Windows only. On Linux, use
+- **Artifact names.** KapeFiles was removed from built-ins in 0.75; import triage extras with
+  `Server.Import.Extras` and check the replacement `Windows.Triage.Targets` (SETUP.md section 5).
+  Full-memory acquisition is built in for Windows only. On Linux, use
   `Linux.Triage.ProcessMemory`.
 - **Remote shells.** Shell artifacts (`*.System.PowerShell`, `*.System.CmdShell`, `*.Sys.BashShell`) are
   set to `deny` in roe.yaml. Change them to `approve` only if your ROE permits remote command execution.
 - **Human in the loop.** Every collection, hunt, memory image, evidence download, label, quarantine and server-VQL
   call needs an analyst's approval, enforced in code so `roe.yaml` cannot lower it. Files pulled from endpoints
-  land in the evidence vault (`evidence/vault/`): read-only, never executable, executables renamed
-  `.quarantined`, every file in `MANIFEST.jsonl`. See SETUP.md section 5.
-- **Re-verify.** To re-check the connector against your own server version, run:
+  land in the evidence vault (`evidence/vault/`): mode 0400, executable/script files renamed
+  `.quarantined`, each file recorded in `MANIFEST.jsonl`. These precautions do not make evidence safe to run.
+  See SETUP.md section 5 for protection limits and the notify-tier cancellation exception.
+- **Re-verify in an isolated lab only.** This test bypasses harness ROE, performs collections/uploads/label
+  changes, and creates a hunt targeting all Linux clients. See SETUP.md section 5 for prerequisites:
   `CA_VELO_API_CONFIG=api.yaml CA_VELO_ADMIN_API_CONFIG=admin.yaml pytest tests/test_velociraptor_live.py`
 
 **Security Onion / Elastic notes (verified live against Security Onion 3.4.0):**
@@ -309,8 +315,9 @@ and a Velociraptor `investigator,api` client.
   to a read-only aggregation when `_cat` and `_data_stream` are forbidden.
 - **ES|QL width.** Null columns are dropped (`drop_null_columns`). Without `KEEP`, a single row can still
   carry dozens of fields.
-- **Re-verify.** To re-check the connectors against your own grid, run:
-  `CA_LIVE_ES_URL=https://so:9200 CA_LIVE_ES_API_KEY=... CA_LIVE_ES_VERIFY=/path/ca.crt CA_LIVE_SO=1 pytest tests/test_siem_live.py`
+- **Re-verify.** Start with the authenticated read-only check in [SETUP.md](SETUP.md#2e-check-the-actual-connection);
+  `doctor` only checks the local MCP startup. For a SO 3 grid with recent Zeek data, the optional integration test is:
+  `CA_LIVE_ES_URL=https://so:9200 CA_LIVE_ES_API_KEY=... CA_LIVE_ES_VERIFY=/path/ca.crt CA_LIVE_SO=1 pytest tests/test_siem_live.py -k test_security_onion_live`
 
 ## Local forensics
 

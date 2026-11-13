@@ -96,9 +96,9 @@ budgets:
 
 # ---------------------------------------------------------------------------
 # Credential redaction: credential values in tool output (API keys, bearer tokens, passwords, private keys, the
-# secrets in config/.env, ...) are replaced with a fingerprint such as <redacted:bearer fp:3f9a1c2e7b> before any
-# model sees them or anything is saved. The same value always gets the same fingerprint (keyed with
-# config/secrets/redaction.key). Evidence files on disk are never changed.
+# secrets in config/.env, ...) are detected by patterns and replaced in returned tool text before model/UI/
+# transcript use. Tool-generated files and original evidence remain unchanged and may still contain secrets.
+# The same value gets the same fingerprint, keyed with config/secrets/redaction.key (SETUP.md section 10).
 # ---------------------------------------------------------------------------
 redaction:
   enabled: true
