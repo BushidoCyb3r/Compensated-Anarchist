@@ -31,7 +31,7 @@ from typing import Any, Callable
 
 import yaml
 
-from .audit import AuditLog
+from .audit import AuditLog, install_key
 from .case import Case
 from .config import HarnessConfig
 from .history import ChatStore
@@ -69,6 +69,23 @@ def _prompt(name: str) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# A verdict or a denial becomes approved memory at once, used in every case. It may quote an agent's values only when
+# they are identifier-like - no spaces: a host, IP, client id, hash, artifact name, path, ATT&CK id. An agent's free
+# text (a finding's description, prose in a tool argument) may carry instructions planted in the data it read.
+_FACT = re.compile(r"[\w.:/@+=,#\\-]{1,120}")
+
+
+def _facts(values: Any) -> list[str]:
+    vals = values if isinstance(values, list) else [values]
+    return [str(v) for v in vals if isinstance(v, (str, int, float)) and _FACT.fullmatch(str(v))]
+
+
+def _line(text: Any, limit: int = 120) -> str:
+    """An agent's title on one line, as the analyst saw it when deciding."""
+    one = " ".join(str(text).split())
+    return one[:limit] + ("..." if len(one) > limit else "")
 
 
 # An analyst statement must be the analyst's own words: whole words of one of their messages, never a fragment of a
@@ -620,7 +637,7 @@ class Harness:
         self.on_event = on_event or (lambda k, d: None)
         self.session = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.case = Case(cfg.cases_dir, case_id)
-        self.audit = AuditLog(self.case.dir / "audit.jsonl", cfg.operator)
+        self.audit = AuditLog(self.case.dir / "audit.jsonl", cfg.operator, key=install_key(cfg.root))
         self.memory = Memory(cfg.memory_db, cfg.memory, self.audit)
         self.memory.case_id = case_id
         self.budget: Budget | None = None  # the running operation's limits (budgets: in harness.yaml)
@@ -1394,10 +1411,23 @@ class Harness:
         return self.op
 
     def _learn_denials(self) -> None:
-        """The analyst's denials are corrections: trusted at once, as approved feedback memories."""
+        """The analyst's denials are corrections: trusted at once, as approved feedback memories. They quote the
+        call's identifier-like arguments (hosts, ids, artifacts) and the analyst's reason; the agent's free text in
+        other arguments is left out (see _facts)."""
         for d in self.executor.denials:
+            args = d["args"] if isinstance(d["args"], dict) else {}
+            shown, omitted = [], 0
+            for k, v in args.items():
+                vals = v if isinstance(v, list) else [v]
+                good = _facts(vals)
+                if vals and len(good) == len(vals) and _FACT.fullmatch(str(k)):
+                    shown.append(f"{k}={','.join(good)}"[:200])
+                else:
+                    omitted += 1
+            what = ", ".join(shown) or "no identifier-like arguments"
+            more = f" ({omitted} free-text argument(s) left out)" if omitted else ""
             self.memory.add("feedback", f"Analyst denied {d['tool']}",
-                            f"Agent {d['agent']} requested {d['tool']} with {json.dumps(d['args'])[:400]}. {d['reason']}",
+                            f"Agent {d['agent']} requested {d['tool']} with {what}{more}. {d['reason']}",
                             tags=[d["tool"]], source="analyst")
         self.executor.denials.clear()
 
@@ -1527,19 +1557,28 @@ class Harness:
         return out
 
     def set_verdict(self, finding_id: str, verdict: str, note: str = "") -> bool:
-        """Analyst adjudication of a finding. Benign/false-positive verdicts become approved memory."""
+        """Analyst adjudication of a finding. Benign/false-positive and true-positive verdicts become approved memory
+        at once, for every case: what the analyst decided and wrote, the finding's title, and its identifiers. The
+        agent's description stays in the case file (see _facts)."""
         if verdict not in ("tp", "fp", "benign", "inconclusive"):
             raise ValueError("verdict must be tp, fp, benign or inconclusive")
         if not self.case.set_verdict(finding_id, verdict, note):
             return False
         self.audit.record("finding_verdict", finding=finding_id, verdict=verdict, note=note)
         f = next(x for x in self.case.data["findings"] if x["id"] == finding_id)
-        if verdict in ("fp", "benign"):
-            self.memory.add("false_positive", f"Benign: {f['title']}", f"{f['description'][:800]}\nAnalyst: {note}",
-                            tags=f["attack_techniques"], source="analyst")
-        elif verdict == "tp":  # tradecraft confirmed in this network
-            self.memory.add("ttp", f"Confirmed: {f['title']}", f"{f['description'][:800]}\nAnalyst: {note}",
-                            tags=f["attack_techniques"], attack_techniques=f["attack_techniques"], source="analyst")
+        if verdict in ("fp", "benign", "tp"):
+            techs, assets = _facts(f.get("attack_techniques") or []), _facts(f.get("affected_assets") or [])
+            word = {"fp": "a false positive", "benign": "benign", "tp": "a true positive"}[verdict]
+            body = (f"The analyst marked finding {finding_id} ({_line(f.get('title', ''))}) {word}. "
+                    f"The analyst's reason: {note.strip() or 'none given'}."
+                    + (f" Assets: {', '.join(assets)}." if assets else "") + (f" ATT&CK: {', '.join(techs)}." if techs else "")
+                    + f" (The agent's description of {finding_id} is in case {self.case.id}; it is not repeated here.)")
+            if verdict == "tp":  # tradecraft confirmed in this network
+                self.memory.add("ttp", f"Confirmed: {_line(f.get('title', ''), 100)}", body, tags=techs,
+                                attack_techniques=techs, source="analyst")
+            else:
+                self.memory.add("false_positive", f"Benign: {_line(f.get('title', ''), 100)}", body, tags=techs,
+                                source="analyst")
         return True
 
     def remember(self, kind: str, title: str, content: str) -> int:
@@ -1603,5 +1642,5 @@ def delete_conversation(cfg: HarnessConfig, conv_id: str, operator: str) -> dict
     if not c:
         return None
     case_dir = cfg.cases_dir / c["case_id"]
-    _purge(store, case_dir, c, AuditLog(case_dir / "audit.jsonl", operator))
+    _purge(store, case_dir, c, AuditLog(case_dir / "audit.jsonl", operator, key=install_key(cfg.root)))
     return c

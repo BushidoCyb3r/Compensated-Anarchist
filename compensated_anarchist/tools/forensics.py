@@ -247,7 +247,12 @@ class Forensics:
         rules_path = rules or self.yara_rules_dir
         if not rules_path:
             return "ERROR: no rules given and forensics.yara_rules_dir not configured"
-        rp = Path(rules_path).resolve()
+        rp = Path(os.path.expanduser(rules_path)).resolve()
+        if rules:  # the agent's choice: rule files in the evidence roots, the case folder or the configured rules dir
+            home = Path(os.path.expanduser(self.yara_rules_dir)).resolve() if self.yara_rules_dir else None
+            if not (self.jail.inside(rp) or (home and (rp == home or home in rp.parents))):
+                raise PermissionError(f"{rules}: YARA rules must be in forensics.yara_rules_dir"
+                                      f"{f' ({home})' if home else ''}, the evidence roots or the case folder")
         if rp.is_dir():
             files = sorted([*rp.rglob("*.yar"), *rp.rglob("*.yara")])
         else:

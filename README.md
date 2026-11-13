@@ -445,8 +445,10 @@ The ROE gate runs in code, so the model cannot talk its way past it.
     conversation.
 - **Defaults:** unknown tools default to `approve`. MCP annotations are trusted only from your own servers.
 - **Audit:** every decision, approval (with the analyst's note), result hash, memory write and verdict goes
-  into `cases/<id>/audit.jsonl`. The log is hash-chained, so `canarchist audit-verify --case <id>` detects
-  any edit or deletion.
+  into `cases/<id>/audit.jsonl`. The log is hash-chained and keeps a signed head (`audit.jsonl.head`,
+  keyed with `config/secrets/audit.key`), so `canarchist audit-verify --case <id>` detects edits, deleted
+  records, records cut off the end and a rewritten file. The account that runs the harness can read the
+  key: to prove the log against that account, copy the head somewhere it cannot write.
 - **Untrusted data:** tool output is wrapped as untrusted data, and agents are instructed to treat
   instructions found in logs or files as a sign of adversary activity, never to follow them.
 

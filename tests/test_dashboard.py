@@ -199,3 +199,14 @@ def test_classification_banner_setting(tmp_path, monkeypatch):
     dash.cfg.raw["dashboard"] = {"classification": {"text": "SECRET", "background": "crimson"}}
     with pytest.raises(ValueError, match="harness.yaml"):
         Dashboard(dash.cfg, "WEB-1", token="test-token", harness=dash.harness)
+
+
+def test_playbook_names_are_plain_names(tmp_path, monkeypatch):
+    """A playbook is chosen by its plain name. A path to the vulnerability assessment playbook would load it without
+    matching the gate-everything floor, which knows playbooks by name, so it is refused."""
+    dash, app = make(tmp_path, monkeypatch, {})
+    with TestClient(app) as c:
+        login(c)
+        for pb in ("../playbooks/vulnerability_assessment", "../prompts/core", "Triage"):
+            r = c.post("/api/message", json={"text": "go", "playbook": pb}, headers=H)
+            assert r.status_code == 400 and "unknown playbook" in r.json()["error"], pb

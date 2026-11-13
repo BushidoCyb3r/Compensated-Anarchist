@@ -845,7 +845,7 @@ def create_app(dash: Dashboard) -> Starlette:
 
     async def audit(request: Request) -> Response:
         path = dash.harness.case.dir / "audit.jsonl"
-        ok, msg = verify(path)
+        ok, msg = verify(path, dash.harness.audit.key)
         limit = min(int(request.query_params.get("limit", "300")), 2000)
         lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
         return JSONResponse({"verified": ok, "message": msg, "records": [json.loads(x) for x in lines][::-1]})
@@ -948,9 +948,11 @@ def create_app(dash: Dashboard) -> Starlette:
         text = str(d.get("text", "")).strip()
         playbook = str(d.get("playbook", "")).strip()
         if playbook:
+            # a plain name only: "../playbooks/vulnerability_assessment" would load the playbook but not match the
+            # gate-everything floor, which knows playbooks by name
             pb = resources.files("compensated_anarchist").joinpath(f"playbooks/{playbook}.md")
-            if not pb.is_file():
-                raise ValueError(f"unknown playbook {playbook}")
+            if not re.fullmatch(r"[a-z0-9_]{1,64}", playbook) or not pb.is_file():
+                raise ValueError(f"unknown playbook {playbook[:80]}")
             text = pb.read_text(encoding="utf-8") + "\n\n# Details from analyst\n" + (text or "(none)")
         if not text:
             raise ValueError("empty message")

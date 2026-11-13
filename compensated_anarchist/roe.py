@@ -23,6 +23,8 @@ Resolution order for a call:
   Then for active tiers (notify/approve) the scope check runs:
   - a target argument outside the authorized scope -> deny
   - a target argument that is a protected asset   -> escalate to approve
+  - no target argument at all (a fleet-wide hunt, server VQL) -> the approval says SCOPE NOT CHECKED; a Velociraptor
+    hunt without include_labels is denied, since it runs on every endpoint
   A protected asset also escalates an auto-tier call (a rule may have made an active tool auto), unless the call is
   known not to act on a system: a tool its trusted server marks read-only, or one of the harness's own tools
   (HARNESS_OWN: case notes, memory, plans, reports, local file analysis).
@@ -248,8 +250,10 @@ class RoeGate:
         raised = bool(gated) and tier in ("auto", "notify")
         if gated and tier != "deny":
             tier, why = "approve", f"{why}; {gated}"
+        reads_only = self.known_read_only(tool, annotations, server)
         decision = await self._decide(tool, arguments, rationale, agent, tier, why, ask_in_observe=raised,
-                                      reads_only=self.known_read_only(tool, annotations, server))
+                                      reads_only=reads_only,
+                                      reaches=not reads_only and not (not server and fnmatch.fnmatchcase(tool, "vuln_*")))
         self.audit.record(
             "roe_decision",
             agent=agent,
@@ -284,7 +288,9 @@ class RoeGate:
         return [t for t, ns in names.items() if any(_matches_target(n, self.protected_assets) for n in ns)]
 
     async def _decide(self, tool, arguments, rationale, agent, tier, why, ask_in_observe: bool = False,
-                      reads_only: bool = False) -> Decision:
+                      reads_only: bool = False, reaches: bool = True) -> Decision:
+        """reads_only: the call cannot act on a system (known_read_only). reaches: it may reach systems the scope
+        covers (not a read, not a local vuln_* tool, which names its hosts in `targets` and checks them itself)."""
         if tier == "deny":
             return Decision("deny", False, f"denied by ROE: {why}", why)
         if self.posture == "observe" and tier == "approve" and not ask_in_observe:  # gate-raised reads may still ask
@@ -295,6 +301,14 @@ class RoeGate:
 
         if tier in ("notify", "approve"):
             names = await self._names(tool, arguments)
+            if self.scope_enforce and self.allowed_targets and not names and reaches:
+                # nothing in the arguments says where it acts, so the scope check has nothing to check
+                if fnmatch.fnmatchcase(tool, "velociraptor*__create_hunt") and not arguments.get("include_labels"):
+                    return Decision("deny", False, "denied: a hunt without include_labels runs on every endpoint, and "
+                                    "the ROE limits the authorized scope (allowed_targets). Label the in-scope endpoints "
+                                    "and hunt by those labels.", why)
+                why = (f"{why}; SCOPE NOT CHECKED: this call names no target (host, ip, client_id...), so nothing "
+                       "limits it to the authorized scope - check what it reaches")
             if self.scope_enforce and self.allowed_targets:
                 outside = [t for t, ns in names.items() if not any(_matches_target(n, self.allowed_targets) for n in ns)]
                 if outside:

@@ -379,3 +379,84 @@ def test_splunk_runs_only_read_only_commands(monkeypatch):
     for var in ("SPLUNK_EXTRA_COMMANDS", "SPLUNK_ALLOW_MACROS"):
         monkeypatch.delenv(var)
     importlib.reload(sp)
+
+
+def test_calls_that_name_no_target_are_flagged_under_scope(tmp_path):
+    """With an authorized scope, an active call that names no target (server VQL, a hunt) cannot be scope-checked: the
+    approval says so. A Velociraptor hunt without include_labels runs on every endpoint and is denied. Harness tools
+    and calls with a target are unaffected; without a scope nothing changes."""
+    asked: list[str] = []
+    g = gate(tmp_path, asked)
+    act = {"read_only_hint": False, "destructive_hint": True}
+
+    def run(tool, args, server="velociraptor"):
+        n = len(asked)
+        d = asyncio.run(g.authorize(tool, args, "", "incident_responder", act, server))
+        return d, asked[-1] if len(asked) > n else ""
+
+    d, why = run("velociraptor__create_hunt", {"artifact": "Windows.System.Pslist", "description": "x"})
+    assert not d.allowed and d.tier == "deny" and "include_labels" in d.reason and not why
+    d, why = run("velociraptor__create_hunt", {"artifact": "Windows.System.Pslist", "description": "x",
+                                               "include_labels": ["in-scope"]})
+    assert d.allowed and "SCOPE NOT CHECKED" in why
+    d, why = run("velociraptor_admin__run_server_vql", {"query": "SELECT * FROM clients()"})
+    assert d.allowed and "SCOPE NOT CHECKED" in why
+    d, why = run("velociraptor__collect_artifact", {"client_id": "C.1111111111111111", "artifact": "Generic.Client.Info"})
+    assert d.allowed and "SCOPE NOT CHECKED" not in why
+    d, why = run("report_finalize", {"name": "r"}, server="")
+    assert "SCOPE NOT CHECKED" not in why
+    g.allowed_targets = []
+    d, why = run("velociraptor__create_hunt", {"artifact": "Windows.System.Pslist", "description": "x"})
+    assert d.allowed and "SCOPE NOT CHECKED" not in why
+
+
+def test_audit_log_detects_cut_and_rewritten_records(tmp_path):
+    """The chain shows edits inside the log; the signed head also shows records cut off the end, a rewritten file, a
+    deleted head and changes made between two writes. A log from before signed heads still verifies."""
+    import json as _json
+
+    from compensated_anarchist.audit import _canon, head_path, verify
+    key, path = b"k" * 32, tmp_path / "case" / "audit.jsonl"
+    log = AuditLog(path, "op", key=key)
+    for i in range(4):
+        log.record("x", i=i)
+    assert verify(path, key) == (True, "audit chain intact; signed head matches (4 records)")
+    full = path.read_text()
+    path.write_text("".join(full.splitlines(keepends=True)[:2]))  # the last two records cut off: the chain is intact
+    assert verify(path)[0] and not verify(path, key)[0] and "cut off" in verify(path, key)[1]
+    path.write_text(full)
+    assert verify(path, key)[0]
+    head_path(path).unlink()
+    assert not verify(path, key)[0] and "missing" in verify(path, key)[1]
+    log.record("x", i=4)  # the next write records the mismatch in the chain instead of re-signing silently
+    ok, msg = verify(path, key)
+    assert not ok and "no longer matched its signed head" in msg
+    # a rewritten file with fresh hashes, by someone without the key for the head
+    import hashlib
+    other = tmp_path / "other" / "audit.jsonl"
+    AuditLog(other, "op", key=key).record("x", i=0)
+    rec = _json.loads(other.read_text())
+    rec.pop("hash")
+    rec["data"]["i"] = 9
+    rec["hash"] = hashlib.sha256(_canon(rec).encode()).hexdigest()
+    other.write_text(_canon(rec) + "\n")
+    assert verify(other)[0] and not verify(other, key)[0]
+    old = tmp_path / "old" / "audit.jsonl"  # written before signed heads
+    AuditLog(old, "op").record("x", i=0)
+    assert verify(old, key) == (True, "audit chain intact (no signed head yet: written before signed heads)")
+
+
+def test_yara_rules_must_come_from_the_rules_dir_or_the_jail(tmp_path):
+    """An agent's rules path is checked like any other path: the configured rules folder, the evidence roots or the
+    case folder. Anything else (a home folder, /) is refused before any file is read."""
+    from compensated_anarchist.case import Case
+    from compensated_anarchist.tools.forensics import Forensics
+
+    ev, rules = tmp_path / "evidence", tmp_path / "rules"
+    ev.mkdir()
+    rules.mkdir()
+    (ev / "sample.bin").write_bytes(b"x")
+    f = Forensics({"yara_rules_dir": str(rules)}, [ev], Case(tmp_path / "cases", "YARA-1"))
+    for bad in ("/", str(tmp_path / "elsewhere.yar"), str(Path.home())):
+        with pytest.raises(PermissionError):
+            asyncio.run(f.yara_scan(str(ev / "sample.bin"), bad))

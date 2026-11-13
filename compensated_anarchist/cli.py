@@ -7,13 +7,14 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from importlib import resources
 from pathlib import Path
 from typing import Any
 
 from . import NAME, __version__
-from .audit import verify
+from .audit import install_key, verify
 from .config import load_config
 from .roe import roe_drift_note
 
@@ -163,6 +164,8 @@ def _cfg(args):
 
 
 def _playbook(name: str) -> str:
+    if not re.fullmatch(r"[a-z0-9_]{1,64}", name):  # a plain name: the gate-everything floor knows playbooks by name
+        raise SystemExit(f"unknown playbook {name}")
     try:
         return resources.files("compensated_anarchist").joinpath(f"playbooks/{name}.md").read_text()
     except FileNotFoundError:
@@ -337,7 +340,7 @@ def cmd_memory(args) -> None:
     from .memory import Memory
 
     cfg = _cfg(args)
-    audit = AuditLog(cfg.cases_dir / "_memory_audit.jsonl", cfg.operator)
+    audit = AuditLog(cfg.cases_dir / "_memory_audit.jsonl", cfg.operator, key=install_key(cfg.root))
     mem = Memory(cfg.memory_db, cfg.memory, audit)
     if args.action == "stats":
         print(json.dumps(mem.stats(), indent=1))
@@ -436,7 +439,7 @@ def cmd_tools(args) -> None:
     from .tools.forensics import PathJail
 
     cfg = _cfg(args)
-    audit = AuditLog(cfg.cases_dir / "_tools_audit.jsonl", cfg.operator)
+    audit = AuditLog(cfg.cases_dir / "_tools_audit.jsonl", cfg.operator, key=install_key(cfg.root))
     cat = toolspecs.ToolCatalog(cfg.tool_specs_dir, audit)
     a, rest, by = args.action, args.rest, cfg.operator
     experts = set(load_experts(cfg))
@@ -498,7 +501,7 @@ def cmd_skills(args) -> None:
     from .skills import SkillStore
 
     cfg = _cfg(args)
-    store = SkillStore(cfg.memory_db, cfg.skills, AuditLog(cfg.cases_dir / "_memory_audit.jsonl", cfg.operator))
+    store = SkillStore(cfg.memory_db, cfg.skills, AuditLog(cfg.cases_dir / "_memory_audit.jsonl", cfg.operator, key=install_key(cfg.root)))
     a, rest, by = args.action, args.rest, cfg.operator
     if a == "list":
         _print_skills(store)
@@ -755,7 +758,8 @@ def main(argv: list[str] | None = None) -> None:
             print("\nNothing changed.")
             sys.exit(1)
     elif args.cmd == "audit-verify":
-        ok, msg = verify(_cfg(args).cases_dir / args.case / "audit.jsonl")
+        cfg = _cfg(args)
+        ok, msg = verify(cfg.cases_dir / args.case / "audit.jsonl", install_key(cfg.root))
         print(msg)
         sys.exit(0 if ok else 1)
     elif args.cmd == "export-docx":
