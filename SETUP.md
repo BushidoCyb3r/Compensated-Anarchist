@@ -9,6 +9,9 @@ This guide gets Compensated Anarchist working end to end:
 Only a model is strictly required. Every connector is optional: enable the ones you have. The agents can only
 use what is connected.
 
+For a Linux VM on a Windows workstation, start with [section 0a: VMware Workstation Pro](#0a-linux-vm-with-vmware-workstation-pro).
+That section also covers the equivalent network arrangement on macOS with VMware Fusion.
+
 Run commands from the repository root. Use `.venv/bin/canarchist`, or activate the environment with
 `source .venv/bin/activate` before examples that use bare `canarchist`.
 
@@ -153,9 +156,296 @@ or a real query. Follow each connector's read-only check. `doctor` can create th
 state; it is not a completely side-effect-free command.
 
 **Network:** every connector is an outbound connection *from the harness host* to the other system. Open
-each port to the harness host's IP only, never to the whole network.
+each port to the source IP the destination actually sees, never to the whole network. In the bridged VM
+setup below, services on the LAN see the Linux guest's own LAN IP; see section 0a.
 
 **Credentials ever pasted into a chat, ticket or email:** rotate them once setup works.
+
+---
+
+## 0a. Linux VM with VMware Workstation Pro
+
+Run the harness, its connector processes and local forensic tools inside Linux; use the browser on your
+physical workstation for the dashboard. In this section, **host** means the physical Windows workstation,
+and **guest** means the Linux VM. Elsewhere in this guide, **harness host** means the Linux guest when using
+this arrangement.
+
+The walkthrough uses **Workstation Pro on Windows with one bridged adapter (VMnet0)**. The Linux guest
+gets its own IP on the physical LAN. Its connectors reach Elasticsearch, Velociraptor and other services
+using that IP, through the host's physical network adapter. **VMware does not NAT these connections.**
+The model can run on the physical host's LAN address or another reachable server. This follows VMware's
+[networking modes](https://knowledge.broadcom.com/external/article/309842/understanding-networking-types-in-hosted.html).
+Each backend still needs its own credentials, TLS configuration and source-IP permissions in sections 1–7b.
+
+```mermaid
+flowchart LR
+    Browser[Host browser] -->|Guest LAN IP: HTTPS 8765| Guest[Linux VM: own LAN IP]
+    Guest -->|VMnet0 bridge through physical adapter| LAN[Physical LAN]
+    LAN --> Services[Elasticsearch, Velociraptor and other services]
+    LAN --> Model[Model on host LAN IP or another server]
+```
+
+### Create the Linux VM
+
+1. Install Workstation Pro on the Windows host, then choose **File → New Virtual Machine** and select a
+   Linux installer ISO. Ubuntu Server 24.04 LTS is a suitable example; it provides Python 3.12. Match the
+   guest architecture to the hypervisor and host.
+2. As an initial allocation for the harness using a model on another machine, try **4 vCPUs, 8 GB RAM and
+   an 80 GB virtual disk**. These are starting estimates, not measured minimums. Evidence collections,
+   memory analysis and local model inference can require substantially more RAM and disk space.
+3. Select **Bridged** networking and install Linux with a normal user account that can use `sudo` for package
+   installation. Run the harness as that user.
+4. Store the checkout, SQLite databases, secrets and evidence on the guest's Linux filesystem, for example
+   `~/compensatedanarchist`. Use shared folders to transfer files if needed, then copy them into the guest
+   before working on them.
+
+**macOS:** use **VMware Fusion** and select **Bridged Networking** on the connected Ethernet or Wi-Fi
+adapter, then follow the guest setup and connector checks below. Workstation's Windows menus and
+PowerShell examples do not apply on macOS.
+On Apple silicon, Fusion requires an **ARM64/aarch64 Linux ISO**; Intel Macs use an x86-64 guest. Check
+ARM64 availability of optional forensic binaries and Python packages individually. See
+[Fusion networking](https://knowledge.broadcom.com/external/article?legacyId=1022264) and
+[Apple silicon guest compatibility](https://knowledge.broadcom.com/external/article/315602/).
+
+### Configure Workstation Pro networking
+
+1. In **VM → Settings → Network Adapter**, select **Bridged: Connected directly to the physical network** and
+   **Connect at power on**. Ensure **Connected** is selected when the VM is running.
+2. Open **Edit → Virtual Network Editor**, using **Change Settings** if administrator access is needed.
+   Select **VMnet0**, set its type to **Bridged**, and set **Bridged to** to the physical Ethernet or Wi-Fi
+   adapter connected to the intended LAN. Choose it explicitly when the host has multiple adapters.
+3. On Windows, run `ipconfig` and record that physical adapter's IP, subnet mask, gateway and DNS settings
+   (`ipconfig /all` includes DNS). Use its LAN IP for a model/API running on Windows.
+4. Boot Linux with DHCP enabled. The **LAN's DHCP server** assigns the guest its own address; VMware's
+   NAT DHCP service is not used. Record the guest's address and route:
+
+   ```bash
+   ip -br -4 address
+   ip route
+   ```
+
+5. Confirm the guest is on the intended LAN and has a route to each backend. For stable dashboard links
+   and firewall rules, reserve its address on the LAN DHCP server or assign an approved, unused static
+   LAN address with the correct prefix, gateway and DNS. Never copy the host's own IP onto the guest.
+
+The adapter controls are documented in Broadcom's
+[Virtual Network Editor guide](https://knowledge.broadcom.com/external/article/339371/using-the-virtual-network-editor-in-vmwa.html).
+
+All addresses below are **examples**; substitute the values you recorded:
+
+| Address | Example | Used for |
+|---|---|---|
+| Physical LAN | `192.168.10.0/24` | Network shared by the host, guest and example services |
+| Windows host | `192.168.10.20` | Guest connects here if the model/API runs on Windows |
+| Linux guest | `192.168.10.50` | Dashboard address and source IP for connector allowlists |
+| LAN gateway | `192.168.10.1` | Guest's route to services outside its local subnet |
+| Elasticsearch server | `192.168.10.60` | Guest connects to its configured API port, commonly `9200` |
+| Velociraptor server | `192.168.10.70` | Guest connects to its API port, commonly `8001` |
+
+For example, Elasticsearch receives `192.168.10.50 → 192.168.10.60:9200`, and a model on Windows receives
+`192.168.10.50 → 192.168.10.20:11434`. Services on other routed subnets work too when the guest's routes
+and network ACLs permit them. No VMware port-forwarding rules are needed.
+
+If the guest cannot obtain an address or reach the LAN, check the selected physical adapter and the
+network's policy for additional devices. Managed switch ports, network admission controls or Wi-Fi
+client isolation can prevent bridged guest access. Use an allowed network attachment and register the
+guest if required; assigning a static IP alone does not bypass these restrictions. See Broadcom's
+[bridged-network troubleshooting](https://knowledge.broadcom.com/external/article/307964).
+
+### Install the harness inside Linux
+
+For the Ubuntu guest above:
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv git openssl ca-certificates bubblewrap curl netcat-openbsd open-vm-tools
+git clone https://github.com/BushidoCyb3r/compensatedanarchist.git
+cd compensatedanarchist
+./scripts/install.sh
+```
+
+Create the dashboard account when prompted. Configure your model in section 1 and enable the connectors
+you have in sections 2–7b. All `config/.env` paths, CA files, Velociraptor API files and forensic tools must
+exist **inside the guest**. Installing a tool on Windows does not install it in Linux. Section 8 covers
+optional forensic tools; section 5 covers vault hardening.
+
+### Open the dashboard from the host
+
+Inside Linux, bind to the guest's LAN address:
+
+```bash
+scripts/start.sh --host 192.168.10.50 --port 8765 --case SETUP-CHECK
+```
+
+On Windows, open the printed sign-in link, which starts with `https://192.168.10.50:8765/`. Compare the
+self-signed certificate's SHA-256 fingerprint with the one printed by the script before accepting it, then
+sign in with the current access token and your dashboard username/password. The host reaches the guest's
+LAN address directly.
+
+`--host 0.0.0.0` also listens on all guest IPv4 interfaces. Use the guest's actual IP in the browser and
+replace `0.0.0.0` in the printed sign-in link while keeping its token. Binding to the actual IP is preferable
+here because the script also uses the bind address when generating its certificate. `--localhost` binds
+only inside the guest and does not accept this direct host connection.
+
+If the guest uses UFW, allow the Windows host's LAN address to reach the dashboard:
+
+```bash
+sudo ufw allow from 192.168.10.20 to any port 8765 proto tcp
+sudo ufw status
+ss -ltn | grep ':8765'
+```
+
+Use the equivalent source-restricted rule if another firewall is active; the commands above do not enable
+UFW. On Windows, test the path in PowerShell:
+
+```powershell
+Test-NetConnection -ComputerName 192.168.10.50 -Port 8765
+```
+
+If it fails, check the listener, guest firewall, VMnet0 bridge, LAN policy and host firewall. Changing
+the dashboard bind address does not change outbound connector routing.
+
+### Route and configure every connector
+
+The shipped MCP connectors run as local processes inside Linux and call their backends over the network.
+There is no additional inbound MCP port to open. Use these destination ports when checking guest egress
+and backend ingress rules; actual deployed ports take precedence over the examples.
+
+| Backend | Guest configuration | Typical destination TCP port | Detailed setup |
+|---|---|---|---|
+| Security Onion Elasticsearch | `SO_ENABLED=true`, `SO_URL=https://so-manager.example:9200` | `9200`, on the appropriate management/search node | [Section 2](#2-security-onion-3) |
+| Elastic | `ES_ENABLED=true`, `ES_URL=https://elastic.example:9200` | `9200`, or the supplied cloud/proxy port such as `443` | [Section 3](#3-elastic-elasticsearch--elastic-security) |
+| Splunk | `SPLUNK_ENABLED=true`, `SPLUNK_URL=https://splunk.example:8089` | `8089` management API; not the web UI or HEC port | [Section 4](#4-splunk-enterprise--enterprise-security) |
+| Velociraptor investigator and optional admin | `VELO_ENABLED=true`, `VELO_API_CONFIG`; optionally `VELO_ADMIN_ENABLED=true`, `VELO_ADMIN_API_CONFIG` | `8001` by default; `api_connection_string` inside each API YAML selects the server and port | [Section 5](#5-velociraptor) |
+| MISP | `MISP_ENABLED=true`, `MISP_URL=https://misp.example` | `443` for this HTTPS endpoint | [Section 6](#6-misp) |
+| OpenCTI | `OPENCTI_ENABLED=true`, `OPENCTI_URL=https://opencti.example` | `443` for this HTTPS endpoint, or your deployment's published port | [Section 7](#7-opencti) |
+| Archer | `ARCHER_ENABLED=true`, `ARCHER_URL=https://archer.example:8443` | `8443` HTTPS | [Section 7b](#7b-archer) |
+| Hosted model or enterprise gateway | Selected profile's URL and credentials | Usually `443` | [Section 1](#1-model-required) |
+| Model server on the physical host | `OLLAMA_URL`, `VLLM_URL`, `LLAMACPP_URL`, or a custom profile URL | Common defaults: `11434`, `8000`, `8080`; use the server's configured port | [Section 1](#1-model-required) |
+
+For a third-party remote MCP server, allow outbound access to the URL/port in its `mcp_servers` entry too.
+
+**Choose addresses from the guest's point of view:**
+
+- A backend on the LAN or another routed network uses its own reachable hostname/IP. Prefer a hostname
+  covered by its TLS certificate. The guest connects directly to that endpoint using its network route.
+- A backend running on Windows uses the host's **LAN IP**, or a certificate-matching hostname
+  that resolves to it from Linux. The service must listen on that interface and the Windows firewall must
+  allow its API port from the guest. See the host model example below.
+- A backend in another bridged VM uses that VM's LAN address. A service on a different,
+  isolated virtual network needs a route or an adapter on a shared network.
+- `localhost` and `127.0.0.1` in the guest's configuration mean **the guest itself**. Replace the shipped
+  localhost model/Archer URLs when those services run elsewhere. `0.0.0.0` is a listener address, not a
+  connector destination.
+
+**Allow the guest's LAN IP at each backend.** In this example, allow `192.168.10.50` to reach Elasticsearch
+on TCP `9200` and Velociraptor on TCP `8001`; use the same source for the other connector ports you enable.
+The host's `192.168.10.20` is a separate machine address. For destinations beyond an upstream NAT or a
+VPN, confirm the source in the destination's connection/firewall logs because those systems can translate
+it independently of VMware bridging.
+
+This matters for Security Onion's `elasticsearch_rest` host group, MISP key IP restrictions, and the
+Velociraptor server firewall. For the section 5 helper, use `--harness-ip 192.168.10.50` in this LAN example.
+Set the actual allowed targets and protect both the workstation and harness VM in section 9.
+To retrieve API files from a remote server,
+you can initiate `scp` from Linux; the helper's optional server-to-guest `--deliver` needs a separate inbound
+SSH path and is not required for connector operation.
+
+**TLS and credentials:** copy CA bundles and API files into the guest's `config/secrets/` using a trusted
+transfer method. Use absolute Linux paths for `*_VERIFY`, `DOD_CA_BUNDLE`, client certificates and
+`VELO_*_API_CONFIG`. Trust installed in the Windows browser is not automatically available to Python
+inside Linux. Keep certificate hostname verification enabled; for Archer use its verified fingerprint
+or CA configuration, and preserve Velociraptor's embedded TLS fields when changing its connection address.
+
+### Use a model running on the Windows host
+
+For example, to reach an existing Ollama installation from the guest:
+
+1. Quit Ollama on Windows. In your Windows user environment variables, set
+   `OLLAMA_HOST=192.168.10.20:11434`, substituting the host's LAN IP, then restart Ollama. This configures
+   the server listener. See [Ollama's environment configuration](https://docs.ollama.com/faq).
+2. In an administrator PowerShell window, add a narrowly scoped rule for that listener:
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "Ollama from Compensated Anarchist VM" -Direction Inbound -Action Allow -Protocol TCP -LocalAddress 192.168.10.20 -LocalPort 11434 -RemoteAddress 192.168.10.50 -Profile Any
+   ```
+
+   The rule matches the example host address, port and guest source; adjust all three for your setup.
+   Existing broader allow rules remain in effect. See Microsoft's
+   [New-NetFirewallRule reference](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule).
+3. In the guest's `config/.env`, set `OLLAMA_URL=http://192.168.10.20:11434/v1` and `OLLAMA_MODEL` to an
+   installed model. Select the corresponding model profile in section 1. `OLLAMA_URL` is the harness's
+   client setting; it does not configure the Windows server listener.
+4. From Linux, check the API before trying a model run:
+
+   ```bash
+   curl --connect-timeout 5 --max-time 15 http://192.168.10.20:11434/v1/models
+   ```
+
+Apply the same address/listener/firewall pattern to other host model servers and host-resident connector
+APIs, using each service's port, authentication and TLS settings. For HTTPS, use a certificate-matching
+hostname that resolves to the host's LAN address. Changing a firewall rule alone cannot expose a service
+that still listens only on host loopback.
+
+### Verify DNS, VPN access and backend authentication
+
+Run these checks **inside Linux**, even if the same service works in the Windows browser. Replace the
+example endpoint and CA path with those for one of your enabled connectors:
+
+```bash
+getent ahostsv4 so-manager.example
+ip route get 10.20.30.40    # substitute an IP returned by the DNS check
+nc -vz -w 5 so-manager.example 9200
+curl --connect-timeout 5 --max-time 15 --cacert /absolute/path/config/secrets/so-ca.crt \
+    -o /dev/null -w 'HTTP %{http_code}\n' https://so-manager.example:9200/
+```
+
+DNS must resolve to the intended server, then TCP must connect, then TLS must validate. An HTTP `401` or
+`403` from the intended backend proves you reached its HTTP service, but this unauthenticated probe does
+not validate the connector's key or permissions. A successful TCP probe of Velociraptor's API likewise
+does not validate its mutual TLS credentials. Repeat the transport check for each enabled destination,
+then perform the connector-specific read-only checks below.
+
+**A bridged guest does not automatically inherit the host's VPN.** If a service is reachable only through
+that VPN, provide an approved VPN connection inside Linux or another routed path for the guest. Compare
+Windows `Resolve-DnsName <name>` / `Test-NetConnection <name> -Port <port>` with the guest checks, and
+configure the guest's DNS servers, search suffixes and routes for the network it must reach.
+Broadcom identifies VPN software, firewalls and DNS settings among the causes of
+[VM networking failures](https://knowledge.broadcom.com/external/article/307964).
+
+Host browser proxy settings and proxy authentication also do not automatically configure guest programs.
+If your environment requires an application proxy, configure it for the relevant Linux client/connector
+process and test that backend separately; one HTTP proxy setting is not a universal route for every API,
+including Velociraptor's gRPC connection.
+
+After editing configuration, restart the dashboard and check MCP startup:
+
+```bash
+scripts/stop.sh
+.venv/bin/canarchist doctor --case SETUP-CHECK
+scripts/start.sh --host 192.168.10.50 --port 8765 --case SETUP-CHECK
+```
+
+`connected (N tools)` means the local MCP process initialized. Verify **remote** access with the checks
+in each connector section: the Security Onion/Elastic backend query, a small Splunk search,
+`velociraptor__list_clients`, a limited MISP event search, a limited OpenCTI entity search, and
+`archer__connection_check`. Run the small model test in section 1 as well. Networking alone cannot validate
+credentials, permissions or compatibility with the backend's installed version.
+
+| Symptom | Check next |
+|---|---|
+| Guest has no LAN address | VMnet0's selected physical adapter, LAN DHCP and network admission policy; use approved static settings if DHCP is unavailable |
+| Host cannot open the dashboard | Guest IP and listener, VMnet0 bridge, LAN isolation and TCP 8765 firewall rules; use HTTPS and the current token |
+| Guest cannot resolve internal names | Guest DNS servers/search suffixes and any required guest VPN connection |
+| Name resolves but TCP times out | Guest routes, bridge/physical link, VLAN/network ACLs and backend allowlist for the guest's IP |
+| Connection refused | Correct backend address/port and listener; check for a service bound only to loopback |
+| TLS fails | Guest CA bundle, certificate hostname, guest clock, or an unconfigured TLS-inspecting proxy |
+| MCP connects but a backend query fails | Connector credentials, backend permissions/API version and the actual source IP |
+| Host-local model fails after a VM address change | Windows firewall's guest source address and the configured host listener |
+
+**Access from other workstations:** use the guest's same LAN address, `https://192.168.10.50:8765/`,
+and allow those workstation source IPs through the guest firewall. Use the current sign-in token and
+dashboard account. VMware port forwarding is not part of this bridged setup.
 
 ---
 
