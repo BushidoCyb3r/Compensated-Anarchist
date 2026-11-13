@@ -1,3 +1,10 @@
+<p align="center">
+  <img src="assets/crimson-anarchy-gauntlet-bomb.png" width="100%"
+       alt="A black and red spiked gauntlet gripping a round bomb marked with an anarchy symbol">
+</p>
+<p align="center"><sub>Banner adapted from original artwork by John Rubio (@johnrubio). The artwork is his and is
+not covered by this project's license.</sub></p>
+
 # Compensated Anarchist
 
 An agentic harness for **Defensive Cyber Operations**: hunt, triage, network and host analysis,
