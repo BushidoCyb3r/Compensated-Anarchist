@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import huntplans
+from . import handoff, huntplans
 from .tools.registry import Tool, schema
 
 SEVERITIES = ["informational", "low", "medium", "high", "critical"]
@@ -151,6 +151,13 @@ class Case:
         """An analyst's answer to an agent's question, quoted from the analyst's own message (event)."""
         return self._append("statements", {"question": question, "answer": answer, "topic": topic, "by": by,
                                            "answered_at": answered_at, "event": event})
+
+    def record(self, rid: str) -> dict[str, Any] | None:
+        """One record by its id (FIN-0001, IOC-0003, TIM-0002, EVI-0001, NOT-0004, STA-0001), or None."""
+        want = rid.strip().upper()
+        key = handoff.RECORD_LISTS.get(want[:3])
+        with self._lock:
+            return next((dict(r) for r in self.data.get(key, []) if r.get("id") == want), None) if key else None
 
     def set_verdict(self, finding_id: str, verdict: str, note: str = "") -> bool:
         with self._lock:

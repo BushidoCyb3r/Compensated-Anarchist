@@ -22,7 +22,7 @@ and the expert team **writes, scores and revises its own skills** as it works.
                                            |
      +------------------------ DCO Mission Lead (orchestrator) --------------------+
      |  subagent_spawn / subagent_message  ->  SA-001, SA-002 ... (parallel)       |
-     |  <- structured reports (status, bottom line, evidence, recommended tasks)   |
+     |  <- structured reports (bottom line, key facts, evidence, tasks)            |
      |  experts: alert_triage threat_hunter network_analyst endpoint_analyst       |
      |  forensicator malware_analyst cti_analyst incident_responder cte_planner    |
      |  detection_engineer reporter hunt_planner vuln_assessor code_writer         |
@@ -193,7 +193,8 @@ provider-side fallbacks. Switch with the picker, `--model`,
   incremental text (the API request still streams). In `tool_mode: text`, `<tool_call>` blocks are held
   back from the stream and only the surrounding prose is shown.
 - `context_tokens` drives automatic history compaction. Tool output above `max_tool_result_chars` is
-  written to the case directory and paged on demand, which keeps small-context local models usable.
+  written to the case's `artifacts/spill/` folder, and any agent with the case tools pages or searches it with
+  `case_read_artifact`, which keeps small-context local models usable.
 
 ## Expert agents: orchestrator and subagents
 
@@ -210,9 +211,21 @@ The lead is the **orchestrator**, and experts run as its **subagents**:
   correction or a related task. It still has its earlier work, even after a restart. `subagent_list`
   shows the roster.
 - **Reporting.** Subagents report only to the orchestrator and finish every task with `submit_report`:
-  status (completed / blocked / needs_input / failed), bottom line, evidence, confidence, open questions,
-  recommended tasks and skills used. A model that skips the tool still has its free-text answer passed
-  on, marked as unstructured.
+  status (completed / blocked / needs_input / failed), bottom line, key facts, evidence, confidence, open
+  questions, recommended tasks and skills used. A model that skips the tool still has its free-text answer
+  passed on, marked as unstructured. Each report has an id: `SA-003.2` is SA-003's second report.
+- **Hand-offs by reference.** The lead never has to re-type what it already has, which keeps its context small
+  on long missions:
+  - A report reaches the lead in full. After `orchestration.report_full_calls` more lead model calls (2 by
+    default; 0 turns this off) it is shortened in the lead's context to the bottom line, key facts, open
+    questions, recommended tasks and every identifier its details mention (IPs, hashes, client ids, ATT&CK
+    ids, times, case ids). The full report stays in the conversation, and `case_get(["SA-003.2"])` shows it.
+  - `subagent_spawn` and `subagent_message` take `refs`: ids of case records (`FIN-`, `IOC-`, `TIM-`, `EVI-`,
+    `NOT-`, `STA-`) and earlier reports. The harness copies them into the brief exactly, marked as untrusted
+    data because agents wrote them from tool output. An unknown id stops the call before anything starts.
+  - Long tool output saved in the case artifacts is shared by path. Any agent with the case tools reads it with
+    `case_read_artifact`, which is jailed to the case's `artifacts/` folder (symlinks are resolved before the
+    check). It pages by byte offset and can search for a value.
 - **Limits.** Subagents cannot spawn agents. When they need another expert they recommend the task, and
   the orchestrator decides. Each subagent only sees its expert's allowlisted tools.
 

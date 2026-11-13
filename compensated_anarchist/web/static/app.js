@@ -1675,11 +1675,12 @@ function renderThread(box, s) {
   if (s.report) {
     const r = s.report;
     const parts = [r.summary || ""];
+    if ((r.key_facts || []).length) parts.push("", "**Key facts**", ...r.key_facts.map((f) => `- ${f}`));
     if (r.details) parts.push("", r.details);
     if ((r.open_questions || []).length) parts.push("", "**Open questions**", ...r.open_questions.map((q) => `- ${q}`));
     if ((r.recommended_tasks || []).length) parts.push("", "**Recommended tasks**", ...r.recommended_tasks.map((t) => `- ${t.expert || "any"}: ${t.task}`));
     if ((r.skills_used || []).length) parts.push("", "**Skills used**", ...r.skills_used.map((u) => `- ${u.name}: ${u.worked ? "worked" : "did not work"} ${u.note || ""}`));
-    body.append(el("div", { class: "thread-sec" }, el("div", { class: "label", text: `Report · ${r.status}${r.confidence && r.confidence !== "unstated" ? " · confidence " + r.confidence : ""}` }),
+    body.append(el("div", { class: "thread-sec" }, el("div", { class: "label", text: `Report${r.ref ? " " + r.ref : ""} · ${r.status}${r.confidence && r.confidence !== "unstated" ? " · confidence " + r.confidence : ""}` }),
       el("div", { class: "card" }, md(parts.join("\n")))));
   }
   if (!run) {

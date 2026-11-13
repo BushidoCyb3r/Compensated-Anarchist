@@ -141,6 +141,13 @@ class ChatStore:
         return {"id": r["id"], "conversation_id": r["conversation_id"], "ts": r["ts"], "kind": r["kind"],
                 "data": json.loads(r["data"])} if r else None
 
+    def events_of(self, conv_id: str, kind: str) -> list[dict[str, Any]]:
+        """Every event of this kind in the conversation, oldest first (e.g. its subagent reports)."""
+        with self._lock:
+            rows = self.db.execute("SELECT * FROM events WHERE conversation_id=? AND kind=? ORDER BY id",
+                                   (conv_id, kind)).fetchall()
+        return [{"id": r["id"], "ts": r["ts"], "kind": r["kind"], "data": json.loads(r["data"])} for r in rows]
+
     def first_event(self, conv_id: str, kind: str) -> dict[str, Any] | None:
         """The earliest event of this kind in the conversation (e.g. the one that put it under the approval gate)."""
         with self._lock:

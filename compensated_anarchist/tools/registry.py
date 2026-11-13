@@ -118,7 +118,7 @@ class ToolExecutor:
         self.roe = roe
         self.audit = audit
         self.budget_of: Callable[[], Any] = lambda: None  # the running operation's budget (set by the harness)
-        self.spill_dir = spill_dir
+        self.spill_dir = spill_dir  # a folder directly in the case's artifacts folder (case_read_artifact: spill/<file>)
         self.max_chars = max_chars
         self.on_event = on_event or (lambda kind, data: None)
         self.denials: list[dict[str, Any]] = []  # analyst denials -> learning signal
@@ -134,13 +134,16 @@ class ToolExecutor:
             return f"ERROR: tool '{call.name}' is not available to agent '{agent}'.", True
         tool = (local or {}).get(call.name) or self.registry.tools[call.name]
         aid = agent_id or agent
+        names = {s.name for s in allowed}
+        pager = next((p for p in PAGERS if p in names), "")  # how this agent can read a spilled result
         token = CURRENT_CALL.set(CallRef(aid, call.id, call_digest(call.name, call.arguments), resumed))
         try:
-            return await self._execute(call, agent, aid, tool, rationale)
+            return await self._execute(call, agent, aid, tool, rationale, pager)
         finally:
             CURRENT_CALL.reset(token)
 
-    async def _execute(self, call: ToolCall, agent: str, aid: str, tool: Tool, rationale: str) -> tuple[str, bool]:
+    async def _execute(self, call: ToolCall, agent: str, aid: str, tool: Tool, rationale: str,
+                       pager: str = "") -> tuple[str, bool]:
         budget = self.budget_of()
         if budget and (why := budget.add_tool_call()):  # the run is over its budget: nothing more runs
             return (f"NOT EXECUTED - this run reached its budget ({why}). Stop here and report what you have."), True
@@ -176,19 +179,37 @@ class ToolExecutor:
                           error=is_error, seconds=elapsed, **({"credentials_redacted": redacted} if redacted else {}))
         self.on_event("result", {"agent": agent, "agent_id": aid, "tool": call.name, "chars": len(out), "error": is_error,
                                  "seconds": elapsed, "preview": out[:800]})
-        wrapped = self._wrap(call.name, tool.server, out)
+        wrapped = self._wrap(call.name, tool.server, out, pager)
         if redacted:  # the harness's own note, outside the untrusted data
             wrapped += "\n" + HARNESS_NOTE.format(n=redacted)
         return wrapped, is_error
 
-    def _wrap(self, name: str, server: str, out: str) -> str:
+    def _wrap(self, name: str, server: str, out: str, pager: str = "") -> str:
         if len(out) > self.max_chars:
             self.spill_dir.mkdir(parents=True, exist_ok=True)
             spill = self.spill_dir / f"{_attr(name)}_{uuid.uuid4().hex[:8]}.txt"
             spill.write_text(out, encoding="utf-8")
             head = out[: self.max_chars]
-            out = (f"{head}\n...[TRUNCATED {len(out) - self.max_chars} chars; full output saved to {spill} - "
-                   f"use local_read_file with offset to page through it, or narrow your query]")
-        src = _attr(server or "local")
-        return (f'<tool_output tool="{_attr(name)}" source="{src}" trust="untrusted-data">\n{defang_wrapper(out)}\n'
-                f'</tool_output>')
+            nxt = len(head.encode("utf-8"))  # the byte offset the rest starts at
+            where = f"{spill.parent.name}/{spill.name}"  # in the case's artifacts folder
+            if pager == "case_read_artifact":
+                how = (f'read on with case_read_artifact(path="{where}", offset={nxt}), search it with its find '
+                       "argument, or narrow your query")
+            elif pager == "local_read_file":
+                how = f'page through it with local_read_file(path="{spill}", offset={nxt}), or narrow your query'
+            else:
+                how = "narrow your query to see the rest"
+            out = (f"{head}\n...[TRUNCATED {len(out) - self.max_chars} chars; the full output is saved in the case "
+                   f"artifacts as {where} - {how}]")
+        return wrap_output(name, server, out)
+
+
+# Tools that page a spilled result, best first: the case tool reads only the case's artifacts folder.
+PAGERS = ("case_read_artifact", "local_read_file")
+
+
+def wrap_output(name: str, server: str, out: str) -> str:
+    """Tool output as the model sees it: untrusted data in a block it cannot end early."""
+    src = _attr(server or "local")
+    return (f'<tool_output tool="{_attr(name)}" source="{src}" trust="untrusted-data">\n{defang_wrapper(out)}\n'
+            f'</tool_output>')

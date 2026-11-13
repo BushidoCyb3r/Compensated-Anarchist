@@ -76,6 +76,10 @@ experts:
 # ---------------------------------------------------------------------------
 orchestration:
   max_parallel: 4            # subagents working at once (lower it for a single local GPU)
+  # A subagent report reaches the lead in full. After this many more lead model calls it is shortened in the lead's
+  # context to its bottom line, key facts, open questions, recommended tasks and the identifiers in its details
+  # (case_get shows it in full again). Long missions then fit small contexts. 0 = always keep reports in full.
+  report_full_calls: 2
   reflect_on_retro: true     # after-action review: every subagent reflects on its work and revises its skills
   # The lead's own tools. It orchestrates, so it keeps overview tools only and experts do the detailed work.
   # Tool schemas are most of a prompt: the full set is ~80 tools / ~10K tokens, this list ~25 tools.

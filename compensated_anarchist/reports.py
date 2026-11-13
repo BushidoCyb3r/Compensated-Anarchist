@@ -368,9 +368,9 @@ def _event_source(e: dict[str, Any], title: str) -> Source | None:
     if e["kind"] == "analyst_message":
         who, text = "analyst", str(d.get("text", ""))
     elif e["kind"] == "subagent_report":
-        who = f"{d.get('id', '')} {d.get('expert', '')} report ({d.get('status', '')})"
-        text = "\n".join([str(d.get("summary", "")), str(d.get("details", "")),
-                          *[f"open question: {q}" for q in d.get("open_questions") or []]])
+        who = f"{d.get('ref') or d.get('id', '')} {d.get('expert', '')} report ({d.get('status', '')})"
+        text = "\n".join([str(d.get("summary", "")), *[f"key fact: {f}" for f in d.get("key_facts") or []],
+                          str(d.get("details", "")), *[f"open question: {q}" for q in d.get("open_questions") or []]])
     elif e["kind"] == "text":
         who, text = str(d.get("agent_id") or d.get("agent", "agent")), str(d.get("text", ""))
     else:
