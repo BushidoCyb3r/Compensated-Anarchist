@@ -275,3 +275,33 @@ def test_local_run_keeps_argument_paths_in_the_jail(monkeypatch, tmp_path):
     assert run("-o", "63", str(ev / "disk.img")).split() == ["-o", "63", str(ev / "disk.img")]
     assert up + "evidence/disk.img" in run(up + "evidence/disk.img")  # relative, into an evidence root
     assert run("--out=results/run1", "-f", "ntfs").split() == ["--out=results/run1", "-f", "ntfs"]  # new output
+
+
+def test_protected_assets_escalate_auto_calls_that_can_act_on_them(tmp_path):
+    """A protected asset needs approval even when a rule made the tool auto (an active tool tiered auto by mistake).
+    Only calls that cannot act on it skip that: a read its trusted server marks read-only, and the harness's own tools
+    (a case timeline entry about the DC). A connector's tool named like a harness tool is still a connector's tool."""
+    from compensated_anarchist.roe import Rule
+    asked: list[str] = []
+    g = gate(tmp_path, asked)
+    g.rules.insert(0, Rule("edr__*", "auto"))  # a site rule that makes a third-party EDR's tools auto
+    dc, ws = {"client_id": "C.2222222222222222"}, {"client_id": "C.1111111111111111"}  # dc01 is protected, ws01 not
+    read = {"read_only_hint": True}
+
+    def run(tool, args, ann=None, server=""):
+        n = len(asked)
+        d = asyncio.run(g.authorize(tool, args, "", "incident_responder", ann, server))
+        return d, len(asked) > n
+
+    d, ask = run("edr__isolate_host", dc, server="edr")
+    assert ask and d.tier == "approve" and "PROTECTED ASSET" in asked[-1]
+    d, ask = run("edr__isolate_host", dc, read, "edr")  # read-only claimed by a server that is not trusted
+    assert ask and d.tier == "approve"
+    d, ask = run("case__wipe", dc, server="case")  # an MCP server named "case": matches case_*, but not the harness's
+    assert ask and d.tier == "approve"
+    d, ask = run("edr__isolate_host", ws, server="edr")  # not a protected asset
+    assert not ask and d.allowed and d.tier == "auto"
+    d, ask = run("velociraptor__client_info", dc, read, "velociraptor")  # trusted read-only read of the DC's record
+    assert not ask and d.allowed and d.tier == "auto"
+    d, ask = run("case_add_timeline_event", {"host": "dc01", "timestamp": "t", "description": "logon"})
+    assert not ask and d.allowed and d.tier == "auto"

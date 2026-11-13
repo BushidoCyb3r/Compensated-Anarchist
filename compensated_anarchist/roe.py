@@ -23,6 +23,9 @@ Resolution order for a call:
   Then for active tiers (notify/approve) the scope check runs:
   - a target argument outside the authorized scope -> deny
   - a target argument that is a protected asset   -> escalate to approve
+  A protected asset also escalates an auto-tier call (a rule may have made an active tool auto), unless the call is
+  known not to act on a system: a tool its trusted server marks read-only, or one of the harness's own tools
+  (HARNESS_OWN: case notes, memory, plans, reports, local file analysis).
 """
 
 from __future__ import annotations
@@ -57,6 +60,12 @@ GATE_ALL_EXPERTS = ("vuln_assessor",)
 GATE_ALL_PLAYBOOKS = ("vulnerability_assessment",)
 # (agent, tool, arguments) -> why this call must be approved under the gate-everything floor, or "" if not
 GateHook = Callable[[str, str, dict[str, Any]], str]
+
+# The harness's own tools (no MCP server): they read and write its records - case file, memory, skills, plans,
+# reports, ATT&CK - or analyze evidence files on this machine, and never reach another system. A protected asset named
+# in one (a timeline entry about the domain controller) needs no approval; an auto-tier call to any other tool does.
+HARNESS_OWN = ("case_*", "memory_*", "skill_*", "subagent_*", "submit_report", "learning_*", "hunt_plan_*", "cte_*",
+               "report_*", "attack_*", "local_*", "onboard_*")
 
 
 def missing_shipped_rules(site: Path, shipped: Path) -> list[dict[str, Any]]:
@@ -239,7 +248,8 @@ class RoeGate:
         raised = bool(gated) and tier in ("auto", "notify")
         if gated and tier != "deny":
             tier, why = "approve", f"{why}; {gated}"
-        decision = await self._decide(tool, arguments, rationale, agent, tier, why, ask_in_observe=raised)
+        decision = await self._decide(tool, arguments, rationale, agent, tier, why, ask_in_observe=raised,
+                                      reads_only=self.known_read_only(tool, annotations, server))
         self.audit.record(
             "roe_decision",
             agent=agent,
@@ -253,7 +263,28 @@ class RoeGate:
         )
         return decision
 
-    async def _decide(self, tool, arguments, rationale, agent, tier, why, ask_in_observe: bool = False) -> Decision:
+    def known_read_only(self, tool: str, annotations: dict[str, Any] | None, server: str) -> bool:
+        """The call cannot act on a system: its trusted server marks the tool read-only, or it is one of the harness's
+        own tools (HARNESS_OWN). Such an auto-tier call that names a protected asset runs without approval."""
+        if server:
+            return bool(annotations and server in self.trust_annotations_from and annotations.get("read_only_hint")
+                        and not annotations.get("destructive_hint"))
+        return any(fnmatch.fnmatchcase(tool, p) for p in HARNESS_OWN)
+
+    async def _names(self, tool: str, arguments: dict[str, Any]) -> dict[str, list[str]]:
+        """Each target argument with its aliases (a client id -> hostname/fqdn/IP), so CIDR/hostname rules apply."""
+        targets = self._targets(arguments)
+        names: dict[str, list[str]] = {t: [t] for t in targets}
+        if targets and self.target_resolver and (self.allowed_targets or self.protected_assets):
+            for t in targets:
+                names[t] += [a for a in await self.target_resolver(tool, t) if a]
+        return names
+
+    def _protected(self, names: dict[str, list[str]]) -> list[str]:
+        return [t for t, ns in names.items() if any(_matches_target(n, self.protected_assets) for n in ns)]
+
+    async def _decide(self, tool, arguments, rationale, agent, tier, why, ask_in_observe: bool = False,
+                      reads_only: bool = False) -> Decision:
         if tier == "deny":
             return Decision("deny", False, f"denied by ROE: {why}", why)
         if self.posture == "observe" and tier == "approve" and not ask_in_observe:  # gate-raised reads may still ask
@@ -263,11 +294,7 @@ class RoeGate:
             why = f"{why}; OBSERVE posture allows asking for this collection"
 
         if tier in ("notify", "approve"):
-            targets = self._targets(arguments)
-            names: dict[str, list[str]] = {t: [t] for t in targets}
-            if targets and self.target_resolver and (self.allowed_targets or self.protected_assets):
-                for t in targets:  # e.g. client id -> hostname/fqdn/IP so CIDR/hostname scope rules apply
-                    names[t] += [a for a in await self.target_resolver(tool, t) if a]
+            names = await self._names(tool, arguments)
             if self.scope_enforce and self.allowed_targets:
                 outside = [t for t, ns in names.items() if not any(_matches_target(n, self.allowed_targets) for n in ns)]
                 if outside:
@@ -275,9 +302,12 @@ class RoeGate:
                     return Decision("deny", False, f"denied: target(s) outside authorized scope ({detail})", why)
                 if any(len(ns) > 1 for ns in names.values()):
                     why = f"{why}; in scope as {[ns for ns in names.values()]}"
-            protected = [t for t, ns in names.items() if any(_matches_target(n, self.protected_assets) for n in ns)]
-            if protected:
+            if protected := self._protected(names):
                 tier, why = "approve", f"{why}; PROTECTED ASSET {protected}"
+        elif tier == "auto" and self.protected_assets and not reads_only:
+            # a rule may have made an active tool auto: a protected asset still needs the analyst
+            if protected := self._protected(await self._names(tool, arguments)):
+                tier, why = "approve", f"{why}; PROTECTED ASSET {protected} (approval even for an auto-tier tool)"
 
         if tier == "auto":
             return Decision("auto", True, why, why)

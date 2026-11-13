@@ -25,7 +25,9 @@ scope:
     # - 10.0.0.0/8
     # - "*.corp.example.mil"
     # - "C.*"
-  # always escalate to approval, even if a rule says auto/notify (domain controllers, safety systems...)
+  # always escalate to approval, even if a rule says auto/notify (domain controllers, safety systems...). Except calls
+  # that cannot act on the asset: reads a trusted connector marks read-only, and the harness's own tools (case notes,
+  # memory, plans, reports, local file analysis).
   protected_assets: []
     # - "C.1234567890abcdef"
     # - 10.0.1.5

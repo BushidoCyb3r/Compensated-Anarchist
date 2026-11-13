@@ -341,15 +341,22 @@ class Forensics:
         return "ERROR: neither hayabusa nor chainsaw installed"
 
     async def plaso_timeline(self, source: str, date_filter: str = "") -> str:
+        """log2timeline + psort, run in their output folder in the case artifacts. date_filter is psort's FILTER
+        expression (a positional argument): one starting with - would be read as an option (-w <path> would write
+        the timeline anywhere), so it is refused."""
         src = self.jail.check(source)
+        date_filter = str(date_filter or "")
+        if date_filter.startswith("-"):
+            return ("ERROR: date_filter is a psort filter expression such as \"date > '2026-01-01 00:00:00'\"; it "
+                    "cannot start with -")
         out = self._outdir("plaso")
         store = out / "timeline.plaso"
         r1 = await self._run([self._which("log2timeline"), "--status_view", "none", "--unattended",
-                              "--storage-file", str(store), str(src)], timeout=6 * 3600)
+                              "--storage-file", str(store), str(src)], timeout=6 * 3600, cwd=out)
         argv = [self._which("psort"), "--status_view", "none", "-o", "l2tcsv", "-w", str(out / "timeline.csv"), str(store)]
         if date_filter:
             argv.append(date_filter)
-        r2 = await self._run(argv, timeout=3600)
+        r2 = await self._run(argv, timeout=3600, cwd=out)
         return f"plaso storage {store}\ncsv {out / 'timeline.csv'}\n{r1[-2000:]}\n{r2[-2000:]}"
 
     async def capa(self, path: str, file_format: str = "auto") -> str:
@@ -597,7 +604,8 @@ class Forensics:
             Tool("local_zeek", "Process a PCAP with Zeek into JSON logs in the case artifacts dir.", schema({"pcap": S}, ["pcap"]), self.zeek),
             Tool("local_evtx_hunt", "Run Sigma-based hunting over Windows EVTX (hayabusa or chainsaw).",
                  schema({"evtx_path": S, "min_level": {"type": "string", "enum": ["informational", "low", "medium", "high", "critical"]}}, ["evtx_path"]), self.evtx_hunt),
-            Tool("local_plaso_timeline", "Build a super-timeline with plaso (log2timeline + psort). Slow on large images.",
+            Tool("local_plaso_timeline", "Build a super-timeline with plaso (log2timeline + psort). Slow on large images. "
+                 "date_filter: a psort filter expression, e.g. date > '2026-01-01 00:00:00' AND date < '2026-01-08 00:00:00'.",
                  schema({"source": S, "date_filter": S}, ["source"]), self.plaso_timeline),
             Tool("local_capa", "capa: identify capabilities in a PE/.NET/ELF/shellcode sample, mapped to ATT&CK and MBC.",
                  schema({"path": S, "file_format": {"type": "string", "enum": ["auto", "pe", "dotnet", "elf", "sc32", "sc64"]}}, ["path"]), self.capa),

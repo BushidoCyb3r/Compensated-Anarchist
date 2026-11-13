@@ -209,3 +209,20 @@ def test_ez_tool_runs_in_its_output_folder(fx):
     (ev / "inside.reb").write_text("Description: test\n")
     ok = json.loads(asyncio.run(f.ez_tool("RECmd", str(hive), batch_file=str(ev / "inside.reb"))))
     assert str((ev / "inside.reb").resolve()) in json.loads(ok["log_tail"])["argv"]
+
+
+def test_plaso_date_filter_cannot_become_an_option(fx):
+    """date_filter is psort's FILTER expression; one starting with - would be read as an option (-w <path> writes the
+    timeline anywhere), so it is refused before anything runs. Both plaso tools run in their case output folder."""
+    f, ev, fake_bin, tmp = fx
+    script(fake_bin / "log2timeline.py", ECHO)
+    script(fake_bin / "psort.py", ECHO)
+    src = ev / "triage"
+    src.mkdir()
+    for bad in ("-w/tmp/x", "--write=/tmp/x"):
+        assert asyncio.run(f.plaso_timeline(str(src), bad)).startswith("ERROR: date_filter")
+    assert not list(f.case.artifacts.glob("plaso_*"))
+    out = asyncio.run(f.plaso_timeline(str(src), "date > '2026-01-01 00:00:00'"))
+    runs = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+    assert len(runs) == 2 and runs[1]["argv"][-1] == "date > '2026-01-01 00:00:00'"
+    assert all(Path(r["cwd"]).parent == f.case.artifacts.resolve() for r in runs)

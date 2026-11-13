@@ -430,7 +430,9 @@ The ROE gate runs in code, so the model cannot talk its way past it.
   artifact is `approve`.
 - **Posture:** `observe` denies every approval-tier action. `respond` allows them with analyst approval.
 - **Scope:** `allowed_targets` (CIDRs, host globs, client ids). An active action against anything outside
-  scope is denied without asking. `protected_assets` always escalate to approval.
+  scope is denied without asking. `protected_assets` always escalate to approval, even for a tool a rule made
+  `auto`; only calls that cannot act on the asset skip it (reads a trusted connector marks read-only, and the
+  harness's own case notes, memory, plans and local file analysis).
   - Velociraptor client ids are resolved live to hostname, FQDN and last IP, so CIDR and hostname rules
     apply to endpoint actions.
   - An id that can't be resolved is denied (fail closed). This was verified against a live server.
