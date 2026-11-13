@@ -71,6 +71,24 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# An analyst statement must be the analyst's own words: whole words of one of their messages, never a fragment of a
+# word ("no" inside "know"). A short answer (yes, no, one marking) is too easy to find in unrelated text, so it counts
+# only when it was the analyst's whole message; otherwise the agent quotes the sentence it is in.
+SHORT_ANSWER_CHARS = 12
+
+
+def quoted_from(answer: str, message: str) -> bool:
+    """True when `answer` is quoted from `message` (case and spacing aside) under the rules above."""
+    want = " ".join(answer.split()).lower()
+    text = " ".join(message.split()).lower()
+    if not want:
+        return False
+    if len(want) < SHORT_ANSWER_CHARS:
+        bare = lambda s: re.sub(r"^\W+|\W+$", "", s)  # noqa: E731  - "No." is the answer "no"
+        return bool(bare(want)) and bare(want) == bare(text)
+    return re.search(r"(?<!\w)" + re.escape(want) + r"(?!\w)", text) is not None
+
+
 # ---------------------------------------------------------------------------
 # Expert definitions (markdown + YAML frontmatter)
 # ---------------------------------------------------------------------------
@@ -818,12 +836,12 @@ class Harness:
         """Record the analyst's answer to an agent's question as a citable statement. The answer must be quoted from
         one of the analyst's own messages in this case, so an agent cannot put words in the analyst's mouth."""
         def case_analyst_statement(question: str, answer: str, topic: str = "") -> str:
-            want = " ".join(answer.split()).lower()
+            want = " ".join(str(answer).split()).lower()
             if len(want) < 1:
                 raise ValueError("empty answer")
             for conv in self.history.list(self.case.id, 1000):
                 for e in reversed(self.history.events(conv["id"])):
-                    if e["kind"] == "analyst_message" and want in " ".join(str(e["data"].get("text", "")).split()).lower():
+                    if e["kind"] == "analyst_message" and quoted_from(want, str(e["data"].get("text", ""))):
                         when = datetime.fromtimestamp(e["ts"], timezone.utc).isoformat()
                         sid = self.case.add_statement(question.strip(), answer.strip(), self.cfg.operator, when,
                                                       f"EV-{e['id']}", topic.strip())
@@ -831,12 +849,15 @@ class Harness:
                                           analyst_message=f"EV-{e['id']}")
                         return f"recorded {sid}: the analyst's answer from EV-{e['id']} ({when[:16]}). Cite it as [{sid}]."
             return ("NOT RECORDED: that answer is not in any of the analyst's messages in this case. Quote the analyst's "
-                    "own words exactly; if they have not answered yet, ask them.")
+                    f"own words exactly, as whole words; an answer shorter than {SHORT_ANSWER_CHARS} characters (yes, no, "
+                    "a single marking) counts only when it was the analyst's whole message, so quote the sentence it is in. "
+                    "If they have not answered yet, ask them.")
         S = {"type": "string"}
         return Tool("case_analyst_statement", "Record an analyst's answer to a question (classification markings, a missing "
                     "fact, a decision) as a citable statement STA-nnnn. The answer must be quoted exactly from the analyst's "
-                    "own message in this case.", schema({"question": S, "answer": S, "topic": S}, ["question", "answer"]),
-                    case_analyst_statement)
+                    f"own message in this case, as whole words; one shorter than {SHORT_ANSWER_CHARS} characters must be "
+                    "the analyst's whole message (otherwise quote the sentence it is in).",
+                    schema({"question": S, "answer": S, "topic": S}, ["question", "answer"]), case_analyst_statement)
 
     def _register_orchestration(self) -> None:
         S = {"type": "string"}

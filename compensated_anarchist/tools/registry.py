@@ -3,7 +3,8 @@
 Execution pipeline for every call, from every agent:
    allowlist check (expert's tool globs) -> ROE gate -> run -> truncate/spill -> audit
 Tool output is wrapped as UNTRUSTED data: logs, alerts, files and packets are attacker-
-influenced and may contain prompt-injection text.
+influenced and may contain prompt-injection text. The data cannot end its own wrapper: every
+`<tool_output` / `</tool_output` inside it is escaped, so the block ends only where the harness ends it.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import fnmatch
 import hashlib
 import inspect
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -25,6 +27,19 @@ from ..redact import HARNESS_NOTE, Redactor
 from ..roe import RoeGate
 
 Handler = Callable[..., Awaitable[str] | str]
+
+# The wrapper's tag inside the data (any case, any spacing: "</tool_output>", "< / TOOL_OUTPUT"), whose "<" is
+# escaped so it can neither close the block early nor open a fake one that looks like the harness's.
+_WRAPPER_TAG = re.compile(r"<(?=\s*/?\s*tool_output)", re.I)
+
+
+def defang_wrapper(text: str) -> str:
+    return _WRAPPER_TAG.sub("&lt;", text)
+
+
+def _attr(value: str) -> str:
+    """A tool or server name for the wrapper's attributes: a connector picks its own tool names."""
+    return re.sub(r"[^A-Za-z0-9_.:-]", "_", value)
 
 
 @dataclass(frozen=True)
@@ -169,10 +184,11 @@ class ToolExecutor:
     def _wrap(self, name: str, server: str, out: str) -> str:
         if len(out) > self.max_chars:
             self.spill_dir.mkdir(parents=True, exist_ok=True)
-            spill = self.spill_dir / f"{name}_{uuid.uuid4().hex[:8]}.txt"
+            spill = self.spill_dir / f"{_attr(name)}_{uuid.uuid4().hex[:8]}.txt"
             spill.write_text(out, encoding="utf-8")
             head = out[: self.max_chars]
             out = (f"{head}\n...[TRUNCATED {len(out) - self.max_chars} chars; full output saved to {spill} - "
                    f"use local_read_file with offset to page through it, or narrow your query]")
-        src = server or "local"
-        return f'<tool_output tool="{name}" source="{src}" trust="untrusted-data">\n{out}\n</tool_output>'
+        src = _attr(server or "local")
+        return (f'<tool_output tool="{_attr(name)}" source="{src}" trust="untrusted-data">\n{defang_wrapper(out)}\n'
+                f'</tool_output>')
