@@ -220,6 +220,8 @@ mcp_servers:
       SPLUNK_URL: ${SPLUNK_URL:-}
       SPLUNK_TOKEN: ${SPLUNK_TOKEN:-}
       SPLUNK_VERIFY: ${SPLUNK_VERIFY:-true}
+      SPLUNK_EXTRA_COMMANDS: ${SPLUNK_EXTRA_COMMANDS:-}  # more read-only SPL commands to allow (comma list)
+      SPLUNK_ALLOW_MACROS: ${SPLUNK_ALLOW_MACROS:-}      # macros agents may use (comma list, or *)
 
   elastic:
     enabled: ${ES_ENABLED:-false}

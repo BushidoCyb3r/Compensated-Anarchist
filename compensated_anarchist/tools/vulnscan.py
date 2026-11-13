@@ -6,14 +6,15 @@ itself before it runs:
 
   - the program must be on the allowlist (assessment tools, no exploitation or password attacks) and installed;
   - the ROE must define an authorized scope (scope.allowed_targets): no scope, no scanning;
-  - every host in the arguments (IPs, CIDRs, hostnames, URLs, host:port) must be listed in `targets`, and every
+  - every host in the arguments (IPs, CIDRs, hostnames, URLs, host:port, one-word names that resolve such as dc01
+    or localhost, and numbers the resolver reads as addresses such as 10.1) must be listed in `targets`, and every
     target must sit inside the scope (hostnames: every address they resolve to);
-  - target ranges with - or *, and "read targets from a file" options, are refused: scope is checked on what
-    is written in the command;
+  - target ranges with - or *, "read targets from a file" options, config-file options and file: URLs are
+    refused: scope is checked on what is written in the command;
   - options matching the program's deny patterns (exploit / brute-force / DoS script categories, uploads,
     HTTP methods that change data, ...) are refused;
-  - absolute paths may only point into the case's vuln_assessment folder, or into read-only data folders for
-    inputs such as wordlists;
+  - absolute, ~ and .. paths - also after = or stuck to an option (--script=/x.nse, -oN/tmp/x) - may only point
+    into the case's vuln_assessment folder, or into read-only data folders for inputs such as wordlists;
   - argv only, never a shell; a minimal environment (no API keys); a timeout; the full output is kept in
     <case>/vuln_assessment/raw/ next to the command that produced it.
 """
@@ -47,7 +48,8 @@ DEFAULT_TOOLS = [
 ]
 # Refused options, matched against the whole argument string. "*" applies to every program.
 DEFAULT_DENY: dict[str, list[str]] = {
-    "*": [r"(^|\s)--?(exec|execute|shell|upload|delete)(\s|=|$)"],
+    # a config file can carry any option, including the ones refused below, where this check cannot see them
+    "*": [r"(^|\s)--?(exec|execute|shell|upload|delete)(\s|=|$)", r"(^|\s)--?config(\s|=|$)"],
     "nmap": [r"--script[= ]\S*(exploit|brute|dos|intrusive|malware|fuzzer|flood|slowloris)",
              r"--script-args[= ]\S*unsafe", r"(^|\s)-iR(\s|$)", r"(^|\s)-iL(\s|$)", r"(^|\s)--resume(\s|$)"],
     "nuclei": [r"(^|\s)-(tags|itags|include-tags|t|templates|tc|template-condition)[= ]\S*(dos|fuzz|intrusive|brute)",
@@ -58,7 +60,8 @@ DEFAULT_DENY: dict[str, list[str]] = {
     "testssl.sh": [r"--file[= ]"], "testssl": [r"--file[= ]"],
     "sslyze": [r"--targets_in[= ]"],
     "curl": [r"(^|\s)(-X|--request)[= ]?(PUT|POST|DELETE|PATCH)\b",
-             r"(^|\s)(-T|--upload-file|-d|--data\S*|-F|--form\S*|--json)(\s|=|$)"],
+             r"(^|\s)(-T|--upload-file|-d|--data\S*|-F|--form\S*|--json)(\s|=|$)",
+             r"(^|\s)(?-i:-[A-Za-z]*K)"],  # -K / -sK: read options from a file (case-sensitive: -k is fine)
     "ffuf": [r"(^|\s)(-d|-X|-request)(\s|=|$)"],
     "wpscan": [r"(^|\s)(-P|--passwords|-U|--usernames)(\s|=|$)"],
     "smbmap": [r"(^|\s)(-x|-X|--upload|--download|--delete|--mode)(\s|=|$)"],
@@ -71,6 +74,7 @@ FILE_EXT = {"xml", "txt", "json", "jsonl", "yaml", "yml", "csv", "html", "htm", 
 _URL = re.compile(r"[a-z][a-z0-9+.-]*://(\[[^\]]+\]|[^/:?#\s]+)", re.I)
 _HOSTNAME = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}\.?$", re.I)
 _RANGE = re.compile(r"^\d{1,3}(-\d{1,3})?(\.(\d{1,3}(-\d{1,3})?|\*)){3}$")  # 10.0.0.1-50, 10.0.*.1 (not port ranges)
+_LABEL = re.compile(r"^(?=.*[a-z])[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$", re.I)  # one word: dc01, localhost
 _OUTPUT_FLAG = re.compile(r"^-(o[A-Za-z]?|-?out\S*|-?output\S*|-?log\S*|-?json\S*|-?xml\S*|-?report\S*|-?export\S*)$")
 MAX_TIMEOUT_S = 3600
 
@@ -89,10 +93,43 @@ def _net(v: str):
         return None
 
 
-def hosts_in_args(args: list[str]) -> tuple[list[str], list[str]]:
-    """(hosts named in the arguments, problems). Hosts: IPs, CIDRs, hostnames, URL hosts, host:port hosts."""
+def _numeric_address(v: str) -> bool:
+    """A number the system resolver reads as an IPv4 address although it is not written as one: 10.1 and 10.0.1
+    (10.0.0.1), or 167772161 (10.0.0.1). Plain numbers up to 65535 are ports and counts; 0.5-style values (an address
+    in 0.0.0.0/8, which nothing can scan) are left to be decimals."""
+    if re.fullmatch(r"\d+", v):
+        return int(v) > 65535
+    return bool(re.fullmatch(r"[1-9]\d{0,2}(\.\d{1,8}){1,2}", v))
+
+
+def _path_candidates(arg: str, prev: str) -> list[tuple[str, str]]:
+    """(the option it belongs to, path) for every path an argument may name: the argument itself (its option is the
+    argument before it), the value after = (--script=/x.nse), and a path stuck to a short option (-oN/tmp/x, its
+    option -oN). Only absolute, ~ and .. paths are returned: a plain relative name stays in raw/, where the tool runs.
+    URLs are hosts, not paths."""
+    if "://" in arg:
+        return []
+    out = [(prev, arg)]
+    head, eq, value = arg.partition("=")
+    if eq:
+        out.append((head, value))
+    elif arg.startswith("-"):
+        cut = [i for i in (arg.find("/"), arg.find("~"), arg.find("..")) if i > 0]
+        if cut:
+            out.append((arg[:min(cut)], arg[min(cut):]))
+    return [(o, c) for o, c in out if c.startswith(("/", "~")) or ".." in Path(c).parts]
+
+
+def hosts_in_args(args: list[str], resolve: Callable[[str], list[str]] | None = None) -> tuple[list[str], list[str]]:
+    """(hosts named in the arguments, problems). Hosts: IPs, CIDRs, hostnames, URL hosts, host:port hosts, numbers the
+    resolver reads as addresses (10.1, 167772161), and one-word names that resolve (dc01, localhost, 0x0a000001):
+    scanners resolve those through the search domain and the hosts file, so they are hosts too."""
+    resolve = resolve or _resolve
     hosts, problems = [], []
     for tok in args:
+        if re.search(r"(?i)(^|[^a-z0-9+.-])file:", tok):
+            problems.append(f"'{tok}': file: URLs read files on this machine, not targets")
+            continue
         for url_host in _URL.findall(tok):
             hosts.append(url_host.strip("[]").lower())
         rest = _URL.sub(" ", tok)
@@ -112,6 +149,10 @@ def hosts_in_args(args: list[str]) -> tuple[list[str], list[str]]:
             elif ("/" not in host and _HOSTNAME.match(host) and host.rsplit(".", 1)[-1].lower() not in FILE_EXT
                   and not Path(host).exists()):
                 hosts.append(host.lower().rstrip("."))
+            elif _numeric_address(host):
+                hosts.append(host)
+            elif _LABEL.match(host) and not Path(host).exists() and resolve(host):
+                hosts.append(host.lower())
     return list(dict.fromkeys(hosts)), problems
 
 
@@ -163,22 +204,23 @@ class VulnTools:
                 problems.append(f"target '{t}' does not resolve, so its scope cannot be checked")
             elif not (_matches_target(t, allowed) or all(_matches_target(n, allowed) for n in names)):
                 problems.append(f"target '{t}' ({', '.join(names)}) is outside the authorized scope {allowed}")
-        named, issues = hosts_in_args(args)
+        named, issues = hosts_in_args(args, self.resolve)
         problems += issues
         for h in named:
             if not _covered(h, tgt):
                 problems.append(f"'{h}' appears in the arguments but not in targets: list every host the command touches")
+        folder = self.folder.resolve()
         for i, a in enumerate(args):
-            if not (a.startswith(("/", "~")) or ".." in Path(a).parts):
-                continue
-            p = Path(os.path.expanduser(a)).resolve()
-            inside = p == self.folder.resolve() or self.folder.resolve() in p.parents
-            readable = any(d == p or d in p.parents for d in self.read_dirs)
-            writing = i > 0 and bool(_OUTPUT_FLAG.match(args[i - 1]))
-            if not inside and (not readable or writing):
-                problems.append(f"path '{a}': only the case's vuln_assessment folder"
-                                + ("" if writing else f" or read-only data folders ({', '.join(map(str, self.read_dirs))})")
-                                + " may be used")
+            for opt, c in _path_candidates(a, args[i - 1] if i > 0 else ""):
+                p = Path(os.path.expanduser(c))
+                p = (p if p.is_absolute() else self.raw / p).resolve()  # vuln_run runs in raw/
+                inside = p == folder or folder in p.parents
+                readable = any(d == p or d in p.parents for d in self.read_dirs)
+                writing = bool(_OUTPUT_FLAG.match(opt))
+                if not inside and (not readable or writing):
+                    problems.append(f"path '{c}' (in '{a}'): only the case's vuln_assessment folder"
+                                    + ("" if writing else f" or read-only data folders ({', '.join(map(str, self.read_dirs))})")
+                                    + " may be used")
         return problems
 
     # ---- tools ------------------------------------------------------------------------------------------

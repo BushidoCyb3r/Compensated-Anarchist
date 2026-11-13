@@ -1,9 +1,14 @@
 """MCP server: Splunk (Enterprise / Enterprise Security) via the REST API on :8089. Read-only.
 
 Env: SPLUNK_URL (https://splunk:8089), SPLUNK_TOKEN (bearer auth token) | SPLUNK_USER+SPLUNK_PASS,
-     SPLUNK_VERIFY (true|false|/path/ca.pem), SPLUNK_MAX_RESULTS (default 200), SPLUNK_TIMEOUT
-SPL that writes or executes (delete, collect, outputlookup, sendemail, script, run, map, ...) is refused here;
-search is read-only by construction, independent of the harness ROE.
+     SPLUNK_VERIFY (true|false|/path/ca.pem), SPLUNK_MAX_RESULTS (default 200), SPLUNK_TIMEOUT,
+     SPLUNK_EXTRA_COMMANDS (comma list of more read-only commands to allow), SPLUNK_ALLOW_MACROS (comma list, or *)
+Every command in a search - the first, each one after a pipe, each one opening a subsearch - must be on the list of
+read-only search and reporting commands (_ALLOWED, plus SPLUNK_EXTRA_COMMANDS); commands that write or execute
+(_BLOCKED: delete, collect, outputlookup, sendemail, script, run, map, ...) are refused even when listed. A command an
+installed app adds is refused until the site lists it. Macros can expand to any command, which this check cannot
+see, so only the macros this connector uses (`notable`) and SPLUNK_ALLOW_MACROS run. The Splunk account's role is
+still the real limit: give it no write capabilities (SETUP.md).
 """
 
 from __future__ import annotations
@@ -31,7 +36,20 @@ MAX = int(env("SPLUNK_MAX_RESULTS", "200"))
 _BLOCKED = ("delete", "collect", "mcollect", "meventcollect", "tscollect", "outputlookup", "outputcsv", "outputtext",
             "sendemail", "sendalert", "script", "run", "runshellscript", "map", "dump", "rest", "sendtocyberark",
             "summaryindex", "dbxquery", "dbxoutput", "dbxlookup", "outputtelemetry", "sendresults")
-# Macros can hide commands from this list: give the connector a role that cannot write (see SETUP.md).
+# Search and reporting commands that only read. Anything else, including commands installed apps add, is refused
+# unless the site lists it in SPLUNK_EXTRA_COMMANDS.
+_ALLOWED = frozenset("""
+    search where eval stats eventstats streamstats tstats mstats mcatalog chart timechart top rare table fields rename
+    sort dedup head tail reverse rex regex erex spath xmlkv xpath kvform extract kv multikv mvexpand makemv mvcombine
+    nomv fillnull filldown bin bucket convert lookup inputlookup inputcsv join append appendcols appendpipe union
+    multisearch transaction iplocation geostats fieldsummary metadata eventcount dbinspect makeresults gentimes
+    datamodel from pivot addinfo addtotals addcoltotals accum autoregress delta trendline predict anomalydetection
+    anomalies cluster kmeans contingency correlate associate xyseries untable transpose uniq return format set typer
+    highlight iconify localize rangemap replace strcat makecontinuous timewrap foreach selfjoin tags concurrency
+    reltime outlier abstract noop tojson fromjson
+""".split())
+_EXTRA = frozenset(c.strip().lower() for c in env("SPLUNK_EXTRA_COMMANDS", "").split(",") if c.strip())
+_MACROS = frozenset({"notable"} | {m.strip().lower() for m in env("SPLUNK_ALLOW_MACROS", "").split(",") if m.strip()})
 _INDEX_RE = re.compile(r"^[A-Za-z0-9_*:.-]{1,200}$")
 
 
@@ -39,15 +57,55 @@ def _index(index: str) -> str:
     if not _INDEX_RE.match(index or ""):
         raise ValueError(f"index: an index name or pattern such as main or wineventlog*; got {index!r}")
     return index
-_BLOCK_RE = re.compile(r"\|\s*(" + "|".join(_BLOCKED) + r")\b", re.I)
+
+
+def _commands(spl: str, single_quotes: bool) -> list[str]:
+    """The command names in a search: the first word of the search, of every pipe segment and of every subsearch
+    ([...]). Quoted strings are skipped (backslash escapes); single quotes count as quotes only when asked. A first
+    word followed by = or a comparison (index=main) is an implicit search, not a command."""
+    quotes = "\"'" if single_quotes else '"'
+    cmds, expect, i, n = [], True, 0, len(spl)
+    while i < n:
+        c = spl[i]
+        if c in quotes:
+            i += 1
+            while i < n and spl[i] != c:
+                i += 2 if spl[i] == "\\" else 1
+            i, expect = i + 1, False
+        elif c in "|[":
+            i, expect = i + 1, True
+        elif c.isspace() or not expect:
+            i += 1
+        else:
+            m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", spl[i:])
+            if m and not re.match(r"\s*(=|!=|<|>)", spl[i + m.end():]):
+                cmds.append(m.group(0).lower())
+            i, expect = i + (m.end() if m else 1), False
+    return cmds
+
+
+def _check_spl(spl: str) -> None:
+    """Raise unless every command is a read-only one and every macro is allowed. The commands are read twice, with
+    and without single quotes as quotes, so a quote Splunk reads differently cannot hide a pipe."""
+    for cmd in dict.fromkeys(_commands(spl, False) + _commands(spl, True)):
+        if cmd in _BLOCKED:
+            raise ValueError(f"SPL command not permitted by the read-only connector: {cmd}")
+        if cmd not in _ALLOWED and cmd not in _EXTRA:
+            raise ValueError(f"SPL command not permitted by the read-only connector: {cmd} (not on its list of "
+                             "read-only commands; a site can add one with SPLUNK_EXTRA_COMMANDS)")
+    if "*" not in _MACROS:
+        for body in re.findall(r"`([^`]*)`", spl):
+            name = body.split("(", 1)[0].strip().lower()
+            if name not in _MACROS:
+                raise ValueError(f"SPL macro not permitted by the read-only connector: `{body[:60]}` (a macro can hide "
+                                 "any command; a site can allow one with SPLUNK_ALLOW_MACROS)")
 
 
 def _spl(spl: str) -> str:
     spl = spl.strip()
-    if _BLOCK_RE.search(spl):
-        raise ValueError(f"SPL command not permitted by the read-only connector: {_BLOCK_RE.search(spl).group(1)}")
     if not (spl.startswith("|") or spl.lower().startswith("search ")):
         spl = "search " + spl
+    _check_spl(spl)
     return spl
 
 

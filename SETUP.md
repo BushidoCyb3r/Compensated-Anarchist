@@ -798,9 +798,14 @@ deployments without those datasets/features.
 ## 4. Splunk (Enterprise / Enterprise Security)
 
 **What it gives the team:** SPL search, index and data inventory, field summaries, IOC sweeps, and ES
-notable events. The connector blocks known write/execute SPL commands such as `delete`, `collect`,
-`outputlookup`, `sendemail`, `script`, `run`, and `map`. This filter cannot inspect commands hidden in macros;
-enforce read-only access with the Splunk account's permissions too.
+notable events. Every command in a search, including those that open subsearches, must be on the connector's
+list of read-only search and reporting commands; anything else, including commands that installed apps add,
+is refused. Write/execute commands such as `delete`, `collect`, `outputlookup`, `sendemail`, `script`, `run`
+and `map` are refused even if you list them. Macros can expand to any command, so agents can use only the
+`notable` macro the connector itself needs, plus the ones you allow. Enforce read-only access with the Splunk
+account's permissions too: the connector checks the search text, the role decides what Splunk will run.
+- `SPLUNK_EXTRA_COMMANDS=ldapsearch,...` allows more read-only commands (comma list).
+- `SPLUNK_ALLOW_MACROS=sysmon,...` allows macros you have reviewed, or `*` for all of them.
 
 **On Splunk:**
 1. **Enable token authentication:** *Settings → Tokens → Enable Token Authentication*. The administrator

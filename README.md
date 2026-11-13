@@ -665,8 +665,8 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md): privately, through Gi
 
 - **Live-verified:** Velociraptor (except quarantine, which was deliberately not run on the dev
   workstation), Security Onion 3.4.0 and Elastic (read-only API key), sigma-cli and capa.
-- **Untested beyond its safety check:** Splunk. Only the SPL write/exec blocklist has a test; search and
-  response handling have never run against Splunk or a mock of it.
+- **Untested beyond its safety check:** Splunk. Only the SPL command check (read-only commands, allowed macros)
+  has tests; search and response handling have never run against Splunk or a mock of it.
 - **Tested against mock servers or stand-in tools only:** MISP and OpenCTI (mock HTTP servers built from
   their documented APIs and the official pycti queries), Archer (a stand-in HTTPS server built from its API
   contract; `tests/test_archer_live.py` runs the acceptance checks against yours), Elastic Security detection alerts, plus the

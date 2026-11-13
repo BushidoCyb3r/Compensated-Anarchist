@@ -343,3 +343,39 @@ def test_analyst_statements_must_be_the_analysts_own_whole_words():
     assert not quoted_from("SECRET", "Mark it SECRET") and quoted_from("mark it secret", "Mark it SECRET.")
     assert quoted_from("unclassified", "Write the incident report. Mark it UNCLASSIFIED.")
     assert not quoted_from("unclassified", "label it unclassifiedish") and quoted_from("UNCLASSIFIED//FOUO", "use unclassified//fouo")
+
+
+def test_splunk_runs_only_read_only_commands(monkeypatch):
+    """Every command in a search must be a read-only one: the first, each after a pipe, each opening a subsearch.
+    A command an installed app adds is refused until the site lists it, a write command even then, and quotes (double,
+    or single as Splunk may read them) cannot hide a pipe. Macros can hide any command: only notable and the macros
+    the site allows run."""
+    import importlib
+    monkeypatch.setenv("SPLUNK_URL", "https://splunk.invalid:8089")
+    monkeypatch.setenv("SPLUNK_TOKEN", "t")
+    for var in ("SPLUNK_EXTRA_COMMANDS", "SPLUNK_ALLOW_MACROS"):
+        monkeypatch.delenv(var, raising=False)
+    sp = importlib.reload(importlib.import_module("compensated_anarchist.servers.splunk"))
+    for spl in ('index=main EventCode=4625 | stats count by src_ip, user | sort -count',
+                '| tstats count where index=* by sourcetype | eval x="a|b" | rex field=x "(?<y>c|d)"',
+                'index=main [search index=threat | fields src_ip] | table _time src_ip',
+                'index=main [index=threat src=10.0.0.5 | fields src_ip | format]',
+                '`notable` | where status_label="new" | table rule_name'):
+        sp._spl(spl)
+    for spl, word in {'index=main | ldapmodify dn=x': "ldapmodify",
+                      'index=main [| outputlookup x.csv]': "outputlookup",
+                      "index=main | eval x='a\"' | delete | eval y='\"'": "delete",
+                      'index=main | runshellscript x': "runshellscript",
+                      'index=main `evil` | stats count': "macro"}.items():
+        with pytest.raises(ValueError, match=word):
+            sp._spl(spl)
+    monkeypatch.setenv("SPLUNK_EXTRA_COMMANDS", "ldapsearch, collect")
+    monkeypatch.setenv("SPLUNK_ALLOW_MACROS", "sysmon")
+    sp = importlib.reload(sp)
+    sp._spl('| ldapsearch search="(cn=x)" | table cn')
+    sp._spl('index=main `sysmon` | stats count')
+    with pytest.raises(ValueError, match="collect"):
+        sp._spl("index=main | collect index=x")  # listed by the site, still a write
+    for var in ("SPLUNK_EXTRA_COMMANDS", "SPLUNK_ALLOW_MACROS"):
+        monkeypatch.delenv(var)
+    importlib.reload(sp)

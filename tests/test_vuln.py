@@ -252,3 +252,31 @@ def test_dashboard_shows_reports_and_approval_mode(tmp_path, monkeypatch):
         assert c.get("/api/plans/raw").status_code == 404
         h.gate_conversation("test")
         assert "every action" in c.get("/api/state").json()["gated"]
+
+
+def test_check_finds_hosts_however_they_are_written(kit):
+    """One-word names (dc01, localhost) and numbers the resolver reads as addresses (10.1, 167772161, 0x0a000001) are
+    hosts too: each must be listed in targets and be in scope. Paths after = or stuck to an option get the path check
+    (relative ones count from raw/, where the tool runs); config files and file: URLs are refused; plain option values
+    (ports, counts, script names) still pass."""
+    vt, _, _ = kit
+    names = {"dc01": ["10.0.0.20"], "localhost": ["127.0.0.1"], "0x0a000001": ["10.0.0.1"]}
+    vt.resolve = lambda h: names.get(h, [])
+    for args in (["-sT", "dc01"], ["-sT", "localhost"], ["-sT", "0x0a000001"], ["-sT", "10.1"], ["167772161"]):
+        assert any("not in targets" in p for p in vt.check("nmap", args, ["10.0.0.5"])), args
+    assert vt.check("nmap", ["-sT", "dc01"], ["dc01"]) == []  # listed, and its address is in scope
+    assert any("outside the authorized scope" in p for p in vt.check("nmap", ["localhost"], ["localhost"]))
+    assert vt.check("nmap", ["-sT", "-p", "22,80", "--top-ports", "100", "--script=default", "-T4", "--max-retries", "2",
+                             "10.0.0.5"], ["10.0.0.5"]) == []
+    cases = {
+        ("nmap", ("--script=/tmp/evil.nse", "10.0.0.5")): "path",
+        ("nmap", ("-oN/etc/cron.d/x", "10.0.0.5")): "path",
+        ("nmap", ("-oX", "../../../x.xml", "10.0.0.5")): "path",
+        ("curl", ("-K", "cfg", "http://10.0.0.5/")): "refused option",
+        ("curl", ("-sK", "cfg", "http://10.0.0.5/")): "refused option",
+        ("curl", ("--config=cfg", "http://10.0.0.5/")): "refused option",
+        ("curl", ("-o", "x.txt", "file:///etc/passwd")): "file: URLs",
+    }
+    for (tool, args), want in cases.items():
+        assert any(want in p for p in vt.check(tool, list(args), ["10.0.0.5"])), (tool, args)
+    assert vt.check("curl", ["-sk", "-o", "../page.html", "http://10.0.0.5/"], ["10.0.0.5"]) == []  # still the case folder
