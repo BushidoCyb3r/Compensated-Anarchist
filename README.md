@@ -159,8 +159,11 @@ single-page app (no CDNs, system fonts), so it works air-gapped, and nothing rel
   - Request bodies are capped before anything reads them: 16 KB for sign-in (the one request served before
     authentication) and 2 MB for everything else, so nobody can make the dashboard hold a huge request in memory.
   - A strict CSP: no inline script or style attributes, no framing, nothing loaded from outside.
-  - Binding beyond localhost requires TLS. `scripts/start.sh` makes a self-signed certificate for the host's
-    address, renews it before it expires, and prints its fingerprint to check against the browser warning.
+  - It listens on all interfaces (`0.0.0.0`, so browsers on other devices can connect) or on this host only
+    (`127.0.0.1`). Anything beyond localhost requires TLS: `scripts/start.sh` makes a self-signed certificate for
+    every address of the host, renews it before it expires or when the addresses change, and prints its
+    fingerprint to check against the browser warning. Other devices also need the host firewall to allow the
+    port (start warns when firewalld does not), or an SSH tunnel, which start prints the command for.
   - Agent, log and tool text is built into the page with DOM text nodes, never HTML, because adversaries
     control that data.
 

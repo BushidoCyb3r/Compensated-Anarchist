@@ -3,12 +3,13 @@
 #
 #   scripts/start.sh                                   # defaults: dashboard.serve in config/harness.yaml
 #   scripts/start.sh --case IR-0042 --posture respond  # pick the case / allow response actions
+#   scripts/start.sh --host 0.0.0.0                    # every interface: browsers on other devices too (HTTPS)
 #   scripts/start.sh --localhost                       # only this host's browser (http://127.0.0.1)
 #   scripts/start.sh --foreground                      # stay attached to this terminal (Ctrl+C stops it)
 #
 # The very first run builds the installation: it runs scripts/install.sh (Python environment, config files,
 # every folder) and asks you to create the dashboard account (username + password, stored as a salted hash).
-# Every run asks three questions - posture (observe/respond), address (main address or this host only) and
+# Every run asks three questions - posture (observe/respond), address (0.0.0.0 or 127.0.0.1) and
 # case - where Enter keeps your last choice (--yes skips them; options such as --posture skip one), then starts
 # a new session: a new access token, with nothing overwritten or deleted. The Settings page in the dashboard can
 # change the same three while it runs.

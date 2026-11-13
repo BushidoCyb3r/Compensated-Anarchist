@@ -290,7 +290,7 @@ def test_move_address_in_place_keeps_token(tmp_path, capsys):
         with httpx.Client(base_url=first["url"], timeout=10) as c:
             assert c.post("/api/login", json={"token": first["token"], "username": TEST_USER, "password": TEST_PASSWORD},
                           headers=H).status_code == 200
-            r = c.post("/api/settings/address", json={"address": "auto"}, headers=H)
+            r = c.post("/api/settings/address", json={"address": "0.0.0.0"}, headers=H)
             assert r.status_code == 200 and r.json()["url"] == f"https://{main}:{port}"
         moved = None
         for _ in range(120):
@@ -306,6 +306,86 @@ def test_move_address_in_place_keeps_token(tmp_path, capsys):
         with httpx.Client(base_url=moved["url"], timeout=10, verify=False) as c:
             assert c.post("/api/login", json={"token": first["token"], "username": TEST_USER, "password": TEST_PASSWORD},
                           headers=H).status_code == 200
-        assert service.saved_startup(cfg)["host"] == "auto"
+        assert service.saved_startup(cfg)["host"] == "0.0.0.0"
+        with httpx.Client(base_url=f"https://127.0.0.1:{port}", timeout=10, verify=False) as c:  # every interface
+            assert c.get("/api/public").status_code == 200
     finally:
         service.stop(cfg)
+
+
+# ---- where it listens: 0.0.0.0 or 127.0.0.1 -----------------------------------------------------------------
+def test_addresses_are_all_interfaces_or_this_host(tmp_path):
+    assert [service.normalize_host(v) for v in ("", "auto", "all", "0.0.0.0", "AUTO")] == ["0.0.0.0"] * 5
+    assert [service.normalize_host(v) for v in ("localhost", "127.0.0.1")] == ["127.0.0.1"] * 2
+    assert service.normalize_host("192.0.2.10") == "192.0.2.10"
+    with pytest.raises(ValueError, match="0.0.0.0"):
+        service.normalize_host("example.org")
+    p = install(tmp_path)
+    cfg = load_config(p)
+    service.save_startup(cfg, host="auto")  # what older versions saved
+    assert service.saved_startup(cfg)["host"] == "0.0.0.0" and service.settings(cfg, {})["host"] == "0.0.0.0"
+    assert service.settings(cfg, {"localhost": True})["host"] == "127.0.0.1"
+    answers = iter(["", "1", ""])
+    out = service.ask_startup(cfg, {}, ask=lambda prompt: next(answers))
+    assert out["host"] == "0.0.0.0" and service.saved_startup(cfg)["host"] == "0.0.0.0"
+    assert service.public_url("127.0.0.1", 8765) == "http://127.0.0.1:8765"
+    assert service.public_url("192.0.2.10", 8765) == "https://192.0.2.10:8765"
+    assert service.public_url("0.0.0.0", 8765) != "https://0.0.0.0:8765"  # never an address to browse to
+
+
+def test_certificate_names_every_address_when_listening_everywhere(tmp_path, monkeypatch):
+    if not shutil.which("openssl"):
+        pytest.skip("openssl not installed")
+    crt, key = tmp_path / "tls" / "d.crt", tmp_path / "tls" / "d.key"
+    monkeypatch.setattr(service, "host_addresses", lambda: ["192.0.2.10", "198.51.100.7"])
+    fp, renewed = service.ensure_cert(crt, key, "0.0.0.0")
+    san = service._out(["openssl", "x509", "-noout", "-ext", "subjectAltName", "-in", str(crt)])
+    assert renewed and all(f"IP Address:{a}" in san for a in ("192.0.2.10", "198.51.100.7", "127.0.0.1"))
+    assert service.ensure_cert(crt, key, "0.0.0.0") == (fp, False)  # the same addresses: kept
+    monkeypatch.setattr(service, "host_addresses", lambda: ["192.0.2.10", "198.51.100.7", "203.0.113.4"])
+    fp2, renewed2 = service.ensure_cert(crt, key, "0.0.0.0")  # a new address on the host: a new certificate
+    assert renewed2 and fp2 != fp
+    assert service.ensure_cert(crt, key, "192.0.2.10") == (fp2, False)  # one address it already names
+
+
+def test_port_check_binds_like_the_server():
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        port = busy.getsockname()[1]
+        assert service._port_busy("127.0.0.1", port) and service._port_busy("0.0.0.0", port)
+    assert not service._port_busy("0.0.0.0", port)
+
+
+FAKE_FIREWALL = """#!/bin/sh
+case "$1" in
+  --state) [ "$FW_STATE" = running ] && { echo running; exit 0; }; echo "not running"; exit 252 ;;
+  --get-active-zones) printf 'public (default)\n  interfaces: eth0\n' ;;
+  --zone=public) [ "$FW_FAIL" = 1 ] && exit 13; echo "$FW_PORTS" ;;
+esac
+"""
+
+
+def test_firewall_note_and_ssh_tunnel_hint(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fc = bin_dir / "firewall-cmd"
+    fc.write_text(FAKE_FIREWALL)
+    fc.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("FW_STATE", "running")
+    monkeypatch.setenv("FW_PORTS", "")
+    note = service.firewall_note(8765)
+    assert "zone public" in note and "--zone=public --add-port=8765/tcp" in note and "SSH tunnel" in note
+    for ports in ("8765/tcp", "8000-9000/tcp", "22/tcp 8765/tcp"):
+        monkeypatch.setenv("FW_PORTS", ports)
+        assert service.firewall_note(8765) == "", ports
+    monkeypatch.setenv("FW_PORTS", "8765/udp")
+    assert service.firewall_note(8765)
+    monkeypatch.setenv("FW_FAIL", "1")  # it cannot tell (no permission): no guess
+    assert service.firewall_note(8765) == ""
+    monkeypatch.setenv("FW_STATE", "stopped")
+    assert service.firewall_note(8765) == ""
+    local = service.tunnel_hint("127.0.0.1", 8765)
+    assert "ssh -L 8765:127.0.0.1:8765 " in local and "the sign-in link above" in local
+    assert "https://127.0.0.1:8765/login" in service.tunnel_hint("0.0.0.0", 8765)

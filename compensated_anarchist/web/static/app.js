@@ -2094,17 +2094,18 @@ function runSettings(info) {
         el("button", { type: "button", class: "btn btn-primary", onclick: () => { dlg.close(); go(); } }, "Switch to RESPOND")] });
   });
 
-  const local = now.address === "127.0.0.1";
-  const address = seg([["auto", `Main address ${info.main_address}`], ["127.0.0.1", "This host only"]], now.address, (v) => {
-    const url = v === "127.0.0.1" ? `http://127.0.0.1:${info.port}` : `https://${info.main_address}:${info.port}`;
+  const where = (a) => a === "127.0.0.1" ? "this host only" : a === "0.0.0.0" ? "all interfaces" : a;
+  const address = seg([["0.0.0.0", "All interfaces (0.0.0.0)"], ["127.0.0.1", "This host only (127.0.0.1)"]], now.address, (v) => {
     const remote = !["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);
+    // on every interface the address this browser already uses keeps working (127.0.0.1 too, e.g. through an SSH tunnel)
+    const url = v === "127.0.0.1" ? `http://127.0.0.1:${info.port}` : `https://${remote ? location.hostname : "127.0.0.1"}:${info.port}`;
     const dlg = openDialog({ title: "Move the dashboard?", sub: url, iconName: "globe",
       body: [el("p", { css: { margin: "0" }, text: `It restarts in place on ${url}. That takes 10-20 seconds while the connectors reconnect; a running operation must be stopped first.` }),
         el("p", { css: { margin: "0" }, text: "The access token from this start stays valid. Sign in again at the new address with it and your username and password." }),
         v === "127.0.0.1" && remote ? el("p", { class: "form-error", css: { margin: "0" }, text: `You are browsing from another computer (${location.hostname}). After the move only a browser on the host itself can reach the dashboard.` }) : null],
       foot: [el("span", { class: "note", text: "Recorded in the audit log." }), el("button", { type: "button", class: "btn", onclick: () => dlg.close() }, "Cancel"),
         el("button", { type: "button", class: "btn btn-primary", onclick: async () => {
-          try { const r = await api("/api/settings/address", { address: v }); dlg.close(); movingTo(r.url); }
+          try { const r = await api("/api/settings/address", { address: v }); dlg.close(); movingTo(v === "0.0.0.0" ? url : r.url); }
           catch (e) { toast(e.message, true); }
         } }, "Move it")] });
   }, busy || !info.can_move);
@@ -2132,11 +2133,11 @@ function runSettings(info) {
       el("div", {}, posture, el("div", { class: "muted small", css: { marginTop: "6px" }, text: "Observe: watch and investigate; response actions are refused. Respond: response actions are allowed, each with your approval. Applies at once." })),
       el("span", { class: "label", text: "Address" }),
       el("div", {}, address, el("div", { class: "muted small", css: { marginTop: "6px" },
-        text: !info.can_move ? "Started without scripts/start.sh: restart it with the address you want." : `Now ${now.url || (local ? "this host only" : "the main address")}. Moving restarts the dashboard in place; the access token stays the same.` })),
+        text: !info.can_move ? "Started without scripts/start.sh: restart it with the address you want." : `Now ${where(now.address)}${now.address === "0.0.0.0" && (info.addresses || []).length ? ` (${info.addresses.join(", ")})` : ""}. Moving restarts the dashboard in place; the access token stays the same.` })),
       el("label", { class: "label", for: "run-case", text: "Case" }),
       el("div", {}, el("div", { class: "path-row" }, pick, fresh, switchBtn),
         el("div", { class: "muted small", css: { marginTop: "6px" }, text: busy ? "Stop the running operation to switch case." : "The other case's files stay as they are. Connectors reconnect for a few seconds; you stay signed in." }))),
-    el("div", { class: "sec-foot" }, el("span", { class: "note", text: `Next start offers: ${info.defaults.posture.toUpperCase()} · ${info.defaults.address === "127.0.0.1" ? "this host only" : "main address"} · case ${info.defaults.case}` })));
+    el("div", { class: "sec-foot" }, el("span", { class: "note", text: `Next start offers: ${info.defaults.posture.toUpperCase()} · ${where(info.defaults.address)} · case ${info.defaults.case}` })));
 }
 function movingTo(url) {
   openDialog({ title: "Moving the dashboard", sub: url, iconName: "globe",

@@ -1,9 +1,12 @@
 """Start and stop the dashboard as a background service (scripts/start.sh, scripts/stop.sh).
 
 start: makes sure the sign-in account exists (asks for it on the first start), makes sure a TLS certificate exists
-for the address it serves on (self-signed, renewed before it expires or when the address changes), launches the
-dashboard detached from the terminal, waits until it is ready, and prints the sign-in link with this start's
-access token. Every start has a new token; the previous one stops working.
+for the addresses it serves on (self-signed, renewed before it expires or when this host's addresses change),
+launches the dashboard detached from the terminal, waits until it is ready, and prints the sign-in links with this
+start's access token. Every start has a new token; the previous one stops working.
+
+Where it listens: 0.0.0.0 (every interface: browsers on other devices can reach it, over HTTPS) or 127.0.0.1 (this
+host only, plain HTTP). A saved "auto" from older versions means 0.0.0.0.
 
 stop: stops the running dashboard cleanly (it finishes writing the audit log and chat history).
 
@@ -36,6 +39,20 @@ STOP_TIMEOUT_S = 30
 # ---- settings ----------------------------------------------------------------------------------------
 STARTUP_KEYS = ("host", "case", "posture")  # the start-up defaults the dashboard's Settings page can change
 CASE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+ALL, LOCAL = "0.0.0.0", "127.0.0.1"  # every interface (other devices can connect) | this host only
+
+
+def normalize_host(value: Any) -> str:
+    """The address to listen on: 0.0.0.0 (also "", auto and all) for every interface, 127.0.0.1 (also localhost) for
+    this host only, or one IP address of this host."""
+    v = str(value or "").strip().lower()
+    if v in ("", "auto", "all", ALL):
+        return ALL
+    if v in ("localhost", LOCAL):
+        return LOCAL
+    if _is_ip(v):
+        return v
+    raise ValueError("address: 0.0.0.0 (all interfaces), 127.0.0.1 (this host only) or an IP address of this host")
 
 
 def dashboard_settings_path(cfg: HarnessConfig) -> Path:
@@ -54,13 +71,10 @@ def saved_startup(cfg: HarnessConfig) -> dict[str, Any]:
 
 
 def validate_startup(values: dict[str, Any]) -> dict[str, str]:
-    """Clean start-up defaults from the Settings page: host auto | 127.0.0.1 | an IP address; case '' (the most
+    """Clean start-up defaults from the Settings page: host 0.0.0.0 | 127.0.0.1 | an IP address; case '' (the most
     recently used) or a case id; posture observe | respond."""
     out: dict[str, str] = {}
-    host = str(values.get("host", "auto")).strip() or "auto"
-    if host not in ("auto", "127.0.0.1") and not _is_ip(host):
-        raise ValueError("address: auto, 127.0.0.1 or an IP address of this host")
-    out["host"] = host
+    out["host"] = normalize_host(values.get("host", ALL))
     case = str(values.get("case", "")).strip()
     if case and not CASE_RE.match(case):
         raise ValueError("case: letters, digits, . _ - (up to 64), or empty for the most recently used case")
@@ -81,7 +95,7 @@ def save_startup(cfg: HarnessConfig, **values: str) -> None:
     except (OSError, json.JSONDecodeError):
         data = {}
     serve = data.get("serve") if isinstance(data.get("serve"), dict) else {}
-    data["serve"] = {**serve, **validate_startup({**{"host": "auto", "case": "", "posture": "observe"}, **serve, **values})}
+    data["serve"] = {**serve, **validate_startup({**{"host": ALL, "case": "", "posture": "observe"}, **serve, **values})}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -93,7 +107,7 @@ def save_startup(cfg: HarnessConfig, **values: str) -> None:
 def ask_startup(cfg: HarnessConfig, opts: dict[str, Any], ask=input) -> dict[str, Any]:
     """start.sh's questions: posture, address and case. Enter keeps the default (the last choice); an option given
     on the command line skips its question. The answers become the next start's defaults."""
-    cur = {"host": "auto", "case": "", "posture": "observe",
+    cur = {"host": ALL, "case": "", "posture": "observe",
            **{k: v for k, v in (((cfg.raw.get("dashboard") or {}).get("serve")) or {}).items() if k in STARTUP_KEYS and v},
            **{k: v for k, v in saved_startup(cfg).items() if v}}
     answers: dict[str, str] = {}
@@ -109,13 +123,16 @@ def ask_startup(cfg: HarnessConfig, opts: dict[str, Any], ask=input) -> dict[str
                 break
             print("    type observe or respond")
     if not (opts.get("host") or opts.get("localhost")):
-        main = primary_address()
-        d = "2" if cur["host"] == "127.0.0.1" else "1"
+        try:
+            d = "2" if normalize_host(cur["host"]) == LOCAL else "1"
+        except ValueError:
+            d = "1"
+        reach = ", ".join(host_addresses()) or "this host's addresses"
         while True:
-            a = ask(f"  Serve on: 1) the main address {main} (HTTPS, reachable from the network) or 2) this host only "
-                    f"(127.0.0.1) [{d}]: ").strip().lower() or d
-            if a in ("1", "2", "main", "network", "local", "localhost"):
-                answers["host"] = out["host"] = "127.0.0.1" if a in ("2", "local", "localhost") else "auto"
+            a = ask(f"  Serve on: 1) all interfaces, 0.0.0.0 (HTTPS; other devices reach it at {reach}) or 2) this host "
+                    f"only, 127.0.0.1 [{d}]: ").strip().lower() or d
+            if a in ("1", "2", "all", ALL, "network", "local", "localhost", LOCAL):
+                answers["host"] = out["host"] = LOCAL if a in ("2", "local", "localhost", LOCAL) else ALL
                 break
             print("    type 1 or 2")
     if not opts.get("case"):
@@ -143,9 +160,8 @@ def settings(cfg: HarnessConfig, opts: dict[str, Any]) -> dict[str, Any]:
     out = {k: opts.get(k) if opts.get(k) not in (None, "") else serve.get(k) for k in
            ("host", "port", "case", "posture", "model", "tls_cert", "tls_key")}
     if opts.get("localhost"):
-        out["host"] = "127.0.0.1"
-    host = str(out["host"] or "auto")
-    out["host"] = primary_address() if host == "auto" else host
+        out["host"] = LOCAL
+    out["host"] = normalize_host(out["host"])
     out["port"] = int(out["port"] or 8765)
     out["case"] = out["case"] or latest_case(cfg)
     out["posture"] = out["posture"] or "observe"
@@ -175,6 +191,23 @@ def primary_address() -> str:
         s.close()
 
 
+def host_addresses() -> list[str]:
+    """This host's own IPv4 addresses (loopback left out), the main one first: where other devices reach a dashboard
+    listening on 0.0.0.0, and the addresses its certificate must name."""
+    found: list[str] = []
+    if shutil.which("ip"):
+        for line in _out(["ip", "-o", "-4", "addr", "show", "scope", "global"]).splitlines():
+            parts = line.split()
+            if "inet" in parts[:-1]:
+                addr = parts[parts.index("inet") + 1].split("/")[0]
+                if _is_ip(addr) and not addr.startswith("127."):
+                    found.append(addr)
+    main = primary_address()
+    if not main.startswith("127."):
+        found.insert(0, main)
+    return list(dict.fromkeys(found))
+
+
 def latest_case(cfg: HarnessConfig) -> str:
     cases = [d for d in Path(cfg.cases_dir).glob("*") if d.is_dir() and not d.name.startswith(("_", "."))]
     return max(cases, key=lambda d: d.stat().st_mtime).name if cases else "CASE-0001"
@@ -184,28 +217,103 @@ def loopback(host: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
 
 
+def public_url(host: str, port: int) -> str:
+    """The address a browser uses for a dashboard listening on `host` (never 0.0.0.0, which is not an address to
+    browse to): this host's main address when it listens on every interface."""
+    if loopback(host):
+        return f"http://127.0.0.1:{port}"
+    shown = (host_addresses() or [LOCAL])[0] if host == ALL else host
+    return f"https://{f'[{shown}]' if ':' in shown else shown}:{port}"
+
+
+def firewall_note(port: int) -> str:
+    """A warning when firewalld runs and an active zone does not open the dashboard's port (other devices then cannot
+    connect), with the command that opens it; "" when the port is open, there is no firewalld, or it cannot tell."""
+    fc = shutil.which("firewall-cmd")
+    if not fc:
+        return ""
+
+    def run(*args: str) -> tuple[int, str]:
+        try:
+            r = subprocess.run([fc, *args], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return 1, ""
+        return r.returncode, r.stdout
+
+    code, state = run("--state")
+    if code != 0 or state.strip() != "running":
+        return ""
+    code, active = run("--get-active-zones")
+    zones = [ln.split()[0] for ln in active.splitlines() if ln.strip() and not ln.startswith((" ", "\t"))]
+    if code != 0 or not zones:
+        return ""
+    closed = []
+    for z in zones:
+        code, ports = run(f"--zone={z}", "--list-ports")
+        if code != 0:
+            return ""  # it would not say (permissions): no guess
+
+        def opens(entry: str) -> bool:
+            span, _, proto = entry.partition("/")
+            lo, _, hi = span.partition("-")
+            return proto == "tcp" and lo.isdigit() and int(lo) <= port <= int(hi or lo)
+        if not any(opens(e) for e in ports.split()):
+            closed.append(z)
+    if not closed:
+        return ""
+    zone = f" --zone={closed[0]}" if len(closed) == 1 else ""
+    return (f"the host firewall (firewalld, zone {', '.join(closed)}) does not open port {port}/tcp, so browsers on "
+            f"other devices cannot connect directly. Without changing the firewall, use the SSH tunnel below; or open "
+            f"the port: sudo firewall-cmd --permanent{zone} --add-port={port}/tcp && sudo firewall-cmd --reload")
+
+
+def tunnel_hint(host: str, port: int) -> str:
+    """How a browser on another device reaches the dashboard through SSH, with no firewall change (SSH is usually
+    allowed already): the tunnel ends at this host's 127.0.0.1, where the dashboard listens in either mode."""
+    import getpass
+
+    try:
+        user = getpass.getuser()
+    except (KeyError, OSError):
+        user = "<user>"
+    where = (host_addresses() or [socket.gethostname()])[0]
+    link = "the sign-in link above" if loopback(host) else f"https://127.0.0.1:{port}/login?token=<the token above>"
+    return (f"run  ssh -L {port}:127.0.0.1:{port} {user}@{where}  on that device, keep it open, and open {link} "
+            "there")
+
+
 # ---- TLS -------------------------------------------------------------------------------------------------
+def cert_names(host: str) -> list[str]:
+    """The names a dashboard listening on `host` is reached by: every address of this host for 0.0.0.0, else that
+    address; plus 127.0.0.1, the host name and localhost (a browser on the host)."""
+    addrs = host_addresses() if host == ALL else [host]
+    return list(dict.fromkeys([*(f"IP:{a}" if _is_ip(a) else f"DNS:{a}" for a in addrs), "IP:127.0.0.1",
+                               f"DNS:{socket.gethostname()}", "DNS:localhost"]))
+
+
 def ensure_cert(cert: Path, key: Path, host: str) -> tuple[str, bool]:
-    """A self-signed certificate valid for `host`; made or renewed when missing, expiring within 30 days, or made
-    for another address. Returns (SHA-256 fingerprint, renewed)."""
+    """A self-signed certificate valid for `host` (for 0.0.0.0: every address of this host); made or renewed when
+    missing, expiring within 30 days, or not naming an address it is now reached by. Returns (SHA-256 fingerprint,
+    renewed)."""
     if not shutil.which("openssl"):
         raise SystemExit("openssl is needed to create the dashboard's TLS certificate (or pass --localhost)")
+    alt = cert_names(host)
     fresh = cert.exists() and key.exists() and _ok(["openssl", "x509", "-checkend", str(30 * 86400), "-noout",
                                                     "-in", str(cert)])
     if fresh:
         san = _out(["openssl", "x509", "-noout", "-ext", "subjectAltName", "-in", str(cert)])
-        fresh = (f"IP Address:{host}" in san) or (f"DNS:{host}" in san)
+        have = {x.strip().replace("IP Address:", "IP:") for x in san.replace("\n", ",").split(",")}
+        fresh = all(a in have for a in alt if a.startswith("IP:") and a != "IP:127.0.0.1")
     if not fresh:
         cert.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(cert.parent, 0o700)
         name = socket.gethostname()
-        alt = [f"IP:{host}" if _is_ip(host) else f"DNS:{host}", "IP:127.0.0.1", f"DNS:{name}", "DNS:localhost"]
         old_umask = os.umask(0o077)
         try:
             r = subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
                                 "-nodes", "-days", "365", "-keyout", str(key), "-out", str(cert),
                                 "-subj", f"/CN=Compensated Anarchist ({name})",
-                                "-addext", "subjectAltName=" + ",".join(dict.fromkeys(alt)),
+                                "-addext", "subjectAltName=" + ",".join(alt),
                                 "-addext", "basicConstraints=critical,CA:FALSE",
                                 "-addext", "extendedKeyUsage=serverAuth"], capture_output=True, text=True)
         finally:
@@ -431,12 +539,16 @@ def start(cfg: HarnessConfig, config_path: str, opts: dict[str, Any]) -> int:
         return 1
     conn = state.get("connectors") or {}
     ok = sum(1 for v in conn.values() if str(v).startswith("connected"))
+    # listening on every interface: the other addresses work too, and so does 127.0.0.1 from this host
+    also = ([f"https://{a}:{s['port']}" for a in host_addresses()[1:]] + [f"https://127.0.0.1:{s['port']}"]
+            if s["host"] == ALL else [])
     print(f"""
   Compensated Anarchist is running (pid {proc.pid})
   Case {state['case']} · model {state['model']} · posture {str(state['posture']).upper()} · connectors {ok}/{len(conn)} connected
 
   Sign in:       {state['url']}/login?token={state['token']}
-  Access token:  {state['token']}
+""" + "".join(f"""                 {u}/login?token={state['token']}
+""" for u in also) + f"""  Access token:  {state['token']}
                  New at every start; the previous one no longer works. Keep it private.
   Then enter your username and password.
 """ + (f"""  Certificate:   self-signed. Your browser warns once; check this SHA-256 fingerprint matches:
@@ -444,6 +556,10 @@ def start(cfg: HarnessConfig, config_path: str, opts: dict[str, Any]) -> int:
 """ if fingerprint else "") + f"""
   Log: {log}     Stop: scripts/stop.sh
 """)
+    if s["host"] == ALL and (note := firewall_note(s["port"])):
+        print(f"  note: {note}")
+    if s["host"] in (ALL, LOCAL):
+        print(f"  From another device through SSH (no firewall change): {tunnel_hint(s['host'], s['port'])}")
     for name, v in conn.items():
         if not str(v).startswith("connected"):
             print(f"  note: connector {name}: {v}")
@@ -498,7 +614,13 @@ def _canarchist() -> str:
 
 
 def _port_busy(host: str, port: int) -> bool:
+    """True when something already listens where the dashboard would: tried by binding, as the server will (with
+    SO_REUSEADDR, so connections still closing from a previous run do not count). 0.0.0.0 overlaps every address."""
     fam = socket.AF_INET6 if ":" in host else socket.AF_INET
     with socket.socket(fam, socket.SOCK_STREAM) as s:
-        s.settimeout(0.5)
-        return s.connect_ex((host, port)) == 0
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+        except OSError:
+            return True
+    return False

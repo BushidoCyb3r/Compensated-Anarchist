@@ -240,16 +240,24 @@ class Dashboard:
 
     # ---- posture, address and case: live from the Settings page, and the next start's defaults --------
     def address_mode(self) -> str:
-        return "127.0.0.1" if self.bind.get("host") in ("127.0.0.1", "localhost", "::1") else "auto"
+        """Where it listens: 0.0.0.0 (every interface), 127.0.0.1 (this host only), or the one address it was given."""
+        host = str(self.bind.get("host") or "")
+        return service.LOCAL if service.loopback(host) else host or service.ALL
 
     def startup_info(self) -> dict[str, Any]:
         h = self.harness
         cases = sorted((d for d in Path(self.cfg.cases_dir).glob("*") if d.is_dir() and not d.name.startswith(("_", "."))),
                        key=lambda d: d.stat().st_mtime, reverse=True)
+        try:
+            default_address = service.normalize_host(service.saved_startup(self.cfg).get("host")
+                                                     or ((self.cfg.raw.get("dashboard") or {}).get("serve") or {}).get("host"))
+        except ValueError:
+            default_address = service.ALL
         return {"now": {"posture": h.roe.posture, "case": h.case.id, "address": self.address_mode(), "url": self.url},
-                "main_address": service.primary_address(), "port": self.bind.get("port"),
+                "main_address": service.primary_address(), "addresses": service.host_addresses(),
+                "port": self.bind.get("port"),
                 "defaults": {k: v for k, v in service.settings(self.cfg, {}).items() if k in ("case", "posture")}
-                | {"address": service.saved_startup(self.cfg).get("host", "auto")},
+                | {"address": default_address},
                 "cases": [d.name for d in cases[:300]], "can_move": bool(self.run_dir and self.bind),
                 "running": self.running()}
 
@@ -329,29 +337,30 @@ class Dashboard:
         self.emit("case_switched", {"case": case_id})
 
     def move_address(self, mode: str, user: str) -> str:
-        """Serve on the main network address ("auto") or this host only ("127.0.0.1"). The listening socket has to
+        """Listen on every interface ("0.0.0.0", HTTPS) or this host only ("127.0.0.1"). The listening socket has to
         change, so the dashboard restarts itself in place (same process and pid, same access token); browsers sign
         in again at the new address. Returns the new URL."""
-        if mode not in ("auto", "127.0.0.1"):
-            raise ValueError("address: auto (the main network address) or 127.0.0.1 (this host only)")
+        mode = {"auto": service.ALL}.get(str(mode).strip(), str(mode).strip())  # "auto": what older pages send
+        if mode not in (service.ALL, service.LOCAL):
+            raise ValueError("address: 0.0.0.0 (all interfaces) or 127.0.0.1 (this host only)")
         if not self.can_move():
             raise ValueError("this dashboard was not started with scripts/start.sh; restart it with the address you want")
         if self.running():
             raise ValueError("an operation is running - stop it first")
-        host = service.primary_address() if mode == "auto" else "127.0.0.1"
+        host = mode
         port = int(self.bind["port"])
         argv = [sys.argv[0], "--config", str(self.cfg.config_path), "dashboard", "--case", self.harness.case.id,
                 "--posture", self.harness.roe.posture, "--model", self.harness.model_name, "--host", host,
                 "--port", str(port), "--run-dir", str(self.run_dir)]
         if self.harness.conversation:
             argv += ["--conversation", self.harness.conversation["id"]]
-        if mode == "auto":
+        if mode == service.ALL:
             st = service.settings(self.cfg, {})
             service.ensure_cert(st["tls_cert"], st["tls_key"], host)
             argv += ["--tls-cert", str(st["tls_cert"]), "--tls-key", str(st["tls_key"])]
         self._remember(host=mode)
         self.harness.audit.record("address_changed", old=self.url, new_host=host, by=user)
-        url = f"{'http' if mode == '127.0.0.1' else 'https'}://{host}:{port}"
+        url = service.public_url(host, port)
         handoff = self.run_dir / "handoff.json"  # this start's token, for the same process after it re-executes
         fd = os.open(handoff, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -1365,7 +1374,8 @@ def serve(cfg: HarnessConfig, case_id: str, model: str | None, posture: str | No
     dash = Dashboard(cfg, case_id, model, posture, conversation_id=conversation_id, new_conversation=new_conversation,
                      account_path=acct, run_dir=Path(run_dir) if run_dir else None)
     scheme = "https" if tls_cert else "http"
-    shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    # 0.0.0.0 is where it listens, not an address to browse to: show this host's main address instead
+    shown = (service.host_addresses() or ["127.0.0.1"])[0] if host == "0.0.0.0" else "127.0.0.1" if host == "::" else host
     dash.url = f"{scheme}://{shown}:{port}"
     dash.bind = {"host": host, "port": port}
     # the token goes to a terminal only: in the background this output is run/dashboard.log, and scripts/start.sh

@@ -43,11 +43,20 @@ scripts/stop.sh             # stop
 - **Interactive starts ask three questions;** press Enter to keep the default shown, which is your last choice:
   - **Posture:** OBSERVE (watch and investigate; response actions are refused) or RESPOND (response actions
     allowed, each still approved by you).
-  - **Address:** the main address (this host's network address, over HTTPS with a self-signed certificate that
-    start makes, renews before it expires, and whose fingerprint it prints) or this host only (127.0.0.1).
+  - **Address:** all interfaces, `0.0.0.0` (browsers on other devices can connect, over HTTPS with a self-signed
+    certificate for every address of this host that start makes, renews before it expires or when the host's
+    addresses change, and whose fingerprint it prints) or this host only, `127.0.0.1` (plain HTTP). With
+    `0.0.0.0`, start prints a sign-in link for each of the host's addresses; `0.0.0.0` itself is not an address
+    to browse to.
+  - **Other devices** also need the host's firewall to let them in. When firewalld does not open the port, start
+    says so and prints the command that would. Without any firewall change, a browser on another device can come
+    in through SSH instead: start prints the `ssh -L 8765:127.0.0.1:8765 <user>@<host>` command to run on that
+    device, which works in either address mode. Running start with `sudo` does not help: the firewall stops the
+    connection before it reaches any program, and the dashboard must never run as root.
   - **Case:** an existing case, or a new case id.
 
-  An option skips its question (`--posture respond`, `--localhost`, `--case IR-0042`), and `--yes` skips them all.
+  An option skips its question (`--posture respond`, `--host 0.0.0.0` or `--localhost`, `--case IR-0042`), and
+  `--yes` skips them all.
   Without a terminal (cron, systemd) it uses the saved answers. Other options: `--port`, `--model`,
   `--foreground`.
 - **Change them while it runs** on the dashboard's Settings page, under "Posture, address and case":
@@ -271,21 +280,18 @@ optional forensic tools; section 5 covers vault hardening.
 
 ### Open the dashboard from the host
 
-Inside Linux, bind to the guest's LAN address:
+Inside Linux, listen on all of the guest's interfaces (the default address choice):
 
 ```bash
-scripts/start.sh --host 192.168.10.50 --port 8765 --case SETUP-CHECK
+scripts/start.sh --host 0.0.0.0 --port 8765 --case SETUP-CHECK
 ```
 
-On Windows, open the printed sign-in link, which starts with `https://192.168.10.50:8765/`. Compare the
-self-signed certificate's SHA-256 fingerprint with the one printed by the script before accepting it, then
-sign in with the current access token and your dashboard username/password. The host reaches the guest's
-LAN address directly.
-
-`--host 0.0.0.0` also listens on all guest IPv4 interfaces. Use the guest's actual IP in the browser and
-replace `0.0.0.0` in the printed sign-in link while keeping its token. Binding to the actual IP is preferable
-here because the script also uses the bind address when generating its certificate. `--localhost` binds
-only inside the guest and does not accept this direct host connection.
+On Windows, open the printed sign-in link for the guest's LAN address, which starts with
+`https://192.168.10.50:8765/`. Compare the self-signed certificate's SHA-256 fingerprint with the one printed by
+the script before accepting it, then sign in with the current access token and your dashboard username/password.
+The certificate names every address of the guest, so any printed link works, and it is renewed when the guest's
+addresses change. `--host 192.168.10.50` listens on that one address only. `--localhost` binds only inside the
+guest and does not accept this direct host connection (an SSH tunnel to the guest still reaches it).
 
 If the guest uses UFW, allow the Windows host's LAN address to reach the dashboard:
 

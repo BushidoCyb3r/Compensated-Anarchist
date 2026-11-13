@@ -164,13 +164,13 @@ dashboard:
   # scripts/start.sh defaults (its options override them). Start and stop never touch cases, conversations,
   # memory, skills or audit logs.
   serve:
-    host: auto               # auto = this host's main network address, over HTTPS; 127.0.0.1 = this host only
+    host: 0.0.0.0            # 0.0.0.0 = every interface, over HTTPS (other devices can connect); 127.0.0.1 = this host only
     port: 8765
     case: ""                 # "" = the most recently used case
     posture: observe         # start safe; `scripts/start.sh --posture respond` allows response actions
     model: ""                # "" = default_model in models.yaml (or CA_MODEL)
-    tls_cert: secrets/tls/dashboard.crt   # self-signed; made by start.sh, renewed before expiry or when the
-    tls_key: secrets/tls/dashboard.key    #   address changes
+    tls_cert: secrets/tls/dashboard.crt   # self-signed for every address of this host; made by start.sh, renewed
+    tls_key: secrets/tls/dashboard.key    #   before expiry or when the host's addresses change
     run_dir: ../run          # pid, log and the current token (mode 700, git-ignored)
   # Opening hunt plans (and hunt results / Navigator layers) from the dashboard in an editor.
   editors:

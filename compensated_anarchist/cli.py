@@ -663,9 +663,11 @@ def main(argv: list[str] | None = None) -> None:
     st.add_argument("--case", help="case id (default: dashboard.serve.case, else the most recently used case)")
     st.add_argument("--model", help="model profile (default: default_model in models.yaml / CA_MODEL)")
     st.add_argument("--posture", choices=["observe", "respond"], help="default: dashboard.serve.posture (observe)")
-    st.add_argument("--host", help="address to serve on (default: dashboard.serve.host; auto = this host's address)")
+    st.add_argument("--host", help="where to listen: 0.0.0.0 = every interface, other devices can connect (HTTPS); "
+                                   "127.0.0.1 = this host only (default: dashboard.serve.host, else 0.0.0.0)")
     st.add_argument("--port", type=int)
-    st.add_argument("--localhost", action="store_true", help="only this host's browser, plain http on 127.0.0.1")
+    st.add_argument("--localhost", action="store_true", help="only this host's browser, plain http on 127.0.0.1 "
+                                                             "(same as --host 127.0.0.1)")
     st.add_argument("--foreground", action="store_true", help="stay attached to this terminal (Ctrl+C stops it)")
     st.add_argument("-y", "--yes", action="store_true", help="do not ask; use the saved posture, address and case")
     sub.add_parser("stop", help="stop the dashboard (scripts/stop.sh); your data is untouched")
