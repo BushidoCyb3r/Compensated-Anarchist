@@ -2,7 +2,7 @@
   <img src="assets/crimson-anarchy-gauntlet-bomb.png" width="100%"
        alt="A black and red spiked gauntlet gripping a round bomb marked with an anarchy symbol">
 </p>
-<p align="center"><sub>Banner adapted from original artwork by John Rubio (@johnrubio). The artwork is his and is
+<p align="center"><sub>Banner adapted from original artwork by <a href="https://www.instagram.com/johnrubio/">John Rubio (@johnrubio)</a>. The artwork is his and is
 not covered by this project's license.</sub></p>
 
 # Compensated Anarchist
