@@ -50,7 +50,7 @@ and the expert team **writes, scores and revises its own skills** as it works.
 ## Quick start
 
 ```bash
-git clone https://github.com/BushidoCyb3r/compensatedanarchist.git
+git clone https://github.com/BushidoCyb3r/Compensated-Anarchist.git compensatedanarchist
 cd compensatedanarchist
 scripts/start.sh     # first run: builds everything (scripts/install.sh) and asks you to create the dashboard
                      # account; every run: asks posture / address / case (Enter keeps your last choice), then

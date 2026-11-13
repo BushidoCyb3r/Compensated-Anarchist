@@ -77,7 +77,7 @@ scripts/stop.sh             # stop
 **Install:** one script takes you from `git clone` to ready-to-configure. It is safe to re-run, and never
 overwrites your settings:
 ```bash
-git clone https://github.com/BushidoCyb3r/compensatedanarchist.git
+git clone https://github.com/BushidoCyb3r/Compensated-Anarchist.git compensatedanarchist
 cd compensatedanarchist
 ./scripts/install.sh               # --help for options; scripts/start.sh runs it for you on the first start
 ```
@@ -259,7 +259,7 @@ For the Ubuntu guest above:
 ```bash
 sudo apt update
 sudo apt install -y python3 python3-venv git openssl ca-certificates bubblewrap curl netcat-openbsd open-vm-tools
-git clone https://github.com/BushidoCyb3r/compensatedanarchist.git
+git clone https://github.com/BushidoCyb3r/Compensated-Anarchist.git compensatedanarchist
 cd compensatedanarchist
 ./scripts/install.sh
 ```

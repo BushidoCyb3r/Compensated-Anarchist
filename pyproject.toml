@@ -42,10 +42,10 @@ all = ["compensated-anarchist[anthropic,velociraptor,forensics]"]
 dev = ["pytest>=8,<10"]
 
 [project.urls]
-Homepage = "https://github.com/BushidoCyb3r/compensatedanarchist"
-Documentation = "https://github.com/BushidoCyb3r/compensatedanarchist/blob/main/SETUP.md"
-Issues = "https://github.com/BushidoCyb3r/compensatedanarchist/issues"
-Security = "https://github.com/BushidoCyb3r/compensatedanarchist/security/policy"
+Homepage = "https://github.com/BushidoCyb3r/Compensated-Anarchist"
+Documentation = "https://github.com/BushidoCyb3r/Compensated-Anarchist/blob/main/SETUP.md"
+Issues = "https://github.com/BushidoCyb3r/Compensated-Anarchist/issues"
+Security = "https://github.com/BushidoCyb3r/Compensated-Anarchist/security/policy"
 
 [project.scripts]
 canarchist = "compensated_anarchist.cli:main"
