@@ -37,7 +37,7 @@ STOP_TIMEOUT_S = 30
 
 
 # ---- settings ----------------------------------------------------------------------------------------
-STARTUP_KEYS = ("host", "case", "posture")  # the start-up defaults the dashboard's Settings page can change
+STARTUP_KEYS = ("host", "case", "posture", "firewall")  # start-up defaults (Settings changes the first three)
 CASE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ALL, LOCAL = "0.0.0.0", "127.0.0.1"  # every interface (other devices can connect) | this host only
 
@@ -83,6 +83,11 @@ def validate_startup(values: dict[str, Any]) -> dict[str, str]:
     if posture not in ("observe", "respond"):
         raise ValueError("posture: observe or respond")
     out["posture"] = posture
+    firewall = str(values.get("firewall", "")).strip()
+    if firewall not in ("", "open", "leave"):
+        raise ValueError("firewall: open or leave")
+    if firewall:
+        out["firewall"] = firewall  # open the dashboard's port in the firewall while it runs, or leave it as it is
     return out
 
 
@@ -226,32 +231,41 @@ def public_url(host: str, port: int) -> str:
     return f"https://{f'[{shown}]' if ':' in shown else shown}:{port}"
 
 
-def firewall_note(port: int) -> str:
-    """A warning when firewalld runs and an active zone does not open the dashboard's port (other devices then cannot
-    connect), with the command that opens it; "" when the port is open, there is no firewalld, or it cannot tell."""
+FIREWALL_STATE = "firewall.json"  # in run/: the port start opened in firewalld, so stop closes exactly that again
+
+
+def firewall_closed(port: int) -> list[str]:
+    """The active firewalld zones that do not open `port`/tcp, so browsers on other devices cannot connect. [] when
+    they all do, when firewalld is not running, or when it cannot tell (no permission): never a guess."""
     fc = shutil.which("firewall-cmd")
     if not fc:
-        return ""
+        return []
 
     def run(*args: str) -> tuple[int, str]:
-        try:
-            r = subprocess.run([fc, *args], capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            return 1, ""
-        return r.returncode, r.stdout
+        code, out = 1, ""
+        for attempt in range(3):  # firewalld's D-Bus replies are sometimes lost ("Did not receive a reply"): ask again
+            try:
+                r = subprocess.run([fc, *args], capture_output=True, text=True, timeout=10)
+                code, out = r.returncode, r.stdout
+            except (OSError, subprocess.TimeoutExpired):
+                code, out = 1, ""
+            if code == 0:
+                break
+            time.sleep(0.3)
+        return code, out
 
     code, state = run("--state")
     if code != 0 or state.strip() != "running":
-        return ""
+        return []
     code, active = run("--get-active-zones")
     zones = [ln.split()[0] for ln in active.splitlines() if ln.strip() and not ln.startswith((" ", "\t"))]
     if code != 0 or not zones:
-        return ""
+        return []
     closed = []
     for z in zones:
         code, ports = run(f"--zone={z}", "--list-ports")
         if code != 0:
-            return ""  # it would not say (permissions): no guess
+            return []  # it would not say (permissions): no guess
 
         def opens(entry: str) -> bool:
             span, _, proto = entry.partition("/")
@@ -259,12 +273,89 @@ def firewall_note(port: int) -> str:
             return proto == "tcp" and lo.isdigit() and int(lo) <= port <= int(hi or lo)
         if not any(opens(e) for e in ports.split()):
             closed.append(z)
+    return closed
+
+
+def firewall_note(port: int, closed: list[str] | None = None) -> str:
+    """A warning when the firewall keeps other devices out of the dashboard's port, with the ways in; "" when not."""
+    closed = firewall_closed(port) if closed is None else closed
     if not closed:
         return ""
-    zone = f" --zone={closed[0]}" if len(closed) == 1 else ""
     return (f"the host firewall (firewalld, zone {', '.join(closed)}) does not open port {port}/tcp, so browsers on "
-            f"other devices cannot connect directly. Without changing the firewall, use the SSH tunnel below; or open "
-            f"the port: sudo firewall-cmd --permanent{zone} --add-port={port}/tcp && sudo firewall-cmd --reload")
+            f"other devices cannot connect. Start with --open-firewall to open it while the dashboard runs (sudo "
+            f"asks for your password; stop closes it again), or use the SSH tunnel below.")
+
+
+def _sudo_firewall(args: list[str], interactive: bool) -> bool:
+    """firewall-cmd through sudo. Interactive, sudo may ask for the password on this terminal; otherwise it must not
+    ask (-n) and fails instead."""
+    sudo, fc = shutil.which("sudo"), shutil.which("firewall-cmd")
+    if not (sudo and fc):
+        return False
+    for _ in range(3):
+        try:
+            code = subprocess.run([sudo, *([] if interactive else ["-n"]), fc, *args], stdin=None if interactive else
+                                  subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=120).returncode
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if code in (0, 1):  # done, or sudo said no (a wrong password is not asked for again and again)
+            return code == 0
+        time.sleep(0.3)  # firewalld's D-Bus reply was lost: try again (sudo remembers the password meanwhile)
+    return False
+
+
+def open_firewall(rd: Path, port: int, zones: list[str], interactive: bool) -> str:
+    """Open `port`/tcp in these firewalld zones until stop closes it again. Runtime rules only: nothing permanent
+    changes, and a reboot or a firewalld reload closes them as well. Returns "" when it is open, else why not."""
+    opened = []
+    for z in zones:
+        if not _sudo_firewall([f"--zone={z}", f"--add-port={port}/tcp"], interactive):
+            break
+        opened.append(z)
+    if opened:  # remembered even when only part of it worked, so stop closes what was opened
+        fd = os.open(rd / FIREWALL_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"port": port, "zones": opened}, fh)
+    if len(opened) == len(zones):
+        return ""
+    return ("sudo did not open it" + ("" if interactive else " (no terminal to ask for the password)")
+            + f"; zone {zones[len(opened)]} still blocks port {port}/tcp")
+
+
+def close_firewall(rd: Path, interactive: bool) -> str:
+    """Close what open_firewall opened (stop calls it). Returns what was done, or how to finish it by hand."""
+    f = rd / FIREWALL_STATE
+    try:
+        st = json.loads(f.read_text(encoding="utf-8"))
+        port, zones = int(st["port"]), [str(z) for z in st["zones"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return ""
+    left = [z for z in zones if not _sudo_firewall([f"--zone={z}", f"--remove-port={port}/tcp"], interactive)]
+    if not left:
+        f.unlink(missing_ok=True)
+        return f"Closed port {port}/tcp in the firewall again."
+    return (f"Port {port}/tcp is still open in the firewall (zone {', '.join(left)}) until a reboot or a firewalld "
+            f"reload. Close it now with: sudo firewall-cmd --zone={left[0]} --remove-port={port}/tcp")
+
+
+def want_firewall(cfg: HarnessConfig, port: int, zones: list[str], opts: dict[str, Any], ask=input,
+                  interactive: bool = True) -> bool:
+    """Whether this start opens the port: --open-firewall / --no-open-firewall, else the question (Enter keeps the
+    last answer), else the last answer. The answer is remembered for the next start."""
+    if opts.get("open_firewall") is not None:
+        return bool(opts["open_firewall"])
+    saved = saved_startup(cfg).get("firewall", "")
+    if not interactive or opts.get("yes"):
+        return saved == "open"
+    d = "n" if saved == "leave" else "y"
+    while True:
+        a = ask(f"  Other devices cannot reach port {port}: the firewall (firewalld, zone {', '.join(zones)}) blocks it.\n"
+                f"  Open it while the dashboard runs? sudo asks for your password; stop closes it again and nothing "
+                f"permanent changes [{d}]: ").strip().lower() or d
+        if a in ("y", "yes", "n", "no"):
+            save_startup(cfg, firewall="open" if a.startswith("y") else "leave")
+            return a.startswith("y")
+        print("    type y or n")
 
 
 def tunnel_hint(host: str, port: int) -> str:
@@ -504,6 +595,14 @@ def start(cfg: HarnessConfig, config_path: str, opts: dict[str, Any]) -> int:
     rd.mkdir(parents=True, exist_ok=True)
     os.chmod(rd, 0o700)
     (rd / "dashboard.json").unlink(missing_ok=True)
+    # listening on every interface while the firewall keeps other devices out: open the port for this run, if wanted
+    closed = firewall_closed(s["port"]) if s["host"] == ALL else []
+    fw_opened, fw_note = False, firewall_note(s["port"], closed)
+    if closed and want_firewall(cfg, s["port"], closed, opts, interactive=sys.stdin.isatty()):
+        print(f"Opening port {s['port']}/tcp in the firewall while it runs (sudo may ask for your password)...", flush=True)
+        why = open_firewall(rd, s["port"], closed, interactive=sys.stdin.isatty())
+        fw_opened = not why
+        fw_note = (f"could not open the firewall: {why}. {firewall_note(s['port'], closed)}" if why else "")
     env = {k: v for k, v in os.environ.items() if k != "CA_DASHBOARD_TOKEN"}
     if opts.get("foreground"):
         os.execve(argv[0], argv, env)  # serve() prints the link and token; Ctrl+C stops it
@@ -524,6 +623,8 @@ def start(cfg: HarnessConfig, config_path: str, opts: dict[str, Any]) -> int:
             tail = log.read_text(errors="replace").strip().splitlines()[-15:]
             print("It stopped during start-up. Last lines of run/dashboard.log:\n  " + "\n  ".join(tail))
             (rd / "dashboard.pid").unlink(missing_ok=True)
+            if closed_again := close_firewall(rd, interactive=sys.stdin.isatty()):
+                print(closed_again)
             return 1
         try:
             st = json.loads((rd / "dashboard.json").read_text())
@@ -556,9 +657,11 @@ def start(cfg: HarnessConfig, config_path: str, opts: dict[str, Any]) -> int:
 """ if fingerprint else "") + f"""
   Log: {log}     Stop: scripts/stop.sh
 """)
-    if s["host"] == ALL and (note := firewall_note(s["port"])):
-        print(f"  note: {note}")
-    if s["host"] in (ALL, LOCAL):
+    if fw_opened:
+        print(f"  Firewall:      port {s['port']}/tcp is open while it runs (scripts/stop.sh closes it again)")
+    if fw_note:
+        print(f"  note: {fw_note}")
+    if s["host"] == LOCAL or fw_note:  # other devices cannot connect directly: the way in that needs no change
         print(f"  From another device through SSH (no firewall change): {tunnel_hint(s['host'], s['port'])}")
     for name, v in conn.items():
         if not str(v).startswith("connected"):
@@ -582,6 +685,8 @@ def stop(cfg: HarnessConfig) -> int:
         print("Compensated Anarchist is not running.")
         (rd / "dashboard.pid").unlink(missing_ok=True)
         (rd / "dashboard.json").unlink(missing_ok=True)
+        if closed := close_firewall(rd, interactive=sys.stdin.isatty()):  # e.g. after a --foreground run
+            print(closed)
         return 0
     for p in pids:
         try:
@@ -605,6 +710,8 @@ def stop(cfg: HarnessConfig) -> int:
     print(f"Stopped Compensated Anarchist (pid {', '.join(map(str, pids))})"
           + (f"; had to force pid {', '.join(map(str, forced))}" if forced else "")
           + ". Your cases, conversations, memory, skills and audit logs are untouched.")
+    if closed := close_firewall(rd, interactive=sys.stdin.isatty()):
+        print(closed)
     return 0
 
 

@@ -361,22 +361,37 @@ FAKE_FIREWALL = """#!/bin/sh
 case "$1" in
   --state) [ "$FW_STATE" = running ] && { echo running; exit 0; }; echo "not running"; exit 252 ;;
   --get-active-zones) printf 'public (default)\n  interfaces: eth0\n' ;;
-  --zone=public) [ "$FW_FAIL" = 1 ] && exit 13; echo "$FW_PORTS" ;;
+  --zone=public)
+    case "$2" in
+      --add-port=*|--remove-port=*) echo "$*" >> "$FW_LOG"; exit "${FW_DENY:-0}" ;;
+    esac
+    [ "$FW_FAIL" = 1 ] && exit 13; echo "$FW_PORTS" ;;
 esac
+"""
+FAKE_SUDO = """#!/bin/sh
+[ "$1" = "-n" ] && shift
+exec "$@"
 """
 
 
-def test_firewall_note_and_ssh_tunnel_hint(tmp_path, monkeypatch):
+def fake_firewall(tmp_path, monkeypatch):
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    fc = bin_dir / "firewall-cmd"
-    fc.write_text(FAKE_FIREWALL)
-    fc.chmod(0o755)
+    bin_dir.mkdir(exist_ok=True)
+    for name, body in (("firewall-cmd", FAKE_FIREWALL), ("sudo", FAKE_SUDO)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
     monkeypatch.setenv("FW_STATE", "running")
     monkeypatch.setenv("FW_PORTS", "")
+    monkeypatch.setenv("FW_LOG", str(tmp_path / "fw.log"))
+    return tmp_path / "fw.log"
+
+
+def test_firewall_note_and_ssh_tunnel_hint(tmp_path, monkeypatch):
+    fake_firewall(tmp_path, monkeypatch)
+    assert service.firewall_closed(8765) == ["public"]
     note = service.firewall_note(8765)
-    assert "zone public" in note and "--zone=public --add-port=8765/tcp" in note and "SSH tunnel" in note
+    assert "zone public" in note and "--open-firewall" in note and "SSH tunnel" in note
     for ports in ("8765/tcp", "8000-9000/tcp", "22/tcp 8765/tcp"):
         monkeypatch.setenv("FW_PORTS", ports)
         assert service.firewall_note(8765) == "", ports
@@ -389,3 +404,44 @@ def test_firewall_note_and_ssh_tunnel_hint(tmp_path, monkeypatch):
     local = service.tunnel_hint("127.0.0.1", 8765)
     assert "ssh -L 8765:127.0.0.1:8765 " in local and "the sign-in link above" in local
     assert "https://127.0.0.1:8765/login" in service.tunnel_hint("0.0.0.0", 8765)
+
+
+def test_start_opens_the_port_while_it_runs_and_stop_closes_it(tmp_path, monkeypatch):
+    log = fake_firewall(tmp_path, monkeypatch)
+    rd = tmp_path / "run"
+    rd.mkdir()
+    assert service.open_firewall(rd, 8765, ["public"], interactive=False) == ""
+    state = rd / service.FIREWALL_STATE
+    assert json.loads(state.read_text()) == {"port": 8765, "zones": ["public"]}
+    assert stat.S_IMODE(state.stat().st_mode) == 0o600
+    assert log.read_text().splitlines() == ["--zone=public --add-port=8765/tcp"]  # runtime only: no --permanent
+    assert service.close_firewall(rd, interactive=False) == "Closed port 8765/tcp in the firewall again."
+    assert not state.exists() and log.read_text().splitlines()[-1] == "--zone=public --remove-port=8765/tcp"
+    assert service.close_firewall(rd, interactive=False) == ""  # nothing it opened: nothing to close
+    monkeypatch.setenv("FW_DENY", "1")  # sudo refused (no password without a terminal)
+    why = service.open_firewall(rd, 8765, ["public"], interactive=False)
+    assert "zone public still blocks port 8765/tcp" in why and not state.exists()
+    monkeypatch.delenv("FW_DENY")
+    service.open_firewall(rd, 8765, ["public"], interactive=False)
+    monkeypatch.setenv("FW_DENY", "1")
+    left = service.close_firewall(rd, interactive=False)
+    assert "still open" in left and "sudo firewall-cmd --zone=public --remove-port=8765/tcp" in left and state.exists()
+
+
+def test_the_firewall_question_and_its_flags(tmp_path):
+    cfg = load_config(install(tmp_path))
+    assert service.want_firewall(cfg, 8765, ["public"], {"open_firewall": True}) is True
+    assert service.want_firewall(cfg, 8765, ["public"], {"open_firewall": False}) is False
+    assert service.want_firewall(cfg, 8765, ["public"], {}, interactive=False) is False  # never asked: leave it
+    prompts = []
+    assert service.want_firewall(cfg, 8765, ["public"], {}, ask=lambda p: prompts.append(p) or "") is True  # Enter: yes
+    assert "[y]" in prompts[0] and "zone public" in prompts[0] and service.saved_startup(cfg)["firewall"] == "open"
+    assert service.want_firewall(cfg, 8765, ["public"], {"yes": True}) is True  # --yes: the last answer
+    answers = iter(["maybe", "n"])
+    assert service.want_firewall(cfg, 8765, ["public"], {}, ask=lambda p: next(answers)) is False
+    assert service.saved_startup(cfg)["firewall"] == "leave"
+    prompts.clear()
+    assert service.want_firewall(cfg, 8765, ["public"], {}, ask=lambda p: prompts.append(p) or "") is False
+    assert "[n]" in prompts[0]  # Enter keeps the last answer
+    with pytest.raises(ValueError):
+        service.save_startup(cfg, firewall="sometimes")

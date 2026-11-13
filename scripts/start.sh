@@ -4,6 +4,7 @@
 #   scripts/start.sh                                   # defaults: dashboard.serve in config/harness.yaml
 #   scripts/start.sh --case IR-0042 --posture respond  # pick the case / allow response actions
 #   scripts/start.sh --host 0.0.0.0                    # every interface: browsers on other devices too (HTTPS)
+#   scripts/start.sh --open-firewall                   # and open the port in firewalld while it runs (sudo)
 #   scripts/start.sh --localhost                       # only this host's browser (http://127.0.0.1)
 #   scripts/start.sh --foreground                      # stay attached to this terminal (Ctrl+C stops it)
 #

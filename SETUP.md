@@ -48,15 +48,17 @@ scripts/stop.sh             # stop
     addresses change, and whose fingerprint it prints) or this host only, `127.0.0.1` (plain HTTP). With
     `0.0.0.0`, start prints a sign-in link for each of the host's addresses; `0.0.0.0` itself is not an address
     to browse to.
-  - **Other devices** also need the host's firewall to let them in. When firewalld does not open the port, start
-    says so and prints the command that would. Without any firewall change, a browser on another device can come
-    in through SSH instead: start prints the `ssh -L 8765:127.0.0.1:8765 <user>@<host>` command to run on that
-    device, which works in either address mode. Running start with `sudo` does not help: the firewall stops the
-    connection before it reaches any program, and the dashboard must never run as root.
+  - **Firewall** (asked only with `0.0.0.0`, when firewalld keeps other devices out of the port): open the port
+    while the dashboard runs? sudo asks for your password once; the rule is a runtime rule only, so nothing
+    permanent changes, `scripts/stop.sh` closes it again, and a reboot or a firewalld reload closes it too. Your
+    answer is remembered; `--open-firewall` / `--no-open-firewall` skip the question. Say no, and start prints the
+    `ssh -L 8765:127.0.0.1:8765 <user>@<host>` command that reaches the dashboard from another device through SSH
+    instead. Running start itself with `sudo` does not help: the firewall stops the connection before it reaches
+    any program, and the dashboard must never run as root.
   - **Case:** an existing case, or a new case id.
 
-  An option skips its question (`--posture respond`, `--host 0.0.0.0` or `--localhost`, `--case IR-0042`), and
-  `--yes` skips them all.
+  An option skips its question (`--posture respond`, `--host 0.0.0.0` or `--localhost`, `--case IR-0042`,
+  `--open-firewall`), and `--yes` skips them all (using your saved answers).
   Without a terminal (cron, systemd) it uses the saved answers. Other options: `--port`, `--model`,
   `--foreground`.
 - **Change them while it runs** on the dashboard's Settings page, under "Posture, address and case":

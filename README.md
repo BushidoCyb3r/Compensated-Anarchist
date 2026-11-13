@@ -162,8 +162,9 @@ single-page app (no CDNs, system fonts), so it works air-gapped, and nothing rel
   - It listens on all interfaces (`0.0.0.0`, so browsers on other devices can connect) or on this host only
     (`127.0.0.1`). Anything beyond localhost requires TLS: `scripts/start.sh` makes a self-signed certificate for
     every address of the host, renews it before it expires or when the addresses change, and prints its
-    fingerprint to check against the browser warning. Other devices also need the host firewall to allow the
-    port (start warns when firewalld does not), or an SSH tunnel, which start prints the command for.
+    fingerprint to check against the browser warning. Other devices also need the host firewall to let them in:
+    when firewalld blocks the port, start offers to open it while the dashboard runs (sudo, a runtime rule that
+    stop removes again), or prints the SSH tunnel command that needs no firewall change.
   - Agent, log and tool text is built into the page with DOM text nodes, never HTML, because adversaries
     control that data.
 

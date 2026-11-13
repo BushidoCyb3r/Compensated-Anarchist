@@ -669,6 +669,11 @@ def main(argv: list[str] | None = None) -> None:
     st.add_argument("--localhost", action="store_true", help="only this host's browser, plain http on 127.0.0.1 "
                                                              "(same as --host 127.0.0.1)")
     st.add_argument("--foreground", action="store_true", help="stay attached to this terminal (Ctrl+C stops it)")
+    fw = st.add_mutually_exclusive_group()
+    fw.add_argument("--open-firewall", dest="open_firewall", action="store_true", default=None,
+                    help="when firewalld blocks other devices, open the port while it runs (sudo; stop closes it)")
+    fw.add_argument("--no-open-firewall", dest="open_firewall", action="store_false", default=None,
+                    help="leave the firewall as it is (other devices may not reach it)")
     st.add_argument("-y", "--yes", action="store_true", help="do not ask; use the saved posture, address and case")
     sub.add_parser("stop", help="stop the dashboard (scripts/stop.sh); your data is untouched")
     sub.add_parser("setup", help="create any missing folders and site config files (never overwrites anything)")
@@ -747,7 +752,7 @@ def main(argv: list[str] | None = None) -> None:
             if args.cmd == "stop":
                 sys.exit(service.stop(cfg))
             sys.exit(service.start(cfg, cfg_path, {k: getattr(args, k) for k in (
-                "case", "model", "posture", "host", "port", "localhost", "foreground", "yes")}))
+                "case", "model", "posture", "host", "port", "localhost", "foreground", "yes", "open_firewall")}))
         except (KeyboardInterrupt, EOFError):
             print("\nCancelled.")
             sys.exit(1)
