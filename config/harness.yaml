@@ -307,6 +307,6 @@ forensics:
     volatility: vol
     log2timeline: log2timeline.py
     psort: psort.py
-  allowed_binaries:    # what local_run may execute (argv only, no shell)
-    [fls, icat, ils, mmls, fsstat, istat, tsk_recover, mactime, bulk_extractor, exiftool, ssdeep, sha256sum,
+  allowed_binaries:    # what local_run may execute (argv only, no shell). Never exiftool: use local_exiftool
+    [fls, icat, ils, mmls, fsstat, istat, tsk_recover, mactime, bulk_extractor, ssdeep, sha256sum,
      evtxexport, regripper, rip.pl, densityscout, pescan, olevba, oledump.py, pdfid.py, pdf-parser.py, floss, diec]

@@ -158,3 +158,54 @@ assert a[a.index('-t') + 1] == 'fs'
     out = json.loads(asyncio.run(f.leapp("android", str(ev / "android"))))
     assert out["artifacts"][0]["artifact"] == "Chrome History" and out["artifacts"][0]["rows"] == 1
     assert "not configured" in asyncio.run(f.leapp("ios", str(ev / "android")))
+
+
+ECHO = "import os, sys, json; print(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd()}))\n"
+
+
+def test_volatility_runs_in_its_output_folder_and_keeps_its_own_options(fx):
+    """Volatility runs in a new folder in the case artifacts (-o and working directory): --dump output never lands in
+    the dashboard's working directory, and relative paths in plugin_args count from that folder. Its own options
+    (--plugin-dirs loads Python plugins; --log and --output-dir write files; --file swaps the image), any prefix of
+    them, and short options are refused. A refused call leaves no folder behind."""
+    f, ev, fake_bin, tmp = fx
+    script(fake_bin / "vol", ECHO)
+    img = ev / "mem.raw"
+    img.write_bytes(b"\0" * 16)
+    (tmp / "secret.txt").write_text("not evidence")
+    for bad in (["--plugin-dirs=/tmp"], ["--plug=x"], ["-p", "x"], ["--output-dir=x"], ["--log=x"], ["--file=x"],
+                ["--conf"], ["--"]):
+        out = asyncio.run(f.volatility(str(img), "windows.pslist", bad))
+        assert out.startswith("ERROR: rejected plugin argument"), (bad, out)
+    up = "../" * (len(f.case.artifacts.resolve().relative_to(tmp.resolve()).parts) + 1)  # run folder -> tmp
+    with pytest.raises(PermissionError):
+        asyncio.run(f.volatility(str(img), "windows.pslist", ["--yara-file=" + up + "secret.txt"]))
+    text = asyncio.run(f.volatility(str(img), "windows.pslist", ["--pid=4", "--dump"]))
+    ran = json.loads(text.split("\n", 1)[1])
+    run_dir = Path(ran["cwd"])
+    assert run_dir.parent == f.case.artifacts.resolve() and run_dir.name.startswith("vol_windows.pslist_")
+    assert ran["argv"][:2] == ["-q", "-o"] and Path(ran["argv"][2]).resolve() == run_dir
+    assert ran["argv"][-2:] == ["--pid=4", "--dump"] and (run_dir / "output.txt").exists()
+    assert [p.name for p in f.case.artifacts.glob("vol_*")] == [run_dir.name]
+
+
+def test_ez_tool_runs_in_its_output_folder(fx):
+    """A Zimmerman tool runs in its output folder, so '..' in extra_args means the case artifacts, not the folder
+    above the dashboard's working directory. Paths and RECmd batch files outside the jail are refused."""
+    f, ev, fake_bin, tmp = fx
+    script(fake_bin / "PECmd", ECHO)
+    script(fake_bin / "RECmd", ECHO)
+    pf = ev / "Prefetch"
+    pf.mkdir()
+    out = json.loads(asyncio.run(f.ez_tool("PECmd", str(pf), ["-d", ".."])))
+    ran = json.loads(out["log_tail"])
+    assert Path(ran["cwd"]) == Path(out["output_dir"]).resolve() and ran["argv"][-2:] == ["-d", ".."]
+    with pytest.raises(PermissionError):
+        asyncio.run(f.ez_tool("PECmd", str(pf), ["/etc"]))
+    hive = ev / "SYSTEM"
+    hive.write_bytes(b"regf")
+    (tmp / "outside.reb").write_text("Description: test\n")
+    assert asyncio.run(f.ez_tool("RECmd", str(hive), batch_file=str(tmp / "outside.reb"))).startswith("ERROR: batch_file")
+    (ev / "inside.reb").write_text("Description: test\n")
+    ok = json.loads(asyncio.run(f.ez_tool("RECmd", str(hive), batch_file=str(ev / "inside.reb"))))
+    assert str((ev / "inside.reb").resolve()) in json.loads(ok["log_tail"])["argv"]

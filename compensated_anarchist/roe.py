@@ -15,7 +15,9 @@ Resolution order for a call:
      (GATE_ALL_EXPERTS / GATE_ALL_PLAYBOOKS) every call by the gated agent or in the gated conversation is `approve`.
   1. posture: in "observe" posture anything above `notify` is denied (except rules with `observe: ask`, and
      read-only calls that only need approval because of the gate-everything floor).
-  2. first matching rule in roe.yaml (tool glob + optional argument globs).
+  2. rules in roe.yaml (tool glob + optional argument globs): a `deny` rule wins wherever it sits in the file,
+     so a broader auto/notify/approve rule above it (misp__*) can never let through what it denies
+     (*__delete*); among the other rules the first match wins.
   3. MCP tool annotations, only for servers listed in trust_annotations_from.
   4. default_tier.
   Then for active tiers (notify/approve) the scope check runs:
@@ -196,14 +198,15 @@ class RoeGate:
         return tier, why
 
     def _rule(self, tool: str, arguments: dict[str, Any]) -> Rule | None:
-        return next((r for r in self.rules if r.matches(tool, arguments)), None)
+        """The rule that decides this call: any matching deny rule, else the first matching rule."""
+        matching = [r for r in self.rules if r.matches(tool, arguments)]
+        return next((r for r in matching if r.tier == "deny"), matching[0] if matching else None)
 
     def _classify(
         self, tool: str, arguments: dict[str, Any], annotations: dict[str, Any] | None = None, server: str = ""
     ) -> tuple[str, str]:
-        for r in self.rules:
-            if r.matches(tool, arguments):
-                return r.tier, f"rule '{r.match}'" + (f" ({r.note})" if r.note else "")
+        if r := self._rule(tool, arguments):
+            return r.tier, f"rule '{r.match}'" + (f" ({r.note})" if r.note else "")
         if annotations and server in self.trust_annotations_from:
             if annotations.get("destructive_hint"):
                 return "approve", f"annotation destructive_hint from trusted server {server}"

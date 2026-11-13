@@ -4,9 +4,11 @@ unresolvable targets fail closed; protected-asset aliases escalate to approval."
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -197,3 +199,79 @@ def test_roe_drift_is_reported(tmp_path):
                                               {"match": "local_run", "tier": "approve"}]}))
     assert missing_shipped_rules(site, shipped) == [] and drift_note(site, shipped) == ""
     assert missing_shipped_rules(shipped, shipped) == []  # running on the shipped file itself
+
+
+def test_deny_rules_win_wherever_they_sit(tmp_path):
+    """The first matching rule decides auto/notify/approve, but a deny rule cannot be shadowed by a broader rule above
+    it: the shipped *__delete* sits last, under misp__*, opencti__*, archer__* and the SIEM rules (all auto), and
+    still denies their delete tools."""
+    g = gate(tmp_path, [])
+    for tool in ("misp__delete_event", "opencti__delete_entity", "archer__delete_finding", "splunk__delete_index",
+                 "elastic__delete_by_query", "security_onion__delete_case"):
+        assert g.classify(tool, {})[0] == "deny", tool
+    assert g.classify("misp__search_ioc", {})[0] == "auto" and g.classify("opencti__lookup_ioc", {})[0] == "auto"
+    d = asyncio.run(g.authorize("misp__delete_event", {}, "", "intel_analyst"))
+    assert not d.allowed and "*__delete*" in d.reason
+    # any ROE file: a deny below a broader allow still wins, and the other rules keep their order
+    (tmp_path / "site.yaml").write_text(yaml.safe_dump({"rules": [
+        {"match": "x__*", "tier": "auto"}, {"match": "x__b*", "tier": "approve"}, {"match": "x__bad", "tier": "deny"}]}))
+    site = RoeGate(tmp_path / "site.yaml", AuditLog(tmp_path / "s.jsonl", "t"), None)
+    assert site.classify("x__bad", {})[0] == "deny" and site.classify("x__big", {})[0] == "auto"
+
+
+def _fake_bin(tmp_path, monkeypatch, name, script):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    exe = bin_dir / name
+    exe.write_text(script)
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    return exe
+
+
+def test_local_run_never_runs_exiftool(monkeypatch, tmp_path):
+    """exiftool's -if and -p evaluate Perl and -config loads a Perl file, so local_run refuses it even when a site
+    allowlists it, or allowlists a link to it under another name. local_exiftool reads metadata instead, and the
+    shipped ROE no longer lists it with the notify-tier read-only tools."""
+    from compensated_anarchist.case import Case
+    from compensated_anarchist.tools.forensics import Forensics
+
+    marker = tmp_path / "ran"
+    real = _fake_bin(tmp_path, monkeypatch, "exiftool", f"#!/bin/sh\ntouch {marker}\n")
+    (real.parent / "meta").symlink_to(real)
+    (tmp_path / "evidence").mkdir()
+    f = Forensics({"allowed_binaries": ["exiftool", "meta"]}, [tmp_path / "evidence"], Case(tmp_path / "cases", "EXIF-1"))
+    for binary in ("exiftool", "meta"):
+        out = asyncio.run(f.run(binary, ["-if", "1", "x"]))
+        assert out.startswith("ERROR: local_run never runs") and "local_exiftool" in out, out
+    assert not marker.exists()
+    assert gate(tmp_path, []).classify("local_run", {"binary": "exiftool", "args": []})[0] == "approve"
+
+
+def test_local_run_keeps_argument_paths_in_the_jail(monkeypatch, tmp_path):
+    """Paths in local_run arguments are checked however they are written: absolute, relative to the working directory
+    (the case artifacts folder), after = in an option or a name=value argument, or attached to a short option. A path
+    that does not exist yet (an output) may only be created in the artifacts folder, never in the evidence."""
+    from compensated_anarchist.case import Case
+    from compensated_anarchist.tools.forensics import Forensics
+
+    _fake_bin(tmp_path, monkeypatch, "fls", '#!/bin/sh\nprintf "%s\\n" "$@"\n')  # echoes its arguments
+    ev = tmp_path / "evidence"
+    ev.mkdir()
+    (ev / "disk.img").write_bytes(b"x")
+    (tmp_path / "secret.txt").write_text("not evidence")
+    case = Case(tmp_path / "cases", "JAIL-1")
+    f = Forensics({"allowed_binaries": ["fls"]}, [ev], case)
+    up = "../" * len(case.artifacts.resolve().relative_to(tmp_path.resolve()).parts)  # artifacts folder -> tmp_path
+
+    def run(*args: str) -> str:
+        return asyncio.run(f.run("fls", list(args)))
+
+    for bad in ([up + "secret.txt"], ["--image=" + up + "secret.txt"], ["-o" + up + "secret.txt"], ["-o/etc/hostname"],
+                ["/etc/hostname"], ["name=" + str(tmp_path / "secret.txt")], ["-o", up + "new_dir"],
+                [str(ev / "new_output")]):
+        with pytest.raises(PermissionError):
+            run(*bad)
+    assert run("-o", "63", str(ev / "disk.img")).split() == ["-o", "63", str(ev / "disk.img")]
+    assert up + "evidence/disk.img" in run(up + "evidence/disk.img")  # relative, into an evidence root
+    assert run("--out=results/run1", "-f", "ntfs").split() == ["--out=results/run1", "-f", "ntfs"]  # new output

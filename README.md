@@ -425,8 +425,8 @@ tools a mission needs.
 
 The ROE gate runs in code, so the model cannot talk its way past it.
 
-- **Tiers:** `auto` / `notify` / `approve` / `deny`, assigned by first-match glob rules. Rules can also
-  match on argument values. For example, collecting `Windows.System.Pslist` is `notify` while any other
+- **Tiers:** `auto` / `notify` / `approve` / `deny`, assigned by glob rules. A `deny` rule wins wherever it sits
+  in the file; among the other rules the first match wins. Rules can also match on argument values. For example, collecting `Windows.System.Pslist` is `notify` while any other
   artifact is `approve`.
 - **Posture:** `observe` denies every approval-tier action. `respond` allows them with analyst approval.
 - **Scope:** `allowed_targets` (CIDRs, host globs, client ids). An active action against anything outside

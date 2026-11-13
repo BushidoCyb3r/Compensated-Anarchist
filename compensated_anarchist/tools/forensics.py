@@ -4,7 +4,9 @@ Safety properties:
   - no shell: every command is an argv list (no injection through file names / args)
   - reads are jailed to configured evidence_roots + the case directory
   - writes go only to the case artifacts directory; evidence is never modified
-  - binaries resolved from config; generic `local_run` only allows allowlisted binaries
+  - binaries resolved from config; generic `local_run` only allows allowlisted binaries, never one whose options
+    run code (NEVER_LOCAL_RUN), and every path its arguments name - absolute, relative or after `=` - must stay in
+    the jail (an argument check, not a sandbox: review what an approved call does)
   - every call is still subject to the ROE gate
 """
 
@@ -35,19 +37,85 @@ DEFAULT_BINARIES = {
     "floss": "floss", "sigma": "sigma", "dotnet": "dotnet",
 }
 MAX_CAPTURE = 5 * 1024 * 1024
+# local_run never starts these, whatever forensics.allowed_binaries says: their options run code (exiftool's -if and
+# -p evaluate Perl, -config loads a Perl file) or rewrite files. The value is the tool to use instead.
+NEVER_LOCAL_RUN = {"exiftool": "local_exiftool (read-only metadata, fixed arguments)"}
+
+
+def _never_run(name: str) -> str:
+    """The tool to use instead when local_run must refuse `name` (exiftool, exiftool.pl, ...), else ""."""
+    return NEVER_LOCAL_RUN.get(Path(name).name.lower().split(".", 1)[0], "")
+
+
+def _path_like(value: str) -> bool:
+    return value.startswith(("/", "~")) or "/" in value or value in (".", "..")
+
+
+# Volatility 3 options that are not a plugin's: they load code (--plugin-dirs loads Python plugins), write files
+# (--log, --cache-path, --write-config, --save-config, --output-dir), change what is read or how (--file,
+# --single-location, --single-swap-locations, --config, --extend, --symbol-dirs) or fetch from the network
+# (--remote-isf-url). Volatility reads its own options wherever they appear and accepts any unambiguous prefix of
+# one (argparse), so plugin_args may not carry them or a prefix of them. The harness sets -q, -o and -f itself.
+VOL_GLOBAL_OPTIONS = ("plugin-dirs", "symbol-dirs", "config", "extend", "file", "single-location",
+                      "single-swap-locations", "output-dir", "log", "cache-path", "clear-cache", "write-config",
+                      "save-config", "remote-isf-url")
+
+
+def _vol_global_option(arg: str) -> str:
+    """Why `arg` (one starting with -) may not be a plugin argument, or ""."""
+    if not arg.startswith("--"):
+        return "plugin options are long options (--pid=4); short options set Volatility's own settings"
+    name = arg[2:].split("=", 1)[0].lower()
+    hit = next((g for g in VOL_GLOBAL_OPTIONS if g.startswith(name)), "")
+    return f"--{hit} is Volatility's own option, set by the harness or not allowed" if hit else ""
 
 
 class PathJail:
     def __init__(self, roots: list[Path]):
         self.roots = [r.resolve() for r in roots]
 
+    def inside(self, p: Path) -> bool:
+        return any(p == r or r in p.parents for r in self.roots)
+
     def check(self, path: str) -> Path:
         p = Path(os.path.expanduser(path)).resolve()
-        if not any(p == r or r in p.parents for r in self.roots):
+        if not self.inside(p):
             raise PermissionError(f"{p} is outside the allowed evidence roots {[str(r) for r in self.roots]}")
         if not p.exists():
             raise FileNotFoundError(str(p))
         return p
+
+    def check_from(self, path: str, cwd: Path) -> Path:
+        """`path` as a program running in `cwd` opens it (relative paths count from `cwd`). One that exists must be
+        inside the roots; one that does not exist yet (an output) must be inside `cwd`, so nothing new is written
+        into the evidence."""
+        p = Path(os.path.expanduser(path))
+        p = (p if p.is_absolute() else cwd / p).resolve()
+        if p.exists():
+            if not self.inside(p):
+                raise PermissionError(f"{path} ({p}) is outside the allowed evidence roots {[str(r) for r in self.roots]}")
+        else:
+            base = cwd.resolve()
+            if not (p == base or base in p.parents):
+                raise PermissionError(f"{path} ({p}) does not exist; a new file or folder (an output) can only be "
+                                      f"created inside {base}")
+        return p
+
+    def check_args(self, args: list[str], cwd: Path) -> None:
+        """Every path in a command's arguments must stay in the jail: an argument that starts with / or ~, contains
+        a /, or is . or ..; and the same after `=` (--out=../x, name=/tmp/x). A path attached to a short option
+        (-o/tmp/x) cannot be told apart from the option's letters, so it is refused: give it as its own argument."""
+        for a in args:
+            head, eq, value = a.partition("=")
+            if a.startswith("-"):
+                if "/" in head or ".." in head:
+                    raise PermissionError(f"argument {a!r}: give the path as its own argument, not attached to an option")
+                candidates = [value] if eq else []
+            else:
+                candidates = [a, value] if eq else [a]
+            for c in candidates:
+                if _path_like(c):
+                    self.check_from(c, cwd)
 
 
 class Forensics:
@@ -77,10 +145,13 @@ class Forensics:
             raise FileNotFoundError(f"'{exe}' ({key}) is not installed / not on PATH. Run local_tools_inventory.")
         return found
 
-    def _outdir(self, prefix: str) -> Path:
+    def _outdir(self, prefix: str, create: bool = True) -> Path:
+        """A new output folder in the case artifacts. create=False only names it, so a call refused while its
+        arguments are checked leaves no empty folder behind."""
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         d = self.case.artifacts / f"{prefix}_{stamp}_{uuid.uuid4().hex[:4]}"
-        d.mkdir(parents=True, exist_ok=True)
+        if create:
+            d.mkdir(parents=True, exist_ok=True)
         return d
 
     async def _run(self, argv: list[str], timeout: int | None = None, cwd: Path | None = None) -> str:
@@ -202,16 +273,24 @@ class Forensics:
         return "\n".join(hits) or f"no matches across {len(targets)} files"
 
     async def volatility(self, image: str, plugin: str, plugin_args: list[str] | None = None) -> str:
+        """Volatility 3 runs in its own output folder in the case artifacts (-o and the working directory), so files a
+        plugin writes (--dump) land there, and relative paths in plugin_args count from there."""
         img = self.jail.check(image)
         if not re.fullmatch(r"(windows|linux|mac)\.[A-Za-z0-9_.]+", plugin):
             return "ERROR: plugin must look like windows.pslist / linux.bash / mac.pslist"
-        for a in plugin_args or []:
+        args = [str(a) for a in plugin_args or []]
+        for a in args:
             if not re.fullmatch(r"--?[A-Za-z0-9-]+(=[\w.:,\\/ -]+)?|[\w.:,\\/-]+", a):
                 return f"ERROR: rejected plugin argument {a!r}"
-        out = await self._run([self._which("volatility"), "-q", "-f", str(img), plugin, *(plugin_args or [])])
-        dest = self._outdir(f"vol_{plugin}") / "output.txt"
-        dest.write_text(out)
-        return f"[saved {dest}]\n{out}"
+            if a.startswith("-") and (why := _vol_global_option(a)):
+                return f"ERROR: rejected plugin argument {a!r}: {why}"
+        out = self._outdir(f"vol_{plugin}", create=False)
+        self.jail.check_args(args, out)
+        out.mkdir(parents=True, exist_ok=True)
+        text = await self._run([self._which("volatility"), "-q", "-o", str(out), "-f", str(img), plugin, *args], cwd=out)
+        dest = out / "output.txt"
+        dest.write_text(text)
+        return f"[saved {dest}; files the plugin writes are in {out}]\n{text}"
 
     async def pcap_stats(self, pcap: str) -> str:
         p = self.jail.check(pcap)
@@ -353,19 +432,28 @@ class Forensics:
         flag = dir_flag if src.is_dir() else file_flag
         if not flag:
             return f"ERROR: {tool} needs a {'directory' if src.is_file() else 'file'} as input"
-        for a in extra_args or []:  # flags, simple values, or paths inside the evidence jail
-            if a.startswith(("/", "~")):
-                self.jail.check(a)
-            elif not re.fullmatch(r"--?[A-Za-z][\w-]*|[\w.:,@ -]+", a):
+        extra = [str(a) for a in extra_args or []]
+        for a in extra:  # flags, simple values, or paths inside the evidence jail
+            if not a.startswith(("/", "~")) and not re.fullmatch(r"--?[A-Za-z][\w-]*|[\w.:,@ -]+", a):
                 return f"ERROR: rejected argument {a!r}"
-        out = self._outdir(f"ez_{tool}")
+        out = self._outdir(f"ez_{tool}", create=False)  # the tool runs here, so relative paths (..) count from here
+        self.jail.check_args(extra, out)
         argv = [*self._ez_command(tool), flag, str(src), "--csv", str(out)]
         if tool == "RECmd":
-            bn = batch_file or next((str(b) for b in Path(self.ez_dir or "/nonexistent").rglob("Kroll_Batch.reb")), "")
+            if batch_file:
+                bp = Path(os.path.expanduser(batch_file))
+                bp = (bp if bp.is_absolute() else out / bp).resolve()
+                ez = Path(self.ez_dir).resolve() if self.ez_dir else None
+                if not bp.is_file() or not (self.jail.inside(bp) or (ez and ez in bp.parents)):
+                    return ("ERROR: batch_file must be a .reb file in forensics.ez_tools_dir, the evidence roots or the "
+                            "case folder")
+            bn = str(bp) if batch_file else next(
+                (str(b) for b in Path(self.ez_dir or "/nonexistent").rglob("Kroll_Batch.reb")), "")
             if not bn:
                 return "ERROR: RECmd needs a batch file (batch_file=...reb or forensics.ez_tools_dir containing BatchExamples)"
             argv += ["--bn", bn]
-        log = await self._run(argv + list(extra_args or []), timeout=7200)
+        out.mkdir(parents=True, exist_ok=True)
+        log = await self._run(argv + extra, timeout=7200, cwd=out)
         csvs = sorted(out.rglob("*.csv"))
         files = []
         for c in csvs:
@@ -452,19 +540,24 @@ class Forensics:
         return await self._run([self._which("exiftool"), "-a", "-G1", str(p)])
 
     async def run(self, binary: str, args: list[str], timeout_s: int = 600) -> str:
+        if instead := _never_run(binary):
+            return (f"ERROR: local_run never runs {binary}: its options can run code or rewrite evidence. "
+                    f"Use {instead}.")
         if binary not in self.allowed_run:
             return f"ERROR: '{binary}' not in forensics.allowed_binaries {sorted(self.allowed_run)}"
         exe = shutil.which(binary)
         if not exe:
             return f"ERROR: {binary} not installed"
         real = Path(exe).resolve()
+        if instead := _never_run(real.name):  # an allowlisted name that is a link to one of them
+            return (f"ERROR: local_run never runs {binary} ({real}): its options can run code or rewrite evidence. "
+                    f"Use {instead}.")
         for zone in [*self.jail.roots, self.case.dir.resolve()]:  # evidence (incl. the vault) and case outputs
             if real == zone or zone in real.parents:
                 return (f"ERROR: refusing to execute {real}: it is inside {zone}, where files pulled from endpoints "
                         f"and tool outputs live. Only installed tools run.")
-        for a in args:  # any argument that looks like a path must be inside the jail
-            if a.startswith("/") or a.startswith("~"):
-                self.jail.check(a)
+        args = [str(a) for a in args]
+        self.jail.check_args(args, self.case.artifacts)  # paths count from the working directory, as the tool sees them
         return await self._run([exe, *args], timeout=min(timeout_s, 6 * 3600), cwd=self.case.artifacts)
 
     def case_evidence(self, include_vault: bool = True, max_entries: int = 500) -> str:
@@ -494,7 +587,9 @@ class Forensics:
                          "grep": S, "max_lines": I}, ["path"]), self.strings),
             Tool("local_yara_scan", "Scan a file or directory with YARA rules (file or directory of .yar).",
                  schema({"target": S, "rules": S, "recursive": B}, ["target"]), self.yara_scan),
-            Tool("local_volatility", "Run a Volatility 3 plugin against a memory image (e.g. windows.pslist, windows.netscan, windows.malfind, linux.bash).",
+            Tool("local_volatility", "Run a Volatility 3 plugin against a memory image (e.g. windows.pslist, windows.netscan, windows.malfind, linux.bash). "
+                 "plugin_args are the plugin's long options (--pid=4, --dump); dumped files go to the run's folder in the case "
+                 "artifacts. Paths on this machine in the arguments must be in the evidence roots or the case folder.",
                  schema({"image": S, "plugin": S, "plugin_args": L}, ["image", "plugin"]), self.volatility),
             Tool("local_pcap_stats", "Protocol hierarchy, IP conversations and endpoints for a PCAP (tshark).", schema({"pcap": S}, ["pcap"]), self.pcap_stats),
             Tool("local_tshark", "Query a PCAP with a Wireshark display filter, optionally extracting fields.",
@@ -510,7 +605,9 @@ class Forensics:
                  schema({"path": S, "min_length": I, "grep": S, "include_static": B, "max_per_type": I}, ["path"]), self.floss),
             Tool("local_ez_tool", "Run an Eric Zimmerman parser to CSV: MFTECmd ($MFT/$J/$LogFile), PECmd (Prefetch), LECmd (LNK), "
                  "JLECmd (Jump Lists), AmcacheParser, AppCompatCacheParser (ShimCache, SYSTEM hive), RECmd (registry via batch file), "
-                 "SBECmd (ShellBags, dir of hives), SrumECmd (SRUDB.dat), EvtxECmd (EVTX), RBCmd (Recycle Bin), WxTCmd, SQLECmd, bstrings.",
+                 "SBECmd (ShellBags, dir of hives), SrumECmd (SRUDB.dat), EvtxECmd (EVTX), RBCmd (Recycle Bin), WxTCmd, SQLECmd, bstrings. "
+                 "It runs in its output folder in the case artifacts; paths in extra_args and batch_file must be in the evidence roots "
+                 "or the case folder (batch_file may also be in forensics.ez_tools_dir).",
                  schema({"tool": {"type": "string", "enum": sorted(self.EZ_TOOLS)}, "input_path": S, "extra_args": L,
                          "batch_file": S, "head_rows": I}, ["tool", "input_path"]), self.ez_tool),
             Tool("local_sigma_convert", "Convert Sigma rule(s) (YAML text, file or directory) to a SIEM query. Valid target -> pipelines: "
@@ -528,7 +625,10 @@ class Forensics:
                          "input_type": {"type": "string", "enum": ["fs", "tar", "zip", "gz", "itunes", "file"]}, "max_artifacts": I},
                         ["platform", "input_path"]), self.leapp),
             Tool("local_exiftool", "Extract document/media metadata with exiftool.", schema({"path": S}, ["path"]), self.exiftool),
-            Tool("local_run", "Run an allowlisted forensic binary (e.g. Sleuth Kit fls/icat/mmls, bulk_extractor) with argv list; no shell. Working dir = case artifacts.",
+            Tool("local_run", "Run an allowlisted forensic binary (e.g. Sleuth Kit fls/icat/mmls, bulk_extractor) with argv list; no shell. "
+                 "Working dir = case artifacts. Every path (absolute, relative, or after =) must be in the evidence roots or the "
+                 "case folder, and new outputs go in the case artifacts folder; give each path as its own argument. Not for "
+                 "exiftool: use local_exiftool.",
                  schema({"binary": S, "args": L, "timeout_s": I}, ["binary", "args"]), self.run),
         ]
 

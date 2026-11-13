@@ -958,6 +958,15 @@ targeted.
   reported rather than automatically rejected, and the hash is not compared with an independent source hash.
 - **Execution guard:** `local_run` refuses an executable located inside evidence roots or the case folder.
   Installed analysis programs still run on the host; review plugin and command arguments.
+- **Argument paths:** every path in a `local_run` argument (absolute, relative to the case artifacts folder, or
+  after `=`) must be inside the evidence roots or the case folder, and a path that does not exist yet (an
+  output) must be inside the case artifacts folder. A path attached to a short option (`-o/tmp/x`) is refused.
+  `local_volatility` and `local_ez_tool` apply the same check to their extra arguments and run in their own
+  output folder in the case artifacts, so relative paths and Volatility `--dump` files stay in the case.
+  Volatility's own options (`--plugin-dirs`, `--log`, `--output-dir`, `--file`, ...) are refused in
+  `plugin_args`. This checks the argument strings; it is not a sandbox.
+- **Never through `local_run`:** exiftool, even if listed in `allowed_binaries`. Its `-if`, `-p` and `-config`
+  options run Perl and it can rewrite files; `local_exiftool` runs it with fixed, read-only arguments.
 - **Root-only hardening (recommended):** mount the vault `noexec,nosuid,nodev` to block direct execution
   and restrict device/set-ID behavior. This does not stop an interpreter from reading a script, or make
   the contents safe to execute elsewhere. See the [mount flags](https://man7.org/linux/man-pages/man8/mount.8.html).
@@ -1109,8 +1118,8 @@ LEAPP_PYTHON=
 ```
 Other binaries (`vol`, `log2timeline.py`, `tshark`, `zeek`, `capa`, `floss`, `exiftool`, etc.) are found on
 `PATH`. Dedicated wrappers support name/path overrides under `forensics.binaries` in `config/harness.yaml`.
-`local_run` instead resolves the exact requested name on `PATH`, requires it in `forensics.allowed_binaries`,
-and invokes it without a shell. It does not use those binary overrides; review arguments that load plugins,
+`local_run` instead resolves the exact requested name on `PATH`, requires it in `forensics.allowed_binaries`
+(exiftool is refused even when listed: use `local_exiftool`), and invokes it without a shell. It does not use those binary overrides; review arguments that load plugins,
 scripts or write outputs before approving a call.
 
 **Check:** ask the team to run `local_tools_inventory` (`canarchist chat`, then "which local tools are

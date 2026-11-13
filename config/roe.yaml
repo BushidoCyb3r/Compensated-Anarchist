@@ -4,8 +4,9 @@
 # posture: observe -> approve-tier actions are denied outright, except rules marked `observe: ask`
 #                     (endpoint collection, evidence download): those can still be requested and approved
 #          respond -> every approve-tier action is allowed once the analyst approves it
-# Rules are evaluated top to bottom; first match wins. `args` narrows a rule to specific argument
-# values (glob patterns; all listed keys must match).
+# A `deny` rule wins wherever it sits: a call that any deny rule matches never runs, even when a broader
+# rule above it would allow it. Among the other rules, the first match (top to bottom) wins. `args` narrows
+# a rule to specific argument values (glob patterns; all listed keys must match).
 
 posture: respond
 default_tier: approve           # unknown / new tools always need approval
@@ -45,7 +46,9 @@ rules:
   - {match: "skill_*", tier: auto, note: "agent-written skill versions still need analyst approval before use"}
 
   # --- local forensics (read-only, jailed to evidence roots) -------------
-  - {match: "local_run", tier: notify, args: {binary: [fls, icat, ils, mmls, fsstat, istat, mactime, sha256sum, ssdeep, exiftool]},
+  # exiftool is not here and local_run refuses it in code: its -if, -p and -config options run Perl, and it can
+  # rewrite files. local_exiftool runs it with fixed, read-only arguments.
+  - {match: "local_run", tier: notify, args: {binary: [fls, icat, ils, mmls, fsstat, istat, mactime, sha256sum, ssdeep]},
      note: "read-only Sleuth Kit / hashing"}
   - {match: "local_run", tier: approve, args: {binary: [olevba, pescan]},
      note: "static parsers: they read the file and print, and load no plugins; each run is approved (check which file and why)"}
@@ -126,5 +129,5 @@ rules:
   # --- network detection ----------------------------------------------------------
   - {match: "archer__*",           tier: auto, note: "Archer findings, read-only (Viewer account; the connector only reads)"}
 
-  # --- hard denials -----------------------------------------------------------
+  # --- hard denials (deny rules win wherever they sit, so misp__* etc. above cannot allow these) ---
   - {match: "*__delete*", tier: deny}
