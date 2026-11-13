@@ -145,6 +145,16 @@ def read_nmap(root: ET.Element, max_hosts: int = 300) -> str:
     return "\n".join(out)
 
 
+def _inflate(data: bytes, limit: int = MAX_MAP_BYTES) -> bytes:
+    """A compressed draw.io diagram (raw deflate), refused when it would inflate past `limit` (a deflate bomb turns a
+    few MB into gigabytes)."""
+    d = zlib.decompressobj(-15)
+    out = d.decompress(data, limit)
+    if d.unconsumed_tail or len(out) >= limit and d.decompress(b"", 1):
+        raise ValueError(f"compressed diagram larger than {limit} bytes")
+    return out
+
+
 def _drawio_models(root: ET.Element) -> list[tuple[str, ET.Element]]:
     if root.tag == "mxGraphModel":
         return [("diagram", root)]
@@ -154,8 +164,7 @@ def _drawio_models(root: ET.Element) -> list[tuple[str, ET.Element]]:
         m = d.find("mxGraphModel")
         if m is None and (d.text or "").strip():  # compressed: base64 -> raw deflate -> URL-encoded XML
             try:
-                raw = zlib.decompress(base64.b64decode(d.text.strip()), -15)
-                m = xmlsafe.fromstring(urllib.parse.unquote(raw.decode("utf-8")))
+                m = xmlsafe.fromstring(urllib.parse.unquote(_inflate(base64.b64decode(d.text.strip())).decode("utf-8")))
             except (ValueError, zlib.error, ET.ParseError, UnicodeDecodeError):
                 m = None
         if m is not None:

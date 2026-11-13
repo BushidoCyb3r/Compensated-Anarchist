@@ -945,7 +945,9 @@ targeted.
 - **Flow cancellation is `notify` by default**, so it can run without an approval prompt unless your ROE
   or a protected-asset match raises it. Change that rule if your site requires approval.
 - **The shipped ROE denies named PowerShell/CmdShell/BashShell artifact patterns.** These are editable rules,
-  not a universal detector for every artifact capable of running commands.
+  not a universal detector for every artifact capable of running commands. Deny rules match names in any case,
+  and the connector collects and hunts by artifact name only (a `Name/Source` form is refused), so neither can
+  step around them.
 - **Posture under shipped ROE:** in OBSERVE, investigation actions (collections, downloads, labels, hunts, memory) can still be
   *requested* and approved. Response actions (quarantine, unquarantine, server VQL) are denied outright and
   need RESPOND posture plus approval.

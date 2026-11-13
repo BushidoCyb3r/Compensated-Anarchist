@@ -11,13 +11,14 @@ Tiers (least to most restrictive):
   deny     - never run
 
 Resolution order for a call:
-  0. built-in floors: HUMAN_GATED tools are never below `approve`; under the gate-everything floor
+  0. built-in floors: HUMAN_GATED tools (and HUMAN_GATED_ARGS calls, such as a false-positive MISP sighting) are
+     never below `approve`; under the gate-everything floor
      (GATE_ALL_EXPERTS / GATE_ALL_PLAYBOOKS) every call by the gated agent or in the gated conversation is `approve`.
   1. posture: in "observe" posture anything above `notify` is denied (except rules with `observe: ask`, and
      read-only calls that only need approval because of the gate-everything floor).
   2. rules in roe.yaml (tool glob + optional argument globs): a `deny` rule wins wherever it sits in the file,
      so a broader auto/notify/approve rule above it (misp__*) can never let through what it denies
-     (*__delete*); among the other rules the first match wins.
+     (*__delete*), and it matches in any case; among the other rules the first match wins.
   3. MCP tool annotations, only for servers listed in trust_annotations_from.
   4. default_tier.
   Then for active tiers (notify/approve) the scope check runs:
@@ -53,6 +54,12 @@ HUMAN_GATED = (
     "velociraptor*__download_flow_uploads", "velociraptor*__label_client",
     "velociraptor*__quarantine_host", "velociraptor*__unquarantine_host", "velociraptor*__run_server_vql",
     "vuln_*",  # vulnerability assessment: scanners and command-line tools, listing them and saving the report
+)
+# The same floor for one kind of call, by argument value (globs, any case). A MISP sighting of type false_positive tells
+# every MISP user, and the instances it shares with, that an indicator is harmless: an attacker who can get an agent to
+# file one has whitewashed their indicator, so it is never silent.
+HUMAN_GATED_ARGS: tuple[tuple[str, dict[str, list[str]], str], ...] = (
+    ("misp*__add_sighting", {"sighting_type": ["false_positive"]}, "marks an indicator a false positive in shared intel"),
 )
 
 # Built-in "gate everything" floor. Every action - reads, case notes, memory, skills, the final report - taken by
@@ -105,8 +112,16 @@ def roe_drift_note(cfg: Any) -> str:
     return drift_note(Path(cfg.roe_path), Path(cfg.root) / "roe.yaml")
 
 
-def human_gated(tool: str) -> bool:
-    return any(fnmatch.fnmatchcase(tool, p) for p in HUMAN_GATED)
+def human_gated(tool: str, arguments: dict[str, Any] | None = None) -> str:
+    """Why this call is on the built-in human-in-the-loop floor ("" when it is not)."""
+    if any(fnmatch.fnmatchcase(tool, p) for p in HUMAN_GATED):
+        return "touches an endpoint" if tool.startswith("velociraptor") else "vulnerability assessment"
+    args = arguments or {}
+    for pattern, want, why in HUMAN_GATED_ARGS:
+        if fnmatch.fnmatchcase(tool, pattern) and all(
+                any(fnmatch.fnmatchcase(str(args.get(k, "")).lower(), g.lower()) for g in globs) for k, globs in want.items()):
+            return why
+    return ""
 
 
 @dataclass
@@ -127,13 +142,16 @@ class Rule:
     observe: str = ""  # "ask": an approve-tier action that may still be requested in OBSERVE posture (collection)
 
     def matches(self, tool: str, arguments: dict[str, Any]) -> bool:
-        if not fnmatch.fnmatchcase(tool, self.match):
+        # A deny rule compares tool names and argument values in any case, so writing a name another way
+        # (windows.system.powershell) cannot step around it. Other rules match exactly as written.
+        fold = str.lower if self.tier == "deny" else str
+        if not fnmatch.fnmatchcase(fold(tool), fold(self.match)):
             return False
         for key, patterns in self.args.items():
             val = arguments.get(key)
             vals = val if isinstance(val, list) else [val]
             if val is None or not all(
-                any(fnmatch.fnmatchcase(str(v), p) for p in patterns) for v in vals
+                any(fnmatch.fnmatchcase(fold(str(v)), fold(p)) for p in patterns) for v in vals
             ):
                 return False
         return True
@@ -204,8 +222,8 @@ class RoeGate:
         self, tool: str, arguments: dict[str, Any], annotations: dict[str, Any] | None = None, server: str = ""
     ) -> tuple[str, str]:
         tier, why = self._classify(tool, arguments, annotations, server)
-        if tier in ("auto", "notify") and human_gated(tool):
-            return "approve", f"{why}; raised to approve by the built-in human gate (touches an endpoint)"
+        if tier in ("auto", "notify") and (floor := human_gated(tool, arguments)):
+            return "approve", f"{why}; raised to approve by the built-in human gate ({floor})"
         return tier, why
 
     def _rule(self, tool: str, arguments: dict[str, Any]) -> Rule | None:

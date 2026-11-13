@@ -156,6 +156,8 @@ single-page app (no CDNs, system fonts), so it works air-gapped, and nothing rel
     `dashboard.session_idle_hours` (12) without analyst activity, on sign-out, and whenever the dashboard
     restarts. Failed sign-ins are throttled and audited.
   - Every state change needs a CSRF header.
+  - Request bodies are capped before anything reads them: 16 KB for sign-in (the one request served before
+    authentication) and 2 MB for everything else, so nobody can make the dashboard hold a huge request in memory.
   - A strict CSP: no inline script or style attributes, no framing, nothing loaded from outside.
   - Binding beyond localhost requires TLS. `scripts/start.sh` makes a self-signed certificate for the host's
     address, renews it before it expires, and prints its fingerprint to check against the browser warning.
@@ -446,7 +448,8 @@ tools a mission needs.
 The ROE gate runs in code, so the model cannot talk its way past it.
 
 - **Tiers:** `auto` / `notify` / `approve` / `deny`, assigned by glob rules. A `deny` rule wins wherever it sits
-  in the file; among the other rules the first match wins. Rules can also match on argument values. For example, collecting `Windows.System.Pslist` is `notify` while any other
+  in the file and matches in any case (so `windows.system.powershell` is still denied); among the other rules the
+  first match wins. Rules can also match on argument values. For example, collecting `Windows.System.Pslist` is `notify` while any other
   artifact is `approve`.
 - **Posture:** `observe` denies every approval-tier action. `respond` allows them with analyst approval.
 - **Scope:** `allowed_targets` (CIDRs, host globs, client ids). An active action against anything outside
@@ -459,6 +462,8 @@ The ROE gate runs in code, so the model cannot talk its way past it.
 - **Built-in floors** that no ROE file can lower:
   - Velociraptor actions that touch an endpoint (collection, hunts, memory, downloads, quarantine) and every
     `vuln_*` tool always need approval.
+  - A MISP sighting of type `false_positive` always needs approval: it tells MISP, and the instances it shares
+    with, that an indicator is harmless.
   - **Gate everything:** every action by the `vuln_assessor`, and by any agent in a conversation that ran the
     `vulnerability_assessment` playbook or used that expert, needs approval: reads, notes, memory, tasking and
     reports included. The dashboard shows APPROVE EVERYTHING in the top bar, and the mode stays on for that

@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .. import casefiles
+from .. import casefiles, saferx
 from ..case import Case, sha256_file
 from .registry import Tool, schema
 
@@ -236,9 +236,8 @@ class Forensics:
         enc = {"ascii": "s", "utf16le": "l", "utf16be": "b"}.get(encoding, "s")
         out = await self._run([self._which("strings"), "-a", "-t", "x", "-n", str(min_len), "-e", enc, str(p)])
         lines = out.splitlines()
-        if grep:
-            rx = re.compile(grep, re.I)
-            lines = [ln for ln in lines if rx.search(ln)]
+        if grep:  # the agent's pattern runs with a time limit (saferx): a backtracking one cannot hang the harness
+            lines = [lines[i] for i in await saferx.amatching(grep, lines)]
         more = f"\n... {len(lines) - max_lines} more lines" if len(lines) > max_lines else ""
         return "\n".join(lines[:max_lines]) + more
 
@@ -408,12 +407,11 @@ class Forensics:
             return out
         dest = self._outdir("floss") / "floss.json"
         dest.write_text(json.dumps(data))
-        rx = re.compile(grep, re.I) if grep else None
         result: dict[str, Any] = {"full_json": str(dest)}
         for kind, items in (data.get("strings") or {}).items():
-            vals = [i.get("string", "") for i in items or []]
-            if rx:
-                vals = [v for v in vals if rx.search(v)]
+            vals = [str(i.get("string", "")) for i in items or []]
+            if grep:
+                vals = [vals[i] for i in await saferx.amatching(grep, vals)]
             result[kind] = {"count": len(vals), "strings": vals[:max_per_type]}
         return json.dumps(result, indent=1)
 

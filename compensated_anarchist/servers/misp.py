@@ -9,6 +9,7 @@ Read tools run freely; writes are deliberately narrow:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
@@ -26,6 +27,7 @@ http = httpx.Client(base_url=env("MISP_URL", required=True).rstrip("/"),
                     verify=tls_verify(env("MISP_VERIFY", "true")), timeout=float(env("MISP_TIMEOUT", "120")))
 MAX = int(env("MISP_MAX_RESULTS", "100"))
 THREAT = {"high": 1, "medium": 2, "low": 3, "undefined": 4}
+_EVENT_ID = re.compile(r"[0-9]{1,12}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def _req(method: str, path: str, body: Any = None) -> Any:
@@ -90,9 +92,10 @@ def search_events(query: str = "", tags: list[str] | None = None, since: str = "
 @tool(READ)
 def get_event(event_id: str, max_attributes: int = 200) -> str:
     """Full MISP event: description, tags/galaxies (actors, ATT&CK), objects and attributes (indicators)."""
-    if not str(event_id).isdigit() and len(str(event_id)) != 36:
+    eid = str(event_id).strip()
+    if not _EVENT_ID.fullmatch(eid):  # it goes into the request path: nothing else may reach it (../admin/...)
         raise ValueError("event_id must be a numeric id or a UUID")
-    ev = _req("GET", f"/events/view/{event_id}").get("Event", {})
+    ev = _req("GET", f"/events/view/{eid}").get("Event", {})
     galaxies = [{"galaxy": g.get("name"), "clusters": [c.get("value") for c in g.get("GalaxyCluster") or []]}
                 for g in ev.get("Galaxy") or []]
     attrs = [_attr({**a, "Event": {}}) for a in (ev.get("Attribute") or [])]

@@ -805,8 +805,10 @@ class Harness:
             self.registry.add(t)
         for t in self.memory.tools():
             self.registry.add(t)
-        for t in Forensics(self.cfg.forensics, self.cfg.evidence_roots, self.case,
-                           case_folder=self.case_evidence_dir, vault_dir=self.vault_dir).tools():
+        forensics = Forensics(self.cfg.forensics, self.cfg.evidence_roots, self.case,
+                              case_folder=self.case_evidence_dir, vault_dir=self.vault_dir)
+        self.case.jail = forensics.jail  # evidence is registered from the same places the forensic tools may read
+        for t in forensics.tools():
             self.registry.add(t)
         await self.mcp.start(self.registry)
         self.onboarding = toolspecs.Onboarding(self)

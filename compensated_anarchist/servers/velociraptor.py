@@ -36,7 +36,7 @@ import yaml
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-from .. import vault
+from .. import saferx, vault
 from .common import ACTION, READ, dumps, env, tool_factory
 
 mcp = MCPServer("velociraptor", instructions=(
@@ -121,6 +121,21 @@ def _check(pattern: re.Pattern, value: str, what: str) -> str:
     if not isinstance(value, str) or not pattern.match(value):
         raise ValueError(f"invalid {what}: {value!r}")
     return value
+
+
+def _collectable(artifact: str) -> str:
+    """An artifact to collect or hunt: its plain name. Name/Source only selects results when reading them; refusing it
+    here also keeps the ROE's artifact rules (which name artifacts) from being sidestepped with a source suffix."""
+    _check(_ART_RE, artifact, "artifact")
+    if "/" in artifact:
+        raise ValueError(f"collect an artifact by its name ({artifact.split('/')[0]}): a source (Name/Source) "
+                         "applies only when reading results")
+    return artifact
+
+
+def _filtered(rows: list[dict[str, Any]], where_regex: str) -> list[dict[str, Any]]:
+    """The rows whose JSON text the agent's regex matches (case-insensitive), matched with a time limit (saferx)."""
+    return [rows[i] for i in saferx.matching(where_regex, [json.dumps(r, default=str) for r in rows])]
 
 
 def _flow_logs(client_id: str, flow_id: str, limit: int = 20) -> list[str]:
@@ -228,7 +243,7 @@ def collect_artifact(client_id: str, artifact: str, parameters: dict[str, Any] |
     parameters = {name: value} using the artifact's exact parameter names (see artifact_info).
     wait=true polls until finished (up to timeout_s) and returns results; use wait=false for long collections."""
     cid = _check(_CLIENT_RE, client_id, "client_id")
-    _check(_ART_RE, artifact, "artifact")
+    _collectable(artifact)
     flow_id = _schedule(cid, artifact, parameters, timeout_s)
     if not wait:
         return dumps({"client_id": cid, "flow_id": flow_id, "status": "scheduled"})
@@ -264,8 +279,7 @@ def flow_results(client_id: str, flow_id: str, artifact: str, limit: int = 200, 
               "CaArt": _check(_ART_RE, artifact, "artifact")}
     if not where_regex:
         return dumps(_vql(q + f" LIMIT {min(int(limit), 2000)}", params, min(int(limit), 2000)))
-    rx = re.compile(where_regex, re.I)
-    rows = [r for r in _vql(q, params, 20000) if rx.search(json.dumps(r, default=str))]
+    rows = _filtered(_vql(q, params, 20000), where_regex)
     return dumps({"matched": len(rows), "rows": rows[: min(int(limit), 2000)]})
 
 
@@ -290,8 +304,7 @@ def download_flow_uploads(client_id: str, flow_id: str, path_regex: str = "", ma
     ups = _vql("SELECT Upload.Path AS client_path, file_size, vfs_path, _client_components AS cc "
                "FROM uploads(client_id=CaClient, flow_id=CaFlow)", {"CaClient": cid, "CaFlow": fid})
     if path_regex:
-        rx = re.compile(path_regex, re.I)
-        ups = [u for u in ups if rx.search(u.get("client_path") or "")]
+        ups = [ups[i] for i in saferx.matching(path_regex, [str(u.get("client_path") or "") for u in ups])]
     if not ups:
         return "no uploaded files matched"
     total = sum(int(u.get("file_size") or 0) for u in ups)
@@ -370,7 +383,7 @@ def create_hunt(artifact: str, description: str, parameters: dict[str, Any] | No
                 expires_hours: int = 168) -> str:
     """Launch a FLEET-WIDE hunt across all matching endpoints. Strong justification required; scope it with
     include_labels / exclude_labels / os (windows|linux|darwin)."""
-    _check(_ART_RE, artifact, "artifact")
+    _collectable(artifact)
     args = ["description=CaDescription", "artifacts=[CaArt]", "spec=parse_json(data=CaSpec)",
             "expires=now() + int(int=CaExpires)"]
     params: dict[str, Any] = {"CaDescription": f"[canarchist] {description}"[:500], "CaArt": artifact,
@@ -413,8 +426,7 @@ def hunt_results(hunt_id: str, artifact: str, limit: int = 500, where_regex: str
     q = "SELECT * FROM hunt_results(hunt_id=CaHunt, artifact=CaArt)"
     if not where_regex:
         return dumps(_vql(q + " LIMIT " + str(min(int(limit), 5000)), params, min(int(limit), 5000)))
-    rx = re.compile(where_regex, re.I)
-    rows = [r for r in _vql(q, params, 50000) if rx.search(json.dumps(r, default=str))]
+    rows = _filtered(_vql(q, params, 50000), where_regex)
     return dumps({"matched": len(rows), "rows": rows[: min(int(limit), 5000)]})
 
 

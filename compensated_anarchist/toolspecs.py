@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from . import saferx
 from .tools.forensics import PathJail, _kill_group
 from .tools.registry import Tool, schema
 
@@ -251,7 +252,8 @@ def _value(p: dict[str, Any], v: Any, jail: PathJail, ro: list[Path]) -> str:
         raise ValueError(f"{n}: at most {p.get('max_len', 500)} characters")
     if s.startswith("-") and not p.get("allow_dash"):
         raise ValueError(f"{n}: may not start with '-' (it would be read as an option)")
-    if p.get("pattern") and not re.fullmatch(str(p["pattern"]), s):
+    # the pattern is the spec's, the value the agent's: matched with a time limit, so neither can hang the harness
+    if p.get("pattern") and not saferx.matching(str(p["pattern"]), [s], ignore_case=False, full=True, timeout=5):
         raise ValueError(f"{n}: must match {p['pattern']}")
     return s
 
@@ -642,7 +644,8 @@ def api_params(op: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_request(spec: dict[str, Any], op: dict[str, Any], args: dict[str, Any]) -> tuple[str, str, dict[str, Any], Any]:
-    """(method, url, query, json body). Path values are URL-encoded whole, so they cannot leave the path."""
+    """(method, url, query, json body). Path values are URL-encoded whole ('/' included), and '.' and '..' are refused,
+    so they cannot leave the path."""
     from urllib.parse import quote
 
     names = {p["name"]: p for p in op["parameters"]}
@@ -659,6 +662,8 @@ def build_request(spec: dict[str, Any], op: dict[str, Any], args: dict[str, Any]
         if isinstance(v, (dict, list)) and p["in"] == "path":
             raise ValueError(f"{n}: a single value")
         if p["in"] == "path":
+            if str(v) in (".", ".."):  # quote() leaves dots as they are, and the URL would climb out of the path
+                raise ValueError(f"{n}: {v!r} is not a value for a path segment")
             path = path.replace("{" + n + "}", quote(str(v), safe=""))
         else:
             query[n] = v

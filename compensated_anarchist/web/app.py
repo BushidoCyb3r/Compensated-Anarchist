@@ -18,6 +18,8 @@ Security model (the GUI can approve response actions, so it is stricter than a t
     on sign-out, and when the dashboard stops
   - state-changing requests also need the X-CA-Request header (CSRF defense in depth)
   - binding to a non-loopback address requires TLS (or an explicit --allow-plaintext)
+  - every request body is capped before anything reads it: sign-in, the one request served before authentication,
+    at 16 KB; everything else at 2 MB
   - strict Content-Security-Policy; the frontend renders all agent/tool/log text as text, never HTML,
     because that data is attacker-influenced
 """
@@ -41,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Route
@@ -79,6 +82,10 @@ def classification_from(raw: dict[str, Any] | None) -> dict[str, str]:
 
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+# Request bodies are read whole into memory, so each is capped before anything reads it. Sign-in is the one request
+# served before authentication, and its form is tiny; everything else is an analyst's message or setting.
+MAX_BODY = 2 * 1024 * 1024
+BODY_LIMITS = {"/api/login": 16 * 1024}
 
 
 class Dashboard:
@@ -1278,7 +1285,43 @@ def create_app(dash: Dashboard) -> Starlette:
         Route("/api/skills/{name}", guard(skill_detail)),
         Route("/api/skills/{name}/action", guard(skill_action, True), methods=["POST"]),
     ]
-    return SecurityHeaders(Starlette(routes=routes, lifespan=lifespan))
+    return SecurityHeaders(BodyLimit(Starlette(routes=routes, lifespan=lifespan)))
+
+
+class BodyLimit:
+    """Pure-ASGI middleware: a request body over its limit is refused (413) before the app reads any of it, so nobody
+    (signed in or not) can make the dashboard hold gigabytes in memory. A declared Content-Length is checked at once; a
+    body without one (chunked) is counted as it arrives."""
+
+    def __init__(self, app, default: int = MAX_BODY, limits: dict[str, int] | None = None):
+        self.app, self.default = app, default
+        self.limits = BODY_LIMITS if limits is None else limits
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        limit = self.limits.get(scope.get("path", ""), self.default)
+        why = f"request body too large (the limit here is {limit // 1024} KB)"
+        declared = [v for k, v in scope.get("headers") or [] if k.lower() == b"content-length"]
+        if declared:
+            try:
+                over = any(int(v) > limit for v in declared)
+            except ValueError:
+                over = True
+            if over:
+                return await JSONResponse({"error": why}, 413)(scope, receive, send)
+        seen = 0
+
+        async def counted():
+            nonlocal seen
+            message = await receive()
+            if message.get("type") == "http.request":
+                seen += len(message.get("body") or b"")
+                if seen > limit:
+                    raise HTTPException(413, why)
+            return message
+
+        await self.app(scope, counted, send)
 
 
 class SecurityHeaders:

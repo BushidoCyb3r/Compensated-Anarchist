@@ -49,6 +49,9 @@ class Case:
             (self.dir / sub).mkdir(parents=True, exist_ok=True)
         self.path = self.dir / "case.json"
         self._lock = threading.Lock()
+        # the forensic jail (evidence roots + this case's folder), set by the harness: evidence is registered only from
+        # there, so an agent cannot use the register to probe other files on this machine
+        self.jail: Any = None
         if self.path.exists():
             self.data = json.loads(self.path.read_text())
             self.data.setdefault("statements", [])
@@ -105,7 +108,7 @@ class Case:
         return f"recorded {fid}"
 
     def register_evidence(self, path: str, description: str, acquired_by: str = "") -> str:
-        p = Path(path).resolve()
+        p = self.jail.check(path) if self.jail is not None else Path(path).resolve()
         if not p.is_file():
             return f"ERROR: {p} is not a file"
         hashes = sha256_file(p)
@@ -209,7 +212,8 @@ class Case:
                          "attack_techniques": L, "affected_assets": L, "evidence": L, "recommended_actions": L,
                          "confidence": {"type": "string", "enum": ["low", "medium", "high"]}},
                         ["title", "severity", "description"]), self.add_finding),
-            Tool("case_register_evidence", "Hash (MD5/SHA1/SHA256) and register an evidence file in the chain-of-custody register.",
+            Tool("case_register_evidence", "Hash (MD5/SHA1/SHA256) and register an evidence file in the chain-of-custody register "
+                 "(a file in the evidence roots or the case folder).",
                  schema({"path": S, "description": S, "acquired_by": S}, ["path", "description"]), self.register_evidence),
             Tool("case_verify_evidence", "Re-hash registered evidence and compare the FULL SHA-256 with the chain-of-custody "
                  "register (the case summary shows only a prefix). Give evidence ids, or none for all. Use it before and "

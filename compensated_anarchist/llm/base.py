@@ -172,6 +172,10 @@ def parse_text_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
     return clean, calls
 
 
+# text mode's own tags inside a tool result, in any case or spacing ("</tool_response>", "< TOOL_CALL"): escaped
+_TEXT_TAGS = re.compile(r"<(?=\s*/?\s*(?:tool_response|tool_call)\b)", re.I)
+
+
 def to_text_mode(messages: list[dict[str, Any]], tools: list[ToolSpec]) -> list[dict[str, Any]]:
     """Rewrite a native-tool conversation into plain user/assistant turns."""
     out: list[dict[str, Any]] = []
@@ -189,7 +193,9 @@ def to_text_mode(messages: list[dict[str, Any]], tools: list[ToolSpec]) -> list[
                 content += f'\n<tool_call>{{"name": "{fn["name"]}", "arguments": {fn["arguments"]}}}</tool_call>'
             out.append({"role": "assistant", "content": content.strip()})
         elif role == "tool":
-            block = f'<tool_response name="{m.get("name", "")}">\n{m["content"]}\n</tool_response>'
+            # the data cannot end its <tool_response> block early, or write a <tool_call> the model might copy
+            name = re.sub(r"[^A-Za-z0-9_.:-]", "_", str(m.get("name", "")))
+            block = f'<tool_response name="{name}">\n{_TEXT_TAGS.sub("&lt;", str(m["content"]))}\n</tool_response>'
             if out and out[-1]["role"] == "user" and out[-1].get("_tool_resp"):
                 out[-1]["content"] += "\n" + block
             else:

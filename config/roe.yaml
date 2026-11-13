@@ -5,8 +5,9 @@
 #                     (endpoint collection, evidence download): those can still be requested and approved
 #          respond -> every approve-tier action is allowed once the analyst approves it
 # A `deny` rule wins wherever it sits: a call that any deny rule matches never runs, even when a broader
-# rule above it would allow it. Among the other rules, the first match (top to bottom) wins. `args` narrows
-# a rule to specific argument values (glob patterns; all listed keys must match).
+# rule above it would allow it, and it matches tool names and argument values in any case. Among the other
+# rules, the first match (top to bottom) wins, as written. `args` narrows a rule to specific argument values
+# (glob patterns; all listed keys must match).
 
 posture: respond
 default_tier: approve           # unknown / new tools always need approval
@@ -123,6 +124,7 @@ rules:
   - {match: "velociraptor*__run_server_vql",   tier: approve, note: "arbitrary server VQL"}
 
   # --- threat intel ---------------------------------------------------------------
+  # A false_positive sighting always needs approval (built-in floor): it tells MISP an indicator is harmless.
   - {match: "misp__add_sighting",  tier: notify, note: "writes a sighting to MISP"}
   - {match: "misp__create_event",  tier: approve, note: "creates intel in MISP (unpublished, org-only)"}
   - {match: "misp__*",             tier: auto}
