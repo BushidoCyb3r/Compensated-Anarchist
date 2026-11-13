@@ -360,12 +360,19 @@ def test_port_check_binds_like_the_server():
 FAKE_FIREWALL = """#!/bin/sh
 case "$1" in
   --state) [ "$FW_STATE" = running ] && { echo running; exit 0; }; echo "not running"; exit 252 ;;
-  --get-active-zones) printf 'public (default)\n  interfaces: eth0\n' ;;
+  --get-active-zones) printf 'public (default)\\n  interfaces: eth0\\n' ;;
   --zone=public)
     case "$2" in
       --add-port=*|--remove-port=*) echo "$*" >> "$FW_LOG"; exit "${FW_DENY:-0}" ;;
     esac
     [ "$FW_FAIL" = 1 ] && exit 13; echo "$FW_PORTS" ;;
+esac
+"""
+FAKE_UFW = """#!/bin/sh
+case "$1" in
+  status) printf 'Status: %s\\n\\nTo                         Action      From\\n--                         ------      ----\\n' "${UFW_STATUS:-active}"
+          printf '22/tcp                     ALLOW       Anywhere\\n%s\\n' "$UFW_EXTRA" ;;
+  allow|delete) echo "ufw $*" >> "$FW_LOG"; exit "${FW_DENY:-0}" ;;
 esac
 """
 FAKE_SUDO = """#!/bin/sh
@@ -374,22 +381,32 @@ exec "$@"
 """
 
 
-def fake_firewall(tmp_path, monkeypatch):
+def fake_firewall(tmp_path, monkeypatch, ufw_enabled: bool = False):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    for name, body in (("firewall-cmd", FAKE_FIREWALL), ("sudo", FAKE_SUDO)):
+    for name, body in (("firewall-cmd", FAKE_FIREWALL), ("ufw", FAKE_UFW), ("sudo", FAKE_SUDO)):
         (bin_dir / name).write_text(body)
         (bin_dir / name).chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
     monkeypatch.setenv("FW_STATE", "running")
     monkeypatch.setenv("FW_PORTS", "")
     monkeypatch.setenv("FW_LOG", str(tmp_path / "fw.log"))
+    conf = tmp_path / "ufw.conf"  # the host's own ufw (or its absence) never decides a test
+    conf.write_text(f"# /etc/ufw/ufw.conf\nENABLED={'yes' if ufw_enabled else 'no'}\nLOGLEVEL=low\n")
+    monkeypatch.setattr(service, "UFW_CONF", conf)
     return tmp_path / "fw.log"
+
+
+def test_port_entries_firewalls_list():
+    for spec in ("8765/tcp", "8765", "8000-9000/tcp", "8000:9000/tcp", "80,8765/tcp"):
+        assert service._covers(spec, 8765), spec
+    for spec in ("8765/udp", "22/tcp", "OpenSSH", "8000-8700/tcp", "Anywhere"):
+        assert not service._covers(spec, 8765), spec
 
 
 def test_firewall_note_and_ssh_tunnel_hint(tmp_path, monkeypatch):
     fake_firewall(tmp_path, monkeypatch)
-    assert service.firewall_closed(8765) == ["public"]
+    assert service.firewall_closed(8765) == ["public"] and service.firewall_blocks(8765) == ("firewalld", ["public"])
     note = service.firewall_note(8765)
     assert "zone public" in note and "--open-firewall" in note and "SSH tunnel" in note
     for ports in ("8765/tcp", "8000-9000/tcp", "22/tcp 8765/tcp"):
@@ -400,7 +417,7 @@ def test_firewall_note_and_ssh_tunnel_hint(tmp_path, monkeypatch):
     monkeypatch.setenv("FW_FAIL", "1")  # it cannot tell (no permission): no guess
     assert service.firewall_note(8765) == ""
     monkeypatch.setenv("FW_STATE", "stopped")
-    assert service.firewall_note(8765) == ""
+    assert service.firewall_note(8765) == "" and service.firewall_blocks(8765) == ("", [])
     local = service.tunnel_hint("127.0.0.1", 8765)
     assert "ssh -L 8765:127.0.0.1:8765 " in local and "the sign-in link above" in local
     assert "https://127.0.0.1:8765/login" in service.tunnel_hint("0.0.0.0", 8765)
@@ -410,38 +427,76 @@ def test_start_opens_the_port_while_it_runs_and_stop_closes_it(tmp_path, monkeyp
     log = fake_firewall(tmp_path, monkeypatch)
     rd = tmp_path / "run"
     rd.mkdir()
-    assert service.open_firewall(rd, 8765, ["public"], interactive=False) == ""
+    ok, what = service.open_firewall(rd, 8765, "firewalld", ["public"], interactive=False)
+    assert ok and "open while it runs" in what
     state = rd / service.FIREWALL_STATE
-    assert json.loads(state.read_text()) == {"port": 8765, "zones": ["public"]}
+    assert json.loads(state.read_text()) == {"kind": "firewalld", "port": 8765, "zones": ["public"]}
     assert stat.S_IMODE(state.stat().st_mode) == 0o600
     assert log.read_text().splitlines() == ["--zone=public --add-port=8765/tcp"]  # runtime only: no --permanent
     assert service.close_firewall(rd, interactive=False) == "Closed port 8765/tcp in the firewall again."
     assert not state.exists() and log.read_text().splitlines()[-1] == "--zone=public --remove-port=8765/tcp"
     assert service.close_firewall(rd, interactive=False) == ""  # nothing it opened: nothing to close
     monkeypatch.setenv("FW_DENY", "1")  # sudo refused (no password without a terminal)
-    why = service.open_firewall(rd, 8765, ["public"], interactive=False)
-    assert "zone public still blocks port 8765/tcp" in why and not state.exists()
+    ok, why = service.open_firewall(rd, 8765, "firewalld", ["public"], interactive=False)
+    assert not ok and "zone public still blocks port 8765/tcp" in why and not state.exists()
     monkeypatch.delenv("FW_DENY")
-    service.open_firewall(rd, 8765, ["public"], interactive=False)
+    service.open_firewall(rd, 8765, "firewalld", ["public"], interactive=False)
     monkeypatch.setenv("FW_DENY", "1")
     left = service.close_firewall(rd, interactive=False)
     assert "still open" in left and "sudo firewall-cmd --zone=public --remove-port=8765/tcp" in left and state.exists()
 
 
+def test_ufw_hosts_ubuntu_debian_kali(tmp_path, monkeypatch):
+    """ufw (Ubuntu; Debian or Kali when enabled): its rules need root to read, so it only may block; a rule is added
+    only when none of the host's own allows the port, and stop removes only the rule start added."""
+    log = fake_firewall(tmp_path, monkeypatch, ufw_enabled=True)
+    monkeypatch.setenv("FW_STATE", "stopped")  # no firewalld on these hosts
+    assert service.firewall_blocks(8765) == ("ufw", [])
+    assert "(ufw) is on and may keep" in service.firewall_note(8765)
+    rd = tmp_path / "run"
+    rd.mkdir()
+    ok, what = service.open_firewall(rd, 8765, "ufw", [], interactive=False)
+    assert ok and "allowed in ufw" in what and log.read_text().splitlines() == ["ufw allow 8765/tcp"]
+    assert json.loads((rd / service.FIREWALL_STATE).read_text()) == {"kind": "ufw", "port": 8765}
+    assert service.close_firewall(rd, interactive=False) == "Removed the ufw rule for port 8765/tcp again."
+    assert log.read_text().splitlines()[-1] == "ufw delete allow 8765/tcp" and not (rd / service.FIREWALL_STATE).exists()
+    monkeypatch.setenv("UFW_EXTRA", "8000:9000/tcp              ALLOW       Anywhere")  # the host's own rule
+    log.write_text("")
+    ok, what = service.open_firewall(rd, 8765, "ufw", [], interactive=False)
+    assert ok and "already allows" in what and log.read_text() == "" and not (rd / service.FIREWALL_STATE).exists()
+    assert service.close_firewall(rd, interactive=False) == ""  # stop leaves the host's own rule alone
+    monkeypatch.setenv("UFW_STATUS", "inactive")
+    assert service.open_firewall(rd, 8765, "ufw", [], interactive=False) == (True, "ufw is not active: nothing blocks the port")
+    monkeypatch.setenv("UFW_STATUS", "active")
+    monkeypatch.setenv("UFW_EXTRA", "")
+    monkeypatch.setenv("FW_DENY", "1")
+    ok, why = service.open_firewall(rd, 8765, "ufw", [], interactive=False)
+    assert not ok and "may still block" in why
+    (rd / service.FIREWALL_STATE).write_text(json.dumps({"kind": "ufw", "port": 8765}))
+    assert "sudo ufw delete allow 8765/tcp" in service.close_firewall(rd, interactive=False)
+    service.UFW_CONF.write_text("ENABLED=no\n")
+    monkeypatch.setenv("FW_STATE", "stopped")
+    assert service.firewall_blocks(8765) == ("", [])  # ufw installed but off (Ubuntu's default): nothing to do
+
+
 def test_the_firewall_question_and_its_flags(tmp_path):
     cfg = load_config(install(tmp_path))
-    assert service.want_firewall(cfg, 8765, ["public"], {"open_firewall": True}) is True
-    assert service.want_firewall(cfg, 8765, ["public"], {"open_firewall": False}) is False
-    assert service.want_firewall(cfg, 8765, ["public"], {}, interactive=False) is False  # never asked: leave it
+    fw = (8765, "firewalld", ["public"])
+    assert service.want_firewall(cfg, *fw, {"open_firewall": True}) is True
+    assert service.want_firewall(cfg, *fw, {"open_firewall": False}) is False
+    assert service.want_firewall(cfg, *fw, {}, interactive=False) is False  # never asked: leave it
     prompts = []
-    assert service.want_firewall(cfg, 8765, ["public"], {}, ask=lambda p: prompts.append(p) or "") is True  # Enter: yes
+    assert service.want_firewall(cfg, *fw, {}, ask=lambda p: prompts.append(p) or "") is True  # Enter: yes
     assert "[y]" in prompts[0] and "zone public" in prompts[0] and service.saved_startup(cfg)["firewall"] == "open"
-    assert service.want_firewall(cfg, 8765, ["public"], {"yes": True}) is True  # --yes: the last answer
+    assert service.want_firewall(cfg, *fw, {"yes": True}) is True  # --yes: the last answer
     answers = iter(["maybe", "n"])
-    assert service.want_firewall(cfg, 8765, ["public"], {}, ask=lambda p: next(answers)) is False
+    assert service.want_firewall(cfg, *fw, {}, ask=lambda p: next(answers)) is False
     assert service.saved_startup(cfg)["firewall"] == "leave"
     prompts.clear()
-    assert service.want_firewall(cfg, 8765, ["public"], {}, ask=lambda p: prompts.append(p) or "") is False
+    assert service.want_firewall(cfg, *fw, {}, ask=lambda p: prompts.append(p) or "") is False
     assert "[n]" in prompts[0]  # Enter keeps the last answer
+    prompts.clear()
+    service.want_firewall(cfg, 8765, "ufw", [], {}, ask=lambda p: prompts.append(p) or "")
+    assert "ufw (the firewall) is on" in prompts[0] and "stop removes the rule again" in prompts[0]
     with pytest.raises(ValueError):
         service.save_startup(cfg, firewall="sometimes")

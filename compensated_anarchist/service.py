@@ -231,19 +231,37 @@ def public_url(host: str, port: int) -> str:
     return f"https://{f'[{shown}]' if ':' in shown else shown}:{port}"
 
 
-FIREWALL_STATE = "firewall.json"  # in run/: the port start opened in firewalld, so stop closes exactly that again
+# ---- the host firewall ------------------------------------------------------------------------------------------------
+# The firewalls the common distributions switch on: firewalld (RHEL, Rocky, Alma, Fedora, CentOS, openSUSE) and ufw
+# (Ubuntu, and Debian, Kali or Mint when it is installed and enabled). Debian, Kali and Ubuntu ship with none active,
+# so a dashboard on 0.0.0.0 is reachable there as it is. Rules written by hand (nftables, iptables) cannot be read
+# without root, so start says nothing about them.
+FIREWALL_STATE = "firewall.json"  # in run/: what start opened, so stop removes exactly that again
+UFW_CONF = Path("/etc/ufw/ufw.conf")
+
+
+def _tool(name: str) -> str:
+    """A system tool's path, also when it lives in an sbin folder a normal user's PATH lacks (Debian, for ufw)."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in ("/usr/sbin", "/sbin", "/usr/bin", "/bin"):
+        p = Path(d) / name
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return ""
 
 
 def firewall_closed(port: int) -> list[str]:
-    """The active firewalld zones that do not open `port`/tcp, so browsers on other devices cannot connect. [] when
+    """firewalld: the active zones that do not open `port`/tcp, so browsers on other devices cannot connect. [] when
     they all do, when firewalld is not running, or when it cannot tell (no permission): never a guess."""
-    fc = shutil.which("firewall-cmd")
+    fc = _tool("firewall-cmd")
     if not fc:
         return []
 
     def run(*args: str) -> tuple[int, str]:
         code, out = 1, ""
-        for attempt in range(3):  # firewalld's D-Bus replies are sometimes lost ("Did not receive a reply"): ask again
+        for _ in range(3):  # firewalld's D-Bus replies are sometimes lost ("Did not receive a reply"): ask again
             try:
                 r = subprocess.run([fc, *args], capture_output=True, text=True, timeout=10)
                 code, out = r.returncode, r.stdout
@@ -266,71 +284,141 @@ def firewall_closed(port: int) -> list[str]:
         code, ports = run(f"--zone={z}", "--list-ports")
         if code != 0:
             return []  # it would not say (permissions): no guess
-
-        def opens(entry: str) -> bool:
-            span, _, proto = entry.partition("/")
-            lo, _, hi = span.partition("-")
-            return proto == "tcp" and lo.isdigit() and int(lo) <= port <= int(hi or lo)
-        if not any(opens(e) for e in ports.split()):
+        if not any(_covers(e, port) for e in ports.split()):
             closed.append(z)
     return closed
 
 
-def firewall_note(port: int, closed: list[str] | None = None) -> str:
-    """A warning when the firewall keeps other devices out of the dashboard's port, with the ways in; "" when not."""
-    closed = firewall_closed(port) if closed is None else closed
-    if not closed:
-        return ""
-    return (f"the host firewall (firewalld, zone {', '.join(closed)}) does not open port {port}/tcp, so browsers on "
-            f"other devices cannot connect. Start with --open-firewall to open it while the dashboard runs (sudo "
-            f"asks for your password; stop closes it again), or use the SSH tunnel below.")
-
-
-def _sudo_firewall(args: list[str], interactive: bool) -> bool:
-    """firewall-cmd through sudo. Interactive, sudo may ask for the password on this terminal; otherwise it must not
-    ask (-n) and fails instead."""
-    sudo, fc = shutil.which("sudo"), shutil.which("firewall-cmd")
-    if not (sudo and fc):
+def _covers(spec: str, port: int) -> bool:
+    """A firewall port entry (8765/tcp, 8000-9000/tcp, 8000:9000/tcp, 80,8765/tcp, 8765) opens `port` over TCP."""
+    ports, _, proto = spec.partition("/")
+    if proto not in ("", "tcp"):
         return False
-    for _ in range(3):
-        try:
-            code = subprocess.run([sudo, *([] if interactive else ["-n"]), fc, *args], stdin=None if interactive else
-                                  subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=120).returncode
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        if code in (0, 1):  # done, or sudo said no (a wrong password is not asked for again and again)
-            return code == 0
-        time.sleep(0.3)  # firewalld's D-Bus reply was lost: try again (sudo remembers the password meanwhile)
+    for part in ports.split(","):
+        lo, _, hi = part.replace(":", "-").partition("-")
+        if lo.isdigit() and (hi.isdigit() or not hi) and int(lo) <= port <= int(hi or lo):
+            return True
     return False
 
 
-def open_firewall(rd: Path, port: int, zones: list[str], interactive: bool) -> str:
-    """Open `port`/tcp in these firewalld zones until stop closes it again. Runtime rules only: nothing permanent
-    changes, and a reboot or a firewalld reload closes them as well. Returns "" when it is open, else why not."""
-    opened = []
-    for z in zones:
-        if not _sudo_firewall([f"--zone={z}", f"--add-port={port}/tcp"], interactive):
-            break
-        opened.append(z)
-    if opened:  # remembered even when only part of it worked, so stop closes what was opened
-        fd = os.open(rd / FIREWALL_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"port": port, "zones": opened}, fh)
-    if len(opened) == len(zones):
+def _ufw_enabled() -> bool:
+    """ufw is switched on (its config file says so; a normal user can read that, though not its rules)."""
+    try:
+        conf = UFW_CONF.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(_tool("ufw")) and re.search(r"(?mi)^\s*ENABLED\s*=\s*yes\s*$", conf) is not None
+
+
+def _ufw_allows(status: str, port: int) -> bool:
+    """`ufw status` output has a rule that allows `port`/tcp in (the site's own rule: never removed by stop)."""
+    for line in status.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and "ALLOW" in parts[1:3] and _covers(parts[0], port):
+            return True
+    return False
+
+
+def firewall_blocks(port: int) -> tuple[str, list[str]]:
+    """Which firewall may keep other devices out of `port`: ("firewalld", the zones that do not open it), ("ufw", [])
+    when ufw is on (its rules need root to read, so it only may), or ("", []) when none does, as far as it can tell."""
+    if zones := firewall_closed(port):
+        return "firewalld", zones
+    if _ufw_enabled():
+        return "ufw", []
+    return "", []
+
+
+def firewall_note(port: int, blocks: tuple[str, list[str]] | None = None) -> str:
+    """A warning when the firewall may keep other devices out of the dashboard's port, with the ways in."""
+    kind, zones = firewall_blocks(port) if blocks is None else blocks
+    if not kind:
         return ""
-    return ("sudo did not open it" + ("" if interactive else " (no terminal to ask for the password)")
-            + f"; zone {zones[len(opened)]} still blocks port {port}/tcp")
+    what = (f"the host firewall (firewalld, zone {', '.join(zones)}) does not open port {port}/tcp, so browsers on "
+            "other devices cannot connect" if kind == "firewalld" else
+            f"the host firewall (ufw) is on and may keep browsers on other devices out of port {port}/tcp (its rules "
+            "need root to read)")
+    return (f"{what}. Start with --open-firewall to open it while the dashboard runs (sudo asks for your password; "
+            "stop closes it again), or use the SSH tunnel below.")
+
+
+def _sudo(argv: list[str], interactive: bool, capture: bool = False) -> tuple[bool, str]:
+    """A command through sudo. Interactive, sudo may ask for the password on this terminal; otherwise it must not
+    ask (-n) and fails instead. Returns (succeeded, its output when captured)."""
+    sudo = _tool("sudo")
+    if not sudo or not argv[0]:
+        return False, ""
+    for _ in range(3):
+        try:
+            r = subprocess.run([sudo, *([] if interactive else ["-n"]), *argv],
+                               stdin=None if interactive else subprocess.DEVNULL,
+                               stdout=subprocess.PIPE if capture else subprocess.DEVNULL, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            return False, ""
+        if r.returncode in (0, 1):  # done, or it said no (a wrong password is not asked for again and again)
+            return r.returncode == 0, r.stdout or ""
+        time.sleep(0.3)  # firewalld's D-Bus reply was lost: try again (sudo remembers the password meanwhile)
+    return False, ""
+
+
+def _remember_opened(rd: Path, state: dict[str, Any]) -> None:
+    fd = os.open(rd / FIREWALL_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+
+
+def open_firewall(rd: Path, port: int, kind: str, zones: list[str], interactive: bool) -> tuple[bool, str]:
+    """Let other devices reach `port`/tcp until stop: (it is open now, what happened).
+    firewalld: a runtime rule per zone - nothing permanent, and a reboot or a firewalld reload removes it as well.
+    ufw: an `allow` rule (ufw has no runtime-only rules), added only when no rule of the site's allows the port
+    already, so stop never removes one it did not add."""
+    if kind == "firewalld":
+        fc = _tool("firewall-cmd")
+        opened = []
+        for z in zones:
+            if not _sudo([fc, f"--zone={z}", f"--add-port={port}/tcp"], interactive)[0]:
+                break
+            opened.append(z)
+        if opened:  # remembered even when only part of it worked, so stop removes what was opened
+            _remember_opened(rd, {"kind": "firewalld", "port": port, "zones": opened})
+        if len(opened) == len(zones):
+            return True, f"port {port}/tcp is open while it runs (scripts/stop.sh closes it again)"
+        return False, ("sudo did not open it" + ("" if interactive else " (no terminal to ask for the password)")
+                       + f"; zone {zones[len(opened)]} still blocks port {port}/tcp")
+    if kind == "ufw":
+        ufw = _tool("ufw") or "ufw"
+        ok, status = _sudo([ufw, "status"], interactive, capture=True)
+        if not ok:
+            return False, "sudo did not run ufw" + ("" if interactive else " (no terminal to ask for the password)")
+        if "Status: active" not in status:
+            return True, "ufw is not active: nothing blocks the port"
+        if _ufw_allows(status, port):
+            return True, f"ufw already allows port {port}/tcp (a rule of this host's, left as it is)"
+        if not _sudo([ufw, "allow", f"{port}/tcp"], interactive)[0]:
+            return False, f"sudo did not add the ufw rule; ufw may still block port {port}/tcp"
+        _remember_opened(rd, {"kind": "ufw", "port": port})
+        return True, f"port {port}/tcp is allowed in ufw while it runs (scripts/stop.sh removes the rule again)"
+    return True, ""
 
 
 def close_firewall(rd: Path, interactive: bool) -> str:
-    """Close what open_firewall opened (stop calls it). Returns what was done, or how to finish it by hand."""
+    """Remove what open_firewall added (stop calls it). Returns what was done, or how to finish it by hand."""
     f = rd / FIREWALL_STATE
     try:
         st = json.loads(f.read_text(encoding="utf-8"))
-        port, zones = int(st["port"]), [str(z) for z in st["zones"]]
+        port, kind = int(st["port"]), str(st.get("kind", "firewalld"))
     except (OSError, ValueError, KeyError, TypeError):
         return ""
-    left = [z for z in zones if not _sudo_firewall([f"--zone={z}", f"--remove-port={port}/tcp"], interactive)]
+    if kind == "ufw":
+        ufw = _tool("ufw") or "ufw"
+        if _sudo([ufw, "delete", "allow", f"{port}/tcp"], interactive)[0]:
+            f.unlink(missing_ok=True)
+            return f"Removed the ufw rule for port {port}/tcp again."
+        return (f"The ufw rule for port {port}/tcp is still there (ufw rules stay across reboots). Remove it with: "
+                f"sudo ufw delete allow {port}/tcp")
+    zones = [str(z) for z in st.get("zones") or []]
+    fc = _tool("firewall-cmd")
+    left = [z for z in zones if not _sudo([fc, f"--zone={z}", f"--remove-port={port}/tcp"], interactive)[0]]
     if not left:
         f.unlink(missing_ok=True)
         return f"Closed port {port}/tcp in the firewall again."
@@ -338,7 +426,7 @@ def close_firewall(rd: Path, interactive: bool) -> str:
             f"reload. Close it now with: sudo firewall-cmd --zone={left[0]} --remove-port={port}/tcp")
 
 
-def want_firewall(cfg: HarnessConfig, port: int, zones: list[str], opts: dict[str, Any], ask=input,
+def want_firewall(cfg: HarnessConfig, port: int, kind: str, zones: list[str], opts: dict[str, Any], ask=input,
                   interactive: bool = True) -> bool:
     """Whether this start opens the port: --open-firewall / --no-open-firewall, else the question (Enter keeps the
     last answer), else the last answer. The answer is remembered for the next start."""
@@ -348,10 +436,13 @@ def want_firewall(cfg: HarnessConfig, port: int, zones: list[str], opts: dict[st
     if not interactive or opts.get("yes"):
         return saved == "open"
     d = "n" if saved == "leave" else "y"
+    why = (f"the firewall (firewalld, zone {', '.join(zones)}) blocks it" if kind == "firewalld" else
+           "ufw (the firewall) is on and may block it")
+    after = ("stop closes it again and nothing permanent changes" if kind == "firewalld" else
+             "stop removes the rule again")
     while True:
-        a = ask(f"  Other devices cannot reach port {port}: the firewall (firewalld, zone {', '.join(zones)}) blocks it.\n"
-                f"  Open it while the dashboard runs? sudo asks for your password; stop closes it again and nothing "
-                f"permanent changes [{d}]: ").strip().lower() or d
+        a = ask(f"  Other devices may not reach port {port}: {why}.\n"
+                f"  Open it while the dashboard runs? sudo asks for your password; {after} [{d}]: ").strip().lower() or d
         if a in ("y", "yes", "n", "no"):
             save_startup(cfg, firewall="open" if a.startswith("y") else "leave")
             return a.startswith("y")
@@ -596,13 +687,14 @@ def start(cfg: HarnessConfig, config_path: str, opts: dict[str, Any]) -> int:
     os.chmod(rd, 0o700)
     (rd / "dashboard.json").unlink(missing_ok=True)
     # listening on every interface while the firewall keeps other devices out: open the port for this run, if wanted
-    closed = firewall_closed(s["port"]) if s["host"] == ALL else []
-    fw_opened, fw_note = False, firewall_note(s["port"], closed)
-    if closed and want_firewall(cfg, s["port"], closed, opts, interactive=sys.stdin.isatty()):
-        print(f"Opening port {s['port']}/tcp in the firewall while it runs (sudo may ask for your password)...", flush=True)
-        why = open_firewall(rd, s["port"], closed, interactive=sys.stdin.isatty())
-        fw_opened = not why
-        fw_note = (f"could not open the firewall: {why}. {firewall_note(s['port'], closed)}" if why else "")
+    kind, closed = firewall_blocks(s["port"]) if s["host"] == ALL else ("", [])
+    fw_status, fw_note = "", firewall_note(s["port"], (kind, closed))
+    if kind and want_firewall(cfg, s["port"], kind, closed, opts, interactive=sys.stdin.isatty()):
+        print(f"Opening port {s['port']}/tcp in the firewall ({kind}) while it runs (sudo may ask for your password)...",
+              flush=True)
+        ok, fw_status = open_firewall(rd, s["port"], kind, closed, interactive=sys.stdin.isatty())
+        fw_note = "" if ok else f"could not open the firewall: {fw_status}. {fw_note}"
+        fw_status = fw_status if ok else ""
     env = {k: v for k, v in os.environ.items() if k != "CA_DASHBOARD_TOKEN"}
     if opts.get("foreground"):
         os.execve(argv[0], argv, env)  # serve() prints the link and token; Ctrl+C stops it
@@ -657,8 +749,8 @@ def start(cfg: HarnessConfig, config_path: str, opts: dict[str, Any]) -> int:
 """ if fingerprint else "") + f"""
   Log: {log}     Stop: scripts/stop.sh
 """)
-    if fw_opened:
-        print(f"  Firewall:      port {s['port']}/tcp is open while it runs (scripts/stop.sh closes it again)")
+    if fw_status:
+        print(f"  Firewall:      {fw_status}")
     if fw_note:
         print(f"  note: {fw_note}")
     if s["host"] == LOCAL or fw_note:  # other devices cannot connect directly: the way in that needs no change

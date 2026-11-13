@@ -48,13 +48,21 @@ scripts/stop.sh             # stop
     addresses change, and whose fingerprint it prints) or this host only, `127.0.0.1` (plain HTTP). With
     `0.0.0.0`, start prints a sign-in link for each of the host's addresses; `0.0.0.0` itself is not an address
     to browse to.
-  - **Firewall** (asked only with `0.0.0.0`, when firewalld keeps other devices out of the port): open the port
-    while the dashboard runs? sudo asks for your password once; the rule is a runtime rule only, so nothing
-    permanent changes, `scripts/stop.sh` closes it again, and a reboot or a firewalld reload closes it too. Your
-    answer is remembered; `--open-firewall` / `--no-open-firewall` skip the question. Say no, and start prints the
-    `ssh -L 8765:127.0.0.1:8765 <user>@<host>` command that reaches the dashboard from another device through SSH
-    instead. Running start itself with `sudo` does not help: the firewall stops the connection before it reaches
-    any program, and the dashboard must never run as root.
+  - **Firewall** (asked only with `0.0.0.0`, when the host firewall may keep other devices out of the port): open
+    the port while the dashboard runs? sudo asks for your password once, and `scripts/stop.sh` removes the rule
+    again. Your answer is remembered; `--open-firewall` / `--no-open-firewall` skip the question. Say no, and start
+    prints the `ssh -L 8765:127.0.0.1:8765 <user>@<host>` command that reaches the dashboard from another device
+    through SSH instead. Running start itself with `sudo` does not help: the firewall stops the connection before
+    it reaches any program, and the dashboard must never run as root. By distribution:
+    - **firewalld** (RHEL, Rocky, Alma, Fedora, CentOS, openSUSE): start reads the zones and asks only when one
+      leaves the port closed. The rule is a runtime rule only: nothing permanent changes, and a reboot or a
+      firewalld reload removes it as well.
+    - **ufw** (Ubuntu; Debian, Kali or Mint when installed and enabled): reading its rules takes root, so start
+      asks whenever ufw is on. With sudo it checks the rules first and adds `ufw allow <port>/tcp` only when no rule
+      of the host's allows the port already, so stop never removes a rule it did not add. A ufw rule survives a
+      reboot until stop removes it.
+    - **No firewall enabled** (the default on Debian, Kali and Ubuntu): nothing to do; other devices can connect.
+      Rules written by hand (nftables, iptables) need root to read, so start cannot tell: allow the port yourself.
   - **Case:** an existing case, or a new case id.
 
   An option skips its question (`--posture respond`, `--host 0.0.0.0` or `--localhost`, `--case IR-0042`,

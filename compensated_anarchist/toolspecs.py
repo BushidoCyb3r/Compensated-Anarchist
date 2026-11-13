@@ -321,7 +321,7 @@ class Sandbox:
             return argv
         bw = shutil.which("bwrap")
         if not bw:
-            raise RuntimeError("bubblewrap (bwrap) is needed to run onboarded tools. Install it (dnf install bubblewrap), "
+            raise RuntimeError("bubblewrap (bwrap) is needed to run onboarded tools. Install it (dnf install bubblewrap, or apt install bubblewrap), "
                                "or set tool_onboarding.sandbox: none in harness.yaml (not recommended).")
         cmd = [bw, "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
                "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin", "--setenv", "HOME", "/tmp",

@@ -671,7 +671,8 @@ def main(argv: list[str] | None = None) -> None:
     st.add_argument("--foreground", action="store_true", help="stay attached to this terminal (Ctrl+C stops it)")
     fw = st.add_mutually_exclusive_group()
     fw.add_argument("--open-firewall", dest="open_firewall", action="store_true", default=None,
-                    help="when firewalld blocks other devices, open the port while it runs (sudo; stop closes it)")
+                    help="when firewalld or ufw may block other devices, open the port while it runs (sudo; stop "
+                         "closes it)")
     fw.add_argument("--no-open-firewall", dest="open_firewall", action="store_false", default=None,
                     help="leave the firewall as it is (other devices may not reach it)")
     st.add_argument("-y", "--yes", action="store_true", help="do not ask; use the saved posture, address and case")
